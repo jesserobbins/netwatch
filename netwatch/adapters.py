@@ -42,6 +42,21 @@ def target(name_, kind, host="local", path=None):
     return {"name": name_, "kind": kind, "host": host, "path": path}
 
 
+def step_label(argv):
+    """The tool and its subcommand, ignoring an `env K=V` prefix or SSH wrapper."""
+    args = list(argv)
+    if args and args[0] == "ssh":
+        try:
+            args = shlex.split(args[-1])
+        except ValueError:
+            return args[0]
+    if args and args[0] == "env":
+        args = args[1:]
+        while args and "=" in args[0]:
+            args = args[1:]
+    return " ".join(args[:3]) if args else str(argv[0])
+
+
 def run(t, argv, *, ok=(0,), timeout=120):
     """SSH needs one quoted remote command; no advisory text enters it."""
     cwd = t.get("path") if t["kind"] in ("uv", "npm") else None
@@ -62,12 +77,12 @@ def run(t, argv, *, ok=(0,), timeout=120):
             process.wait()
             raise
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Error(f"Command unavailable or timed out: {argv[0]}") from exc
+        raise Error(f"Command unavailable or timed out: {step_label(argv)}") from exc
     if len(out) + len(err) > 20 * 1024 * 1024:
         raise Error("Command output exceeds 20 MiB")
     if process.returncode not in ok:
         # Avoid storing tool output that can include credentials or private URLs.
-        raise Error(f"Command failed: {argv[0]} (exit {process.returncode})")
+        raise Error(f"Command failed: {step_label(argv)} (exit {process.returncode})")
     return out.decode("utf-8")
 
 
@@ -229,16 +244,17 @@ def brew_outdated(t, runner):
     """Pending updates, with held and greedy-only entries marked honestly."""
     def rows(*extra):
         data = json.loads(runner(t, brew_env("brew", "outdated", "--json=v2", *extra), timeout=300))
-        found = {r["name"]: ("Homebrew", r) for r in data.get("formulae", [])}
-        found.update({r["name"]: ("Homebrew-cask", r) for r in data.get("casks", [])})
+        # A formula and a cask can share a name, so the identity is the pair.
+        found = {("Homebrew", r["name"]): r for r in data.get("formulae", [])}
+        found.update({("Homebrew-cask", r["name"]): r for r in data.get("casks", [])})
         return found
     plain, greedy = rows(), rows("--greedy")
     result = []
-    for name, (ecosystem, row) in sorted(greedy.items()):
+    for (ecosystem, name), row in sorted(greedy.items(), key=lambda item: (item[0][1], item[0][0])):
         entry = {"package": name, "candidate": row.get("current_version"), "ecosystem": ecosystem}
         if row.get("pinned"):
             entry.update(held=True, held_version=row.get("pinned_version"))
-        if name not in plain:
+        if (ecosystem, name) not in plain:
             entry.update(greedy_only=True, reason="Excluded from the default outdated list")
         result.append(entry)
     return result
@@ -253,5 +269,9 @@ def commands(t):
         "mamba": [["mamba", "update", "--all", "--yes", "--prefix", t.get("path")]],
         "uv": [["uv", "lock", "--upgrade"], ["uv", "sync", "--locked"]],
         "npm": [["npm", "update", "--ignore-scripts"]],
-        "brew": [brew_env("brew", "upgrade", "--formula"), brew_env("brew", "upgrade", "--cask")],
+        # HOMEBREW_NO_AUTO_UPDATE=1 suppresses Homebrew's implicit refresh, so the
+        # plan refreshes first, the way apt-get update and pacman -Syu do.
+        "brew": [brew_env("brew", "update"),
+                 brew_env("brew", "upgrade", "--formula"),
+                 brew_env("brew", "upgrade", "--cask")],
     }[t["kind"]]

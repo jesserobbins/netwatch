@@ -38,7 +38,16 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
               "matcher_revision": 2 if t["kind"] in ("arch", "cachyos") else 1}
     if context:
         previous = store.latest(t["name"])
-        linked = findings if complete or not previous else [*previous["findings"], *findings]
+        coverage = next((e["coverage"] for e in evidence if "coverage" in e), None)
+        retained = set((coverage or {}).get("retained") or [])
+        prior = previous["findings"] if previous else []
+        carried = [row for row in prior if row["package"] in retained]
+        if carried:
+            linked = [*carried, *findings]
+        elif complete or not previous:
+            linked = findings
+        else:
+            linked = [*prior, *findings]
         report["context"] = sources.context(packages, linked, store, offline=offline, refresh=refresh,
                                             refreshed=refreshed, request=request)
     return store.save_scan(t["name"], report)
@@ -86,12 +95,16 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
         store.event(t["name"], "approved_and_started", {"plan": id_, "operator_uid": os.getuid(), "commands": body["commands"]})
     try:
         for argv in body["commands"]:
-            runner(t, argv, timeout=1800)
+            try:
+                runner(t, argv, timeout=1800)
+            except Error as exc:
+                raise Error(f"Update step failed: {adapters.step_label(argv)}; {exc}") from exc
             store.event(t["name"], "command_completed", {"plan": id_, "argv": argv})
         report = check(store, t, runner=runner, request=request)
         changed = digest(before) != digest(report["packages"])
         result = {"plan": id_, "status": "applied", "package_state_changed": changed,
                   "remaining_findings": report["findings"], "advisory_check_ok": report["advisory_check_ok"],
+                  "coverage": report.get("coverage"),
                   "runtime": "Not verified. Check running services and restart/reboot requirements before declaring remediation complete."}
         if t["kind"] == "ubuntu":
             try:

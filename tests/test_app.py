@@ -449,6 +449,28 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-9999"])
         self.assertEqual(report["findings"][0]["state"], "unknown")
 
+    def test_brew_commands_refresh_then_upgrade_by_half(self):
+        t = adapters.target("laptop", "brew")
+        self.assertEqual(adapters.commands(t),
+                         [adapters.brew_env("brew", "update"),
+                          adapters.brew_env("brew", "upgrade", "--formula"),
+                          adapters.brew_env("brew", "upgrade", "--cask")])
+
+    def test_brew_outdated_keeps_same_named_formula_and_cask_apart(self):
+        plain = json.dumps({"formulae": [{"name": "tool", "installed_versions": ["1.0"],
+                                          "current_version": "1.1", "pinned": False, "pinned_version": None}],
+                            "casks": []})
+        greedy = json.dumps({"formulae": [{"name": "tool", "installed_versions": ["1.0"],
+                                           "current_version": "1.1", "pinned": False, "pinned_version": None}],
+                             "casks": [{"name": "tool", "installed_versions": ["2.0"],
+                                        "current_version": "2.1", "pinned": False, "pinned_version": None}]})
+        rows = adapters.brew_outdated(self.t, self.scripted([plain, greedy]))
+        self.assertEqual([(r["ecosystem"], r["package"]) for r in rows],
+                         [("Homebrew", "tool"), ("Homebrew-cask", "tool")])
+        formula, cask = rows
+        self.assertTrue(cask["greedy_only"])
+        self.assertNotIn("greedy_only", formula)
+
     def test_brew_outdated_marks_greedy_only_and_held(self):
         plain = json.dumps({"formulae": [{"name": "pydantic", "installed_versions": ["2.14.3"],
                                           "current_version": "2.14.4", "pinned": False, "pinned_version": None},
@@ -476,6 +498,23 @@ class BrewWorkflowTests(unittest.TestCase):
                            request=lambda url, body=None: {})
         self.assertIn("root", str(caught.exception))
         self.assertEqual(len(self.calls), 4)  # probe only; no inventory, no scan, no update
+
+    def test_failed_cask_step_names_the_step_not_env(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
+        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
+        # apply re-collects inventory first, then runs the three approved steps.
+        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", ""]
+        def failing(t, argv, **kwargs):
+            if argv[-2:] == ["upgrade", "--cask"]:  # not `brew list --cask` during inventory
+                raise Error("Command failed: brew upgrade --cask (exit 1)")
+            return probe.pop(0) if probe else ''
+        with self.assertRaises(Error) as caught:
+            workflow.apply(self.store, plan["id"], yes=True, runner=failing,
+                           request=lambda url, body=None: {})
+        self.assertIn("brew upgrade --cask", str(caught.exception))
+        self.assertNotIn("env PATH", str(caught.exception))
+        self.assertEqual(self.store.db.execute("SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0],
+                         "needs_attention")
 
     def test_preview_warns_about_casks(self):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
