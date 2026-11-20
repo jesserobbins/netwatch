@@ -11,8 +11,9 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
     try:
         packages = adapters.inventory(t, runner)
     except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError) as exc:
-        store.event(t["name"], "collection_failed", {"error": str(exc) if isinstance(exc, Error) else "Invalid inventory output"})
-        raise Error("Inventory collection failed; previous report retained (see history)") from exc
+        reason = str(exc) if isinstance(exc, Error) else "Invalid inventory output"
+        store.event(t["name"], "collection_failed", {"error": reason})
+        raise Error(f"Inventory collection failed: {reason}; previous report retained (see history)") from exc
     findings, warnings, complete, evidence = sources.assess(t, packages, store, offline=offline, refresh=refresh, refreshed=refreshed, request=request, runner=runner)
     available, update_error = [], None
     if offline:
@@ -33,6 +34,7 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
     report = {"target": t, "packages": packages, "findings": findings,
               "updates": available, "warnings": warnings, "advisory_check_ok": complete,
               "evidence": evidence, "update_error": update_error,
+              "coverage": next((e["coverage"] for e in evidence if "coverage" in e), None),
               "matcher_revision": 2 if t["kind"] in ("arch", "cachyos") else 1}
     if context:
         previous = store.latest(t["name"])
@@ -49,7 +51,9 @@ def preview(store, t, runner=adapters.run):
             "observed_updates": available,
             "scope": "Update the ENTIRE selected environment using configured repositories and project constraints. "
                      "This is not an exact-version transaction: repository changes can change what is installed. "
-                     "Dependencies, scripts and services may be affected. Back up first.",
+                     "Dependencies, scripts and services may be affected. Back up first."
+                     + (" Cask upgrades may need privileges, quit running applications or run installers;"
+                        " formulae and casks run as separate commands." if t["kind"] == "brew" else ""),
             "expires_at": int(time.time()) + 3600}
     with store.transaction():
         row = store.db.execute("INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",

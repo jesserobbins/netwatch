@@ -81,6 +81,16 @@ class Store:
                     self.event(name, "finding_changed" if key in old else "finding_new", row)
             # Only successful evidence collection can clear previous findings.
             if report["advisory_check_ok"]:
+                # A scan that ran but skipped packages can only clear the formulae it
+                # covered; the rest keep their prior finding, marked unknown.
+                scope = (report.get("coverage") or {}).get("scanned")
+                if scope is not None:
+                    for key in old.keys() - new.keys():
+                        if old[key]["package"] not in scope:
+                            new[key] = {**old[key], "state": "unknown",
+                                        "reason": "Not scanned by this check; previous finding retained"}
+                            if new[key] != old[key]:
+                                self.event(name, "finding_changed", new[key])
                 removed = old.keys() - new.keys()
                 if removed and previous.get("matcher_revision", 1) != report.get("matcher_revision", 1):
                     self.event(name, "findings_reassessed", {"previous_scan": previous["id"], "removed": len(removed),

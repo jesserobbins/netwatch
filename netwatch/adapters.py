@@ -80,7 +80,8 @@ def os_info(t, runner):
         if runner(t, ["uname", "-s"]).strip() != "Darwin":
             raise Error("Homebrew adapter requires a macOS host")
         return {"ID": "macos", "PLATFORM": runner(t, ["uname", "-m"]).strip(),
-                "VERSION": runner(t, ["sw_vers", "-productVersion"]).strip()}
+                "VERSION": runner(t, ["sw_vers", "-productVersion"]).strip(),
+                "UID": runner(t, ["id", "-u"]).strip()}
     data = {}
     for line in runner(t, ["cat", "/etc/os-release"]).splitlines():
         if "=" in line and not line.startswith("#"):
@@ -170,7 +171,11 @@ BREW_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
 
 def brew_inventory(t, runner):
     """One row per installed keg version, formulae then casks."""
-    os_info(t, runner)
+    if os_info(t, runner)["UID"] == "0":
+        # Homebrew must not run as root, and every check or apply path collects
+        # inventory first, so refusing here covers all of them without adding an
+        # unapproved command to the apply sequence.
+        raise Error("Homebrew must not run as root; re-run as the invoking user")
     result = []
     for ecosystem, argv in (("Homebrew", ["brew", "list", "--versions"]),
                             ("Homebrew-cask", ["brew", "list", "--cask", "--versions"])):
@@ -209,6 +214,8 @@ def updates(t, runner=run):
         if data.get("success") is False or data.get("error"):
             raise Error("Environment solver could not determine updates")
         return [{"package": r["name"], "candidate": r["version"]} for r in data.get("actions", {}).get("LINK", [])]
+    if kind == "brew":
+        return brew_outdated(t, runner)
     if kind == "uv":
         data = json.loads(runner(t, ["uv", "pip", "list", "--outdated", "--format", "json", "--python",
                                     t["path"].rstrip("/") + "/.venv/bin/python"]))
@@ -216,6 +223,25 @@ def updates(t, runner=run):
     data = json.loads(runner(t, ["npm", "outdated", "--json"], ok=(0, 1)) or "{}")
     return [{"package": n, "candidate": r.get("wanted"), "latest": r.get("latest")} for n, r in sorted(data.items())]
 
+
+
+def brew_outdated(t, runner):
+    """Pending updates, with held and greedy-only entries marked honestly."""
+    def rows(*extra):
+        data = json.loads(runner(t, brew_env("brew", "outdated", "--json=v2", *extra), timeout=300))
+        found = {r["name"]: ("Homebrew", r) for r in data.get("formulae", [])}
+        found.update({r["name"]: ("Homebrew-cask", r) for r in data.get("casks", [])})
+        return found
+    plain, greedy = rows(), rows("--greedy")
+    result = []
+    for name, (ecosystem, row) in sorted(greedy.items()):
+        entry = {"package": name, "candidate": row.get("current_version"), "ecosystem": ecosystem}
+        if row.get("pinned"):
+            entry.update(held=True, held_version=row.get("pinned_version"))
+        if name not in plain:
+            entry.update(greedy_only=True, reason="Excluded from the default outdated list")
+        result.append(entry)
+    return result
 
 def commands(t):
     """Operator-approved environment-wide updates, not arbitrary feed commands."""

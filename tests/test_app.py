@@ -247,9 +247,9 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(t["path"])
         with self.assertRaises(Error):
             adapters.target("laptop", "brew", path="/opt/thing")
-        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n"])
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n"])
         self.assertEqual(adapters.os_info(t, run),
-                         {"ID": "macos", "PLATFORM": "arm64", "VERSION": "15.3.1"})
+                         {"ID": "macos", "PLATFORM": "arm64", "VERSION": "15.3.1", "UID": "501"})
         self.assertEqual(self.calls[0][0], ["uname", "-s"])
 
     def test_brew_refuses_non_darwin_host(self):
@@ -259,7 +259,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_brew_inventory_formulae_and_casks(self):
         t = adapters.target("laptop", "brew")
-        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n",
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
                            "abseil 20260817.0\npython@3.12 3.12.7\npython@3.13 3.13.1\n",
                            "claude-code 2.1.311\nantigravity-cli 1.5.13,5999302598852608\n"])
         rows = adapters.inventory(t, run)
@@ -268,12 +268,12 @@ class AdapterTests(unittest.TestCase):
                           ("claude-code", "2.1.311"), ("python@3.12", "3.12.7"), ("python@3.13", "3.13.1")])
         self.assertEqual({p["ecosystem"] for p in rows if p["name"].startswith("python")}, {"Homebrew"})
         self.assertEqual(next(p for p in rows if p["name"] == "claude-code")["ecosystem"], "Homebrew-cask")
-        self.assertEqual(self.calls[3][0][-3:], ["brew", "list", "--versions"])
-        self.assertEqual(self.calls[4][0][-4:], ["brew", "list", "--cask", "--versions"])
+        self.assertEqual(self.calls[4][0][-3:], ["brew", "list", "--versions"])
+        self.assertEqual(self.calls[5][0][-4:], ["brew", "list", "--cask", "--versions"])
 
     def test_brew_inventory_rejects_unparsable_line(self):
         t = adapters.target("laptop", "brew")
-        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "abseil\n"])
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "abseil\n"])
         with self.assertRaises(Error):
             adapters.inventory(t, run)
 
@@ -360,6 +360,97 @@ SCAN_PARTIAL = json.dumps({
                                        "fixed_versions": []}]}],
     "skipped_formulae": ["playwright-cli", "lame"], "checked": 2, "complete": False,
     "outdated_without_sbom": [], "unscanned_formulae": {"wacli": "untrusted_tap"}})
+
+
+
+class BrewWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = Store(Path(self.tmp.name) / "state.db")
+        self.addCleanup(self.store.close)
+        self.t = adapters.target("laptop", "brew")
+        self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("laptop", canonical(self.t)))
+
+    def scripted(self, outputs, calls=None):
+        outputs = list(outputs)
+        self.calls = [] if calls is None else calls
+        def run(t, argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            if not outputs:
+                raise AssertionError("Unexpected command: " + json.dumps(argv))
+            return outputs.pop(0)
+        return run
+
+    def scan(self, findings, skipped=(), unscanned=None, complete=False, checked=1):
+        return json.dumps({"findings": findings, "skipped_formulae": list(skipped), "checked": checked,
+                           "complete": complete, "outdated_without_sbom": [],
+                           "unscanned_formulae": unscanned or {}})
+
+    def finding(self, formula, version, advisory="OSV-2020-2308"):
+        return {"formula": formula, "version": version, "tag": "v" + version,
+                "repo_url": "https://github.com/example/" + formula,
+                "vulnerabilities": [{"id": advisory, "severity": "MEDIUM", "summary": "s",
+                                     "aliases": [], "fixed_versions": ["9.9"]}]}
+
+    def check(self, formulae, scan_json):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae, "", "vulns\n", scan_json, "{}", "{}"]
+        return workflow.check(self.store, self.t, runner=self.scripted(outputs),
+                              request=lambda url, body=None: {})
+
+    def test_coverage_is_on_the_report_and_partial_scan_is_not_a_failure(self):
+        report = self.check("libheif 1.23.7\n", self.scan([self.finding("libheif", "1.23.7")],
+                                                           skipped=["lame"]))
+        self.assertTrue(report["advisory_check_ok"])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertEqual(report["coverage"]["scanned"], ["libheif"])
+        self.assertTrue(any("absence of findings" in w for w in report["warnings"]))
+
+    def test_scanned_formula_clears_after_upgrade_despite_partial_coverage(self):
+        self.check("libheif 1.23.7\n", self.scan([self.finding("libheif", "1.23.7")], skipped=["lame"]))
+        report = self.check("libheif 1.24.0\n", self.scan([], skipped=["lame"]))
+        self.assertEqual(report["findings"], [])
+        self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
+
+    def test_unscanned_formula_keeps_prior_finding_as_unknown(self):
+        self.check("libheif 1.24.0\nlame 3.100\n",
+                   self.scan([self.finding("lame", "3.100", "OSV-2020-9999")], complete=True, checked=2))
+        report = self.check("libheif 1.24.0\nlame 3.100\n", self.scan([], skipped=["lame"]))
+        self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-9999"])
+        self.assertEqual(report["findings"][0]["state"], "unknown")
+
+    def test_brew_outdated_marks_greedy_only_and_held(self):
+        plain = json.dumps({"formulae": [{"name": "pydantic", "installed_versions": ["2.14.3"],
+                                          "current_version": "2.14.4", "pinned": False, "pinned_version": None},
+                                         {"name": "openssl@3", "installed_versions": ["3.5.8"],
+                                          "current_version": "3.5.9", "pinned": True, "pinned_version": "3.5.8"}],
+                            "casks": []})
+        greedy = json.dumps({"formulae": [{"name": "pydantic", "installed_versions": ["2.14.3"],
+                                           "current_version": "2.14.4", "pinned": False, "pinned_version": None},
+                                          {"name": "openssl@3", "installed_versions": ["3.5.8"],
+                                           "current_version": "3.5.9", "pinned": True, "pinned_version": "3.5.8"}],
+                             "casks": [{"name": "1password", "installed_versions": ["8.11"],
+                                        "current_version": "8.12.46", "pinned": False, "pinned_version": None}]})
+        rows = adapters.brew_outdated(self.t, self.scripted([plain, greedy]))
+        self.assertEqual([r["package"] for r in rows], ["1password", "openssl@3", "pydantic"])
+        self.assertTrue(next(r for r in rows if r["package"] == "1password")["greedy_only"])
+        held = next(r for r in rows if r["package"] == "openssl@3")
+        self.assertTrue(held["held"])
+        self.assertEqual(held["held_version"], "3.5.8")
+        self.assertNotIn("self_updating", rows[0])
+
+    def test_root_target_is_refused_before_anything_runs(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "0\n"]
+        with self.assertRaises(Error) as caught:
+            workflow.check(self.store, self.t, runner=self.scripted(outputs),
+                           request=lambda url, body=None: {})
+        self.assertIn("root", str(caught.exception))
+        self.assertEqual(len(self.calls), 4)  # probe only; no inventory, no scan, no update
+
+    def test_preview_warns_about_casks(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
+        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
+        self.assertIn("Cask upgrades", plan["scope"])
 
 
 TARGET = adapters.target("laptop", "brew")
