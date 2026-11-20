@@ -709,6 +709,40 @@ class BrewScanTests(unittest.TestCase):
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
 
+    def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
+        t = TARGET
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                             "ffmpeg 9.0.2_1\nopenssl@3 3.5.8\n", ""])
+        rows = adapters.inventory(t, run)
+        scan = json.dumps({"findings": [{"formula": "ffmpeg", "version": "9.0.2", "tag": "9.0.2",
+                                        "repo_url": "https://github.com/FFmpeg/FFmpeg",
+                                        "vulnerabilities": [{"id": "OSV-9", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 2, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        findings, warnings, coverage = sources.brew_scan(t, rows, self.scripted(["vulns\n", scan]))
+        self.assertEqual([f["installed"] for f in findings], ["9.0.2_1"])  # the keg's version
+        self.assertEqual(findings[0]["upstream_version"], "9.0.2")
+        self.assertEqual(coverage["scanned"], ["ffmpeg", "openssl@3"])
+        self.assertFalse(any("changed version" in w for w in warnings))
+
+    def test_checked_must_be_a_nonnegative_int(self):
+        for value in (True, -1, "1"):
+            bad = json.dumps({"findings": [], "skipped_formulae": [], "checked": value, "complete": True,
+                              "outdated_without_sbom": [], "unscanned_formulae": {}})
+            with self.assertRaises(Error):
+                sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+
+    def test_checked_below_the_results_it_produced_is_malformed(self):
+        rows = self.packages(("x", "1"), ("y", "1"))
+        two = [{"formula": name, "version": "1", "tag": "v1", "repo_url": "https://example.com/" + name,
+                "vulnerabilities": [{"id": "OSV-" + name, "severity": "LOW", "summary": "s",
+                                     "aliases": [], "fixed_versions": []}]} for name in ("x", "y")]
+        bad = json.dumps({"findings": two, "skipped_formulae": [], "checked": 1, "complete": True,
+                          "outdated_without_sbom": [], "unscanned_formulae": {}})
+        with self.assertRaises(Error):  # two results from one checked formula is not possible
+            sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", bad]))
+
     def test_dict_findings_field_is_rejected(self):
         bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,
                           "outdated_without_sbom": [], "unscanned_formulae": {}})

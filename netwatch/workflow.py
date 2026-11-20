@@ -23,8 +23,7 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         # findings and publish none of the new ones.
         formulae = [(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"]
         try:
-            after = [(p["name"], p["version"]) for p in adapters.inventory(t, runner)
-                     if p["ecosystem"] == "Homebrew"]
+            after = [(p["name"], p["version"]) for p in adapters.brew_formula_inventory(t, runner)]
         except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             after = None
         if after is None or sorted(after) != sorted(formulae):
@@ -32,6 +31,9 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             coverage.update(scanned=[], retained=sorted({name for name, _ in formulae}),
                             retained_versions=sorted([name, version] for name, version in formulae),
                             complete=False, changed_during_scan=True)
+            # The scan's evidence cannot be tied to this host, so the advisory check is
+            # incomplete rather than clean, and check exits 1.
+            complete = False
             warnings.append("Coverage: installed formulae changed or could not be re-read while Homebrew's "
                             "scan ran; earlier findings are retained and no scan result is used — re-run the check")
     available, update_error = [], None

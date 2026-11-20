@@ -188,7 +188,26 @@ def npm_inventory(t, runner):
     return list(result.values())
 
 
+# Homebrew writes a revision into the keg name (`ffmpeg 9.0.2_1`), so `_` is legal;
+# 21 formulae on the reference host carry one.
 BREW_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
+
+
+def brew_base(version):
+    """`9.0.2_1` -> `9.0.2`: `brew vulns` reports the upstream version, not the keg's."""
+    return version.split("_", 1)[0]
+
+
+def brew_formula_inventory(t, runner):
+    """Formulae only. Advisory reconciliation must not pay for a cask listing."""
+    os_info(t, runner)
+    result = []
+    for line in runner(t, brew_env("brew", "list", "--versions")).splitlines():
+        parts = line.split()
+        if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
+            raise Error("Unrecognized Homebrew inventory line")
+        result.extend(package(parts[0], version, "Homebrew") for version in parts[1:])
+    return result
 
 
 def brew_inventory(t, runner):
@@ -255,6 +274,8 @@ def brew_outdated(t, runner):
         found = {("Homebrew", r["name"]): r for r in data.get("formulae", [])}
         found.update({("Homebrew-cask", r["name"]): r for r in data.get("casks", [])})
         for row in found.values():
+            if not isinstance(row.get("name"), str) or not row["name"]:
+                raise Error("Unrecognized Homebrew update name")
             for field in ("current_version", "pinned_version"):
                 value = row.get(field)
                 if value is not None and not isinstance(value, str):

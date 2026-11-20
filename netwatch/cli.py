@@ -157,7 +157,8 @@ def display(result, json_output=False, show_all=False):
             emit(f"  Update check: {safe(report['update_error'])}; last observed {date(report.get('updates_observed_at'))}", "yellow")
         for plan in item["pending_updates"]:
             emit(f"  Update plan {plan['id']}: {safe(plan['status'])}", "yellow")
-        updates = {u["package"]: u for u in report["updates"]}
+        updates = {u["package"]: u for u in report["updates"]
+                   if u.get("ecosystem") in (None, "Homebrew")}
         shortened = False
         for state, label in (("affected", "Affected"), ("unknown", "Needs review")):
             groups = defaultdict(list)
