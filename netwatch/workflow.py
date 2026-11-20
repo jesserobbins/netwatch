@@ -39,15 +39,13 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
     if context:
         previous = store.latest(t["name"])
         coverage = next((e["coverage"] for e in evidence if "coverage" in e), None)
-        retained = set((coverage or {}).get("retained") or [])
         prior = previous["findings"] if previous else []
-        carried = [row for row in prior if row["package"] in retained]
-        if carried:
-            linked = [*carried, *findings]
-        elif complete or not previous:
-            linked = findings
+        if not complete:
+            carried = prior  # the store keeps every prior finding on incomplete evidence
         else:
-            linked = [*prior, *findings]
+            pairs = {tuple(pair) for pair in (coverage or {}).get("retained_versions") or []}
+            carried = [row for row in prior if (row["package"], row["installed"]) in pairs]
+        linked = [*carried, *findings] if carried else findings
         report["context"] = sources.context(packages, linked, store, offline=offline, refresh=refresh,
                                             refreshed=refreshed, request=request)
     return store.save_scan(t["name"], report)
@@ -116,10 +114,16 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
             store.event(t["name"], "applied", result)
         return result
     except BaseException as exc:
+        step = str(exc).split(";")[0] if isinstance(exc, Error) else None
+        detail = {"error": "Update interrupted/failed or verification unavailable; inspect the system before retrying"}
+        if step and step.startswith("Update step failed:"):
+            detail["failed_step"] = step.split(":", 1)[1].strip()
         with store.transaction():
             store.db.execute("UPDATE plans SET status='needs_attention',result=? WHERE id=?",
-                             (canonical({"error": "Update interrupted/failed or verification unavailable; inspect the system before retrying"}), id_))
-            store.event(t["name"], "needs_attention", {"plan": id_, "error": type(exc).__name__})
+                             (canonical(detail), id_))
+            store.event(t["name"], "needs_attention",
+                        {"plan": id_, "error": type(exc).__name__, **({"failed_step": detail["failed_step"]}
+                                                                       if "failed_step" in detail else {})})
         raise
 
 

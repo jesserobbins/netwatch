@@ -50,6 +50,9 @@ def step_label(argv):
             args = shlex.split(args[-1])
         except ValueError:
             return args[0]
+        # A project target is wrapped as `cd -- PATH && <command>`.
+        if args[:2] == ["cd", "--"] and "&&" in args:
+            args = args[args.index("&&") + 1:]
     if args and args[0] == "env":
         args = args[1:]
         while args and "=" in args[0]:

@@ -210,9 +210,14 @@ def display(result, json_output=False, show_all=False):
         if report["updates"]:
             emit("\nAvailable updates:", "bold cyan")
             emit("  Repository candidates; not all are security fixes.", "dim")
-            versions = defaultdict(set)
+            versions, by_name = defaultdict(set), defaultdict(set)
             for p in report["packages"]:
-                versions[p["name"]].add(p["version"])
+                versions[(p.get("ecosystem"), p["name"])].add(p["version"])
+                by_name[p["name"]].add(p["version"])
+
+            def installed_for(row):
+                # Homebrew keeps formulae and casks apart; a name can appear in both.
+                return versions.get((row.get("ecosystem"), row["package"])) or by_name[row["package"]]
             affected = {r["package"] for r in report["findings"] if r["state"] == "affected"}
             review = {r["package"] for r in report["findings"] if r["state"] == "unknown"}
             rows = sorted(report["updates"], key=lambda u: (u["package"] not in affected,
@@ -220,12 +225,16 @@ def display(result, json_output=False, show_all=False):
             grid = table("Package", "Installed", "Available", "Finding") if wide else None
             for row in rows if show_all else rows[:10]:
                 n = row["package"]
-                label, style = (" [affected]", "bold red") if n in affected else ((" [review]", "yellow") if n in review else ("", "cyan"))
+                # Advisories cover formulae, never casks, so a same-named cask row must not
+                # inherit the formula's marker.
+                advisory_applies = row.get("ecosystem") in (None, "Homebrew")
+                label, style = (" [affected]", "bold red") if advisory_applies and n in affected else (
+                    (" [review]", "yellow") if advisory_applies and n in review else ("", "cyan"))
                 # A held formula and a cask excluded from the default list are not
                 # updates the approved plan will take, so say which one it is.
                 state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
                     " [not in default upgrade]" if row.get("greedy_only") else "")
-                installed = safe(', '.join(sorted(versions[n])) or '?')
+                installed = safe(', '.join(sorted(installed_for(row))) or '?')
                 candidate = safe(row.get('candidate') or 'unknown')
                 if grid is not None:
                     grid.add_row(Text(safe(n), style="bold"), Text(installed, style="dim"), Text(candidate, style="bold cyan"),

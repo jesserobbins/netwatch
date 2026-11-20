@@ -189,7 +189,9 @@ def brew_scan(t, packages, runner, *, offline=False):
     pairs = {(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"}
     formulae = {name for name, _ in pairs}
     coverage = {"scanner": None, "checked": 0, "complete": False, "deferred": False,
-                "skipped": [], "unscanned": {}, "scanned": [], "retained": sorted(formulae)}
+                "skipped": [], "unscanned": {}, "outdated_without_sbom": [],
+                "scanned": [], "retained": sorted(formulae),
+                "retained_versions": sorted([name, version] for name, version in pairs)}
     if offline:
         coverage["deferred"] = True
         return [], ["Coverage: Homebrew's scan needs the target and was skipped in offline mode; prior findings retained"], coverage
@@ -203,18 +205,27 @@ def brew_scan(t, packages, runner, *, offline=False):
         data = json.loads(raw)
         if not isinstance(data["findings"], list) or not isinstance(data["skipped_formulae"], list) \
                 or not isinstance(data["unscanned_formulae"], dict) or not isinstance(data["checked"], int) \
-                or not isinstance(data["complete"], bool):
+                or not isinstance(data["complete"], bool) \
+                or not isinstance(data.get("outdated_without_sbom", []), list):
             raise TypeError("unexpected scan field types")
         coverage.update(checked=data["checked"], complete=data["complete"],
                         skipped=sorted(text(name, "skipped formula") for name in data["skipped_formulae"]),
                         unscanned={text(k, "unscanned formula"): text(v, "reason")
-                                   for k, v in data["unscanned_formulae"].items()})
+                                   for k, v in data["unscanned_formulae"].items()},
+                        # Homebrew reports these against the current formula version, not the
+                        # installed one, so they cannot clear a finding either.
+                        outdated_without_sbom=sorted(text(n, "outdated formula")
+                                                     for n in data.get("outdated_without_sbom") or []))
         parsed = []
         for row in data["findings"]:
             formula, version = text(row["formula"], "formula name"), text(row["version"], "installed version")
             vulnerabilities = row["vulnerabilities"]
             if not isinstance(vulnerabilities, list):
                 raise TypeError("unexpected vulnerabilities type")
+            for advisory in vulnerabilities:
+                fixed = advisory.get("fixed_versions") or []
+                if not isinstance(fixed, list) or any(not isinstance(value, str) for value in fixed):
+                    raise TypeError("unexpected fixed_versions type")
             parsed.append({"formula": formula, "version": version,
                            "repository": text(row["repo_url"], "repository URL"), "tag": text(row["tag"], "upstream tag"),
                            "vulnerabilities": [{"id": text(a["id"], "advisory id"), "severity": a.get("severity", "Unknown"),
@@ -222,15 +233,21 @@ def brew_scan(t, packages, runner, *, offline=False):
                                                 "fixed": a.get("fixed_versions") or []} for a in vulnerabilities]})
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Error("Homebrew vulnerability scan output is malformed") from exc
-    uncovered = set(coverage["skipped"]) | set(coverage["unscanned"])
+    uncovered = set(coverage["skipped"]) | set(coverage["unscanned"]) | set(coverage["outdated_without_sbom"])
+    # A formula can be upgraded between inventory and scan. A finding for a version
+    # this host does not report installed cannot be trusted either way, so that
+    # formula's coverage is unknown and its prior findings are kept.
+    unmatched = {row["formula"] for row in parsed if (row["formula"], row["version"]) not in pairs}
+    uncovered |= unmatched
     coverage["scanned"] = sorted(formulae - uncovered)
     coverage["retained"] = sorted(formulae & uncovered)
-    # A formula can be upgraded between inventory and scan. Findings for versions
-    # this host does not report installed would otherwise outlive their evidence.
-    warnings, result, unmatched = [], [], 0
+    coverage["retained_versions"] = sorted([name, version] for name, version in pairs if name in uncovered)
+    warnings, result = [], []
+    if unmatched:
+        warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
+                        "scan; their earlier findings are retained — re-run the check")
     for row in parsed:
-        if (row["formula"], row["version"]) not in pairs:
-            unmatched += 1
+        if row["formula"] in unmatched:
             continue
         for advisory in row["vulnerabilities"]:
             item = finding({"ecosystem": "Homebrew", "name": row["formula"], "version": row["version"]},
@@ -247,9 +264,12 @@ def brew_scan(t, packages, runner, *, offline=False):
     if coverage["retained"]:
         warnings.append(f"Coverage: {len(coverage['retained'])} installed formulae were not scanned by Homebrew; "
                         "their earlier findings are retained and absence of findings is absence of evidence")
+    if coverage["outdated_without_sbom"]:
+        warnings.append(f"Coverage: {len(coverage['outdated_without_sbom'])} formulae were scanned against the current "
+                        "formula version, not the installed one; their results are not used")
     if any(name not in formulae for name in coverage["skipped"]):
         warnings.append("Coverage: scan named packages this host does not report as installed")
-    return result, warnings, coverage
+    return result, sorted(set(warnings)), coverage
 
 
 def advisory_references(findings, *, cves_only=False):

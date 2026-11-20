@@ -84,10 +84,13 @@ class Store:
                 # A scan that ran but skipped packages keeps their prior findings,
                 # marked unknown. Everything else — scanned formulae and formulae no
                 # longer installed — clears, as it does for every other kind.
-                retained = (report.get("coverage") or {}).get("retained")
+                # Retained by (formula, version): a skipped formula that has since been
+                # upgraded is a different observation, so its old finding retires.
+                retained = (report.get("coverage") or {}).get("retained_versions")
                 if retained is not None:
+                    pairs = {tuple(pair) for pair in retained}
                     for key in old.keys() - new.keys():
-                        if old[key]["package"] in retained:
+                        if (old[key]["package"], old[key]["installed"]) in pairs:
                             new[key] = {**old[key], "state": "unknown",
                                         "reason": "Not scanned by this check; previous finding retained"}
                             if new[key] != old[key]:

@@ -252,6 +252,14 @@ class AdapterTests(unittest.TestCase):
                          {"ID": "macos", "PLATFORM": "arm64", "VERSION": "15.3.1", "UID": "501"})
         self.assertEqual(self.calls[0][0], ["uname", "-s"])
 
+    def test_step_label_names_the_tool_behind_wrappers(self):
+        self.assertEqual(adapters.step_label(adapters.brew_env("brew", "upgrade", "--cask")),
+                         "brew upgrade --cask")
+        remote = ["ssh", "-o", "BatchMode=yes", "host", "cd -- /srv/a && uv lock --upgrade"]
+        self.assertEqual(adapters.step_label(remote), "uv lock --upgrade")
+        self.assertEqual(adapters.step_label(["ssh", "host", "npm update --ignore-scripts"]),
+                         "npm update --ignore-scripts")
+
     def test_brew_refuses_non_darwin_host(self):
         t = adapters.target("server", "brew")
         with self.assertRaises(Error):
@@ -285,8 +293,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("NONINTERACTIVE=1", argv)
         self.assertEqual(argv[-3:], ["brew", "list", "--versions"])
         self.assertNotIn("sudo", " ".join(" ".join(argv) for argv in adapters.commands(t)))
-        self.assertTrue(all(commands[:5] == adapters.brew_env("brew", "upgrade", flag)[:5]
-                            for commands, flag in zip(adapters.commands(t), ("--formula", "--cask"))))
+        # The exact step list is pinned by test_brew_commands_refresh_then_upgrade_by_half.
 
 
 class SourceTests(unittest.TestCase):
@@ -413,6 +420,41 @@ class BrewWorkflowTests(unittest.TestCase):
         report = self.check("libheif 1.24.0\nlame 3.100\n", self.scan([], skipped=["lame"]))
         self.assertEqual(report["findings"], [])
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
+
+    def test_skipped_formula_upgrade_retires_the_old_version_finding(self):
+        self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100", "OSV-1")], skipped=["lame"]))
+        report = self.check("libheif 1.23.7\nlame 3.101\n", self.scan([], skipped=["lame"]))
+        self.assertEqual(report["findings"], [])
+        self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
+
+    def test_version_change_between_collection_and_scan_keeps_prior_finding(self):
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
+        report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.24.0")], complete=True, checked=2))
+        self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
+        self.assertEqual(report["findings"][0]["state"], "unknown")
+        self.assertTrue(any("changed version" in w for w in report["warnings"]))
+
+    def test_outdated_without_sbom_counts_as_uncovered(self):
+        report = self.check(self.INSTALLED, json.dumps({
+            "findings": [], "skipped_formulae": [], "checked": 1, "complete": False,
+            "outdated_without_sbom": ["lame"], "unscanned_formulae": {}}))
+        self.assertEqual(report["coverage"]["retained"], ["lame"])
+        self.assertEqual(report["coverage"]["scanned"], ["libheif"])
+        self.assertTrue(any("current formula version" in w for w in report["warnings"]))
+
+    def test_failed_step_is_recorded_in_the_plan_result(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
+        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
+        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", ""]
+        def failing(t, argv, **kwargs):
+            if argv[-2:] == ["upgrade", "--cask"]:
+                raise Error("nope")
+            return probe.pop(0) if probe else ''
+        with self.assertRaises(Error):
+            workflow.apply(self.store, plan["id"], yes=True, runner=failing, request=lambda u, b=None: {})
+        saved = json.loads(self.store.db.execute("SELECT result FROM plans WHERE id=?", (plan["id"],)).fetchone()[0])
+        self.assertIn("brew upgrade --cask", saved["failed_step"])
+        self.assertNotIn("nope", json.dumps(saved))  # raw tool text stays out of history
 
     def test_uninstalled_formula_finding_is_retired(self):
         self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100")], complete=True, checked=2))
@@ -606,6 +648,16 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["retained"], ["x"])
         self.assertEqual(self.calls, [])
         self.assertTrue(any("offline mode" in w for w in warnings))
+
+    def test_string_fixed_versions_is_rejected(self):
+        bad = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
+                                       "repo_url": "https://example.com/x",
+                                       "vulnerabilities": [{"id": "OSV-1", "severity": "LOW", "summary": "s",
+                                                            "aliases": [], "fixed_versions": "1.2.3"}]}],
+                          "skipped_formulae": [], "checked": 1, "complete": True,
+                          "outdated_without_sbom": [], "unscanned_formulae": {}})
+        with self.assertRaises(Error):
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
 
     def test_dict_findings_field_is_rejected(self):
         bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,
