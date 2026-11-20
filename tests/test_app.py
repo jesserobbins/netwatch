@@ -507,6 +507,19 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(any("no vulnerability scanner" in w for w in warnings))
 
+    def test_pwn_watch_matches_formulae_but_not_colliding_cask_names(self):
+        catalog = {"generatedAt": "2026-11-20T00:00:00Z", "incidents": [
+            {"slug": "gemini-thing", "title": "Gemini problem", "product": "Gemini", "severity": "high",
+             "patchStatus": "patched", "updatedAt": "2026-11-19T00:00:00Z", "isExample": False,
+             "category": "supply-chain", "status": "live", "tags": ["gemini"], "cveIds": []},
+            {"slug": "openssl-thing", "title": "OpenSSL problem", "product": "OpenSSL", "severity": "high",
+             "patchStatus": "patched", "updatedAt": "2026-11-19T00:00:00Z", "isExample": False,
+             "category": "supply-chain", "status": "live", "tags": ["openssl@3"], "cveIds": []}]}
+        packages = [adapters.package("gemini", "2.10.1", "Homebrew-cask"),
+                    adapters.package("openssl@3", "3.5.9", "Homebrew")]
+        matched = sources.pwn_context(packages, [], catalog)
+        self.assertEqual([m["id"] for m in matched], ["openssl-thing"])
+
     def test_malformed_scan_output_fails_loudly(self):
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", "not json"]))

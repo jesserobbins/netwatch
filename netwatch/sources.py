@@ -289,6 +289,10 @@ def pwn_context(packages, findings, data):
                "nodejs": "node", "bind9": "bind"}
     names = {}
     for p in packages:
+        # Cask names collide with unrelated projects: a cask "gemini" on this
+        # host is MacPaw Gemini, not Google's gemini-cli.
+        if p["ecosystem"] == "Homebrew-cask":
+            continue
         normalize = lambda n: re.sub(r"[-_.]+", "-", n.lower()) if p["ecosystem"] == "PyPI" else n.lower()
         for name in {p["name"], p.get("source", p["name"])}:
             tag = normalize(name)
