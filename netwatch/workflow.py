@@ -15,6 +15,25 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         store.event(t["name"], "collection_failed", {"error": reason})
         raise Error(f"Inventory collection failed: {reason}; previous report retained (see history)") from exc
     findings, warnings, complete, evidence = sources.assess(t, packages, store, offline=offline, refresh=refresh, refreshed=refreshed, request=request, runner=runner)
+    coverage = next((e["coverage"] for e in evidence if "coverage" in e), None)
+    # Only a scan that could clear a prior finding needs to prove the host held still:
+    # reconciliation exists to protect findings, and costs a second collection.
+    before = store.latest(t["name"])
+    if coverage is not None and coverage.get("scanner") is True and not coverage.get("deferred") \
+            and before and before.get("findings"):
+        # The scan is a second observation of the same host. If inventory moved while it
+        # ran, its version claims cannot be reconciled with this report, so no finding of
+        # the previous check may be cleared on its evidence.
+        try:
+            after = adapters.inventory(t, runner)
+        except Error:
+            after = None
+        if after is None or digest(after) != digest(packages):
+            coverage.update(scanned=[], retained=sorted({p["name"] for p in packages}),
+                            retained_versions=sorted([p["name"], p["version"]] for p in packages),
+                            complete=False, changed_during_scan=True)
+            warnings.append("Coverage: installed versions changed while Homebrew's scan ran; "
+                            "earlier findings are retained — re-run the check")
     available, update_error = [], None
     if offline:
         update_error = "Update availability not refreshed in offline mode"

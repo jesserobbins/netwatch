@@ -178,6 +178,26 @@ def osv(p, data):
 
 
 
+BREW_FIXED = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
+
+
+def advisory_fields(advisory):
+    """Validate the optional fields instead of trusting Homebrew's JSON types.
+
+    A numeric overflow (1e400) decodes to infinity, which the store cannot
+    serialise; an object where a string belongs is equally able to replace a
+    recorded fix with nonsense.
+    """
+    aliases = advisory.get("aliases") or []
+    if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+        raise TypeError("unexpected aliases type")
+    severity, summary = advisory.get("severity"), advisory.get("summary")
+    return {"id": text(advisory["id"], "advisory id"),
+            "severity": "Unknown" if severity is None else text(severity, "advisory severity"),
+            "summary": "" if summary is None else text(summary, "advisory summary"),
+            "aliases": aliases, "fixed": advisory.get("fixed_versions") or []}
+
+
 def brew_scan(t, packages, runner, *, offline=False):
     """Homebrew's own OSV scan.
 
@@ -224,19 +244,23 @@ def brew_scan(t, packages, runner, *, offline=False):
                 raise TypeError("unexpected vulnerabilities type")
             for advisory in vulnerabilities:
                 fixed = advisory.get("fixed_versions") or []
-                if not isinstance(fixed, list) or any(not isinstance(value, str) for value in fixed):
+                if not isinstance(fixed, list) or any(BREW_FIXED.fullmatch(value or "") is None for value in fixed
+                                                     if isinstance(value, str)) \
+                        or any(not isinstance(value, str) for value in fixed):
                     raise TypeError("unexpected fixed_versions type")
             parsed.append({"formula": formula, "version": version,
                            "repository": text(row["repo_url"], "repository URL"), "tag": text(row["tag"], "upstream tag"),
-                           "vulnerabilities": [{"id": text(a["id"], "advisory id"), "severity": a.get("severity", "Unknown"),
-                                                "summary": a.get("summary", ""), "aliases": a.get("aliases") or [],
-                                                "fixed": a.get("fixed_versions") or []} for a in vulnerabilities]})
+                           "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Error("Homebrew vulnerability scan output is malformed") from exc
     uncovered = set(coverage["skipped"]) | set(coverage["unscanned"]) | set(coverage["outdated_without_sbom"])
     # A formula can be upgraded between inventory and scan. A finding for a version
     # this host does not report installed cannot be trusted either way, so that
     # formula's coverage is unknown and its prior findings are kept.
+    unreliable = set(coverage["outdated_without_sbom"]) | set(coverage["unscanned"])
+    # A finding for a formula Homebrew assessed against a different version than the
+    # installed one is not evidence about this host.
+    parsed = [row for row in parsed if row["formula"] not in unreliable]
     unmatched = {row["formula"] for row in parsed if (row["formula"], row["version"]) not in pairs}
     uncovered |= unmatched
     coverage["scanned"] = sorted(formulae - uncovered)
@@ -267,8 +291,6 @@ def brew_scan(t, packages, runner, *, offline=False):
     if coverage["outdated_without_sbom"]:
         warnings.append(f"Coverage: {len(coverage['outdated_without_sbom'])} formulae were scanned against the current "
                         "formula version, not the installed one; their results are not used")
-    if any(name not in formulae for name in coverage["skipped"]):
-        warnings.append("Coverage: scan named packages this host does not report as installed")
     return result, sorted(set(warnings)), coverage
 
 

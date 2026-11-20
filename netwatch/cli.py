@@ -216,8 +216,12 @@ def display(result, json_output=False, show_all=False):
                 by_name[p["name"]].add(p["version"])
 
             def installed_for(row):
-                # Homebrew keeps formulae and casks apart; a name can appear in both.
-                return versions.get((row.get("ecosystem"), row["package"])) or by_name[row["package"]]
+                # Homebrew keeps formulae and casks apart; a name can appear in both, so a
+                # row that names its ecosystem never falls back to the other one's versions.
+                found = versions.get((row.get("ecosystem"), row["package"]))
+                if found or row.get("ecosystem") is not None:
+                    return found or set()
+                return by_name[row["package"]]
             affected = {r["package"] for r in report["findings"] if r["state"] == "affected"}
             review = {r["package"] for r in report["findings"] if r["state"] == "unknown"}
             rows = sorted(report["updates"], key=lambda u: (u["package"] not in affected,

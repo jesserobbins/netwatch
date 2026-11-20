@@ -400,8 +400,15 @@ class BrewWorkflowTests(unittest.TestCase):
                 "vulnerabilities": [{"id": advisory, "severity": "MEDIUM", "summary": "s",
                                      "aliases": [], "fixed_versions": ["9.9"]}]}
 
-    def check(self, formulae, scan_json):
+    def check(self, formulae, scan_json, *, after="same"):
+        """Run a check. `after` is the inventory seen when the scan's own re-collection runs:
+        "same" (the host held still), None (no re-collection), or an explicit inventory."""
+        tail = formulae if after == "same" else after
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae, "", "vulns\n", scan_json, "{}", "{}"]
+        if after is not None:
+            # A scan that could clear a prior finding re-collects inventory; extra outputs
+            # are harmless when it does not run.
+            outputs += ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", tail, ""]
         return workflow.check(self.store, self.t, runner=self.scripted(outputs),
                               request=lambda url, body=None: {})
 
@@ -434,13 +441,24 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(report["findings"][0]["state"], "unknown")
         self.assertTrue(any("changed version" in w for w in report["warnings"]))
 
-    def test_outdated_without_sbom_counts_as_uncovered(self):
+    def test_inventory_change_during_the_scan_retains_prior_findings(self):
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
+        report = self.check(self.INSTALLED, self.scan([], complete=True),
+                            after="libheif 1.24.0\nlame 3.100\n")
+        self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
+        self.assertEqual(report["findings"][0]["state"], "unknown")
+        self.assertTrue(report["coverage"]["changed_during_scan"])
+        self.assertTrue(any("changed while Homebrew's scan ran" in w for w in report["warnings"]))
+
+    def test_outdated_without_sbom_findings_are_not_published(self):
         report = self.check(self.INSTALLED, json.dumps({
-            "findings": [], "skipped_formulae": [], "checked": 1, "complete": False,
-            "outdated_without_sbom": ["lame"], "unscanned_formulae": {}}))
+            "findings": [self.finding("lame", "3.099")], "skipped_formulae": [], "checked": 1,
+            "complete": False, "outdated_without_sbom": ["lame"], "unscanned_formulae": {}}))
         self.assertEqual(report["coverage"]["retained"], ["lame"])
         self.assertEqual(report["coverage"]["scanned"], ["libheif"])
+        self.assertEqual(report["findings"], [])
         self.assertTrue(any("current formula version" in w for w in report["warnings"]))
+        self.assertFalse(any("changed version" in w for w in report["warnings"]))
 
     def test_failed_step_is_recorded_in_the_plan_result(self):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
@@ -648,6 +666,16 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["retained"], ["x"])
         self.assertEqual(self.calls, [])
         self.assertTrue(any("offline mode" in w for w in warnings))
+
+    def test_numeric_overflow_severity_does_not_reach_the_store(self):
+        bad = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
+                                       "repo_url": "https://example.com/x",
+                                       "vulnerabilities": [{"id": "OSV-1", "severity": 1e400, "summary": "s",
+                                                            "aliases": [], "fixed_versions": []}]}],
+                          "skipped_formulae": [], "checked": 1, "complete": True,
+                          "outdated_without_sbom": [], "unscanned_formulae": {}})
+        with self.assertRaises(Error):
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
 
     def test_string_fixed_versions_is_rejected(self):
         bad = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
