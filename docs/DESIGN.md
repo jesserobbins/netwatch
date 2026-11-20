@@ -13,6 +13,7 @@ netwatch runs package tools locally or over SSH and stores observations in SQLit
 ## Behavior to preserve
 
 - Collect only registered environments. Commands come from adapter definitions; advisory text cannot supply commands or repositories.
+- Express Homebrew coverage per formula: a scan that ran but skipped packages clears findings only for the formulae it checked, and `complete: false` is reported as coverage rather than as a failed check. Homebrew's own scanner is the source; netwatch does not re-derive OSV matches for formulae.
 - Match Ubuntu notices using Noble source versions and binary membership. Use OSV for installed PyPI/npm packages. Keep uncertain Arch/CachyOS matches and missing conda-native coverage visible.
 - Retain earlier findings when collection or advisory requests fail. Record changes separately from routine checks.
 - `check --context` enriches existing CVE references through cve.now and locally matches pwn.watch live patch/supply-chain incidents by advisory IDs or exact package/source tags with fixed aliases, and matches Cloudflare Zero Wire briefings by exact CVE tags only. Keep all three sources outside applicability, fix-version and command selection. No inventory is sent to either source.

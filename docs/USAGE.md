@@ -59,6 +59,7 @@ Global flags (`--json`, `--db`) go before the command. Status returns the saved 
 | `conda`, `mamba` | The named tool and an existing prefix | OSV for pip/PyPI-origin entries only. Conda-native coverage is unknown. |
 | `uv` | uv and an installed project `.venv` | OSV for installed PyPI packages. |
 | `npm` | npm and installed dependencies | OSV for installed npm packages, including transitive dependencies. |
+| `brew` | Homebrew 7+ with the `vulns` command, on a macOS host (arm64 or Intel) | Homebrew's own OSV scan: formulae only, and only those it can map to an upstream repository and tag. |
 
 For repository packages on Arch/CachyOS, `vercmp` filters out notices whose fixed version is at or below the installed version. This removes historical matches; it does not verify CachyOS patch contents. Foreign packages and notices without usable fix versions remain for review. A missing or failed `vercmp` makes the advisory check incomplete.
 
@@ -68,7 +69,10 @@ Additional registration examples:
 netwatch add desktop arch --host my-desktop
 netwatch add workstation cachyos --host my-workstation
 netwatch add analysis conda --path /opt/conda/envs/analysis
+netwatch add laptop brew
 ```
+
+Homebrew coverage is reported per formula. A scan that ran but skipped packages clears findings only for the formulae it checked; skipped formulae and refused taps keep their earlier findings marked `unknown`, and `check` says how many formulae were not scanned. Casks are never scanned by Homebrew, produce no pwn.watch leads, and are tracked as inventory and updates only. A Homebrew older than 7.0 has no `vulns` command: the report says so instead of claiming a clean scan. Homebrew is never run as root, and a target whose `id -u` is 0 is refused during collection.
 
 Custom uv environment locations, uninstalled lockfile dependencies, containers, Snap and Flatpak are not scanned. Source forks need separate assessment. Held packages and project constraints can prevent an update from reaching an advisory's fixed version.
 
@@ -156,11 +160,13 @@ Findings have first/last-seen times. History records new or changed findings, fa
 | conda/mamba | `conda update --all --yes --prefix PATH` or its `mamba` equivalent |
 | uv | `uv lock --upgrade`, then `uv sync --locked` |
 | npm | `npm update --ignore-scripts` |
+| brew | `brew upgrade --formula`, then `brew upgrade --cask`, as the invoking user; never under `sudo` |
 
 - Arch/CachyOS always perform a full system upgrade.
 - Conda/mamba leave pip-installed packages unchanged.
 - uv updates within project constraints and syncs default groups.
 - npm skips scripts; packages needing build scripts may require follow-up.
+- Cask upgrades can need privileges, quit running applications or run installers, and they run as a separate command from formulae so a failure names the right half.
 - Package scripts and builds can run code and affect services.
 
 Use the package manager directly if you need to approve an exact list of versions.
