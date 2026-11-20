@@ -165,8 +165,26 @@ def npm_inventory(t, runner):
     return list(result.values())
 
 
+BREW_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
+
+
+def brew_inventory(t, runner):
+    """One row per installed keg version, formulae then casks."""
+    os_info(t, runner)
+    result = []
+    for ecosystem, argv in (("Homebrew", ["brew", "list", "--versions"]),
+                            ("Homebrew-cask", ["brew", "list", "--cask", "--versions"])):
+        for line in runner(t, brew_env(*argv)).splitlines():
+            parts = line.split()
+            if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
+                raise Error("Unrecognized Homebrew inventory line")
+            result.extend(package(parts[0], version, ecosystem) for version in parts[1:])
+    return result
+
+
 INVENTORIES = {"ubuntu": ubuntu_inventory, "arch": arch_inventory, "cachyos": arch_inventory,
-               "conda": conda_inventory, "mamba": conda_inventory, "uv": uv_inventory, "npm": npm_inventory}
+               "conda": conda_inventory, "mamba": conda_inventory, "uv": uv_inventory, "npm": npm_inventory,
+               "brew": brew_inventory}
 
 
 def inventory(t, runner=run):

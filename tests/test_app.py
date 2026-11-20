@@ -257,6 +257,26 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(Error):
             adapters.os_info(t, self.runner(["Linux\n"]))
 
+    def test_brew_inventory_formulae_and_casks(self):
+        t = adapters.target("laptop", "brew")
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n",
+                           "abseil 20260817.0\npython@3.12 3.12.7\npython@3.13 3.13.1\n",
+                           "claude-code 2.1.311\nantigravity-cli 1.5.13,5999302598852608\n"])
+        rows = adapters.inventory(t, run)
+        self.assertEqual([(p["name"], p["version"]) for p in rows],
+                         [("abseil", "20260817.0"), ("antigravity-cli", "1.5.13,5999302598852608"),
+                          ("claude-code", "2.1.311"), ("python@3.12", "3.12.7"), ("python@3.13", "3.13.1")])
+        self.assertEqual({p["ecosystem"] for p in rows if p["name"].startswith("python")}, {"Homebrew"})
+        self.assertEqual(next(p for p in rows if p["name"] == "claude-code")["ecosystem"], "Homebrew-cask")
+        self.assertEqual(self.calls[3][0][-3:], ["brew", "list", "--versions"])
+        self.assertEqual(self.calls[4][0][-4:], ["brew", "list", "--cask", "--versions"])
+
+    def test_brew_inventory_rejects_unparsable_line(self):
+        t = adapters.target("laptop", "brew")
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "abseil\n"])
+        with self.assertRaises(Error):
+            adapters.inventory(t, run)
+
     def test_brew_argv_carries_fixed_path(self):
         t = adapters.target("laptop", "brew")
         argv = adapters.brew_env("brew", "list", "--versions")
