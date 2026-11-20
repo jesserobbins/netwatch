@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from netwatch import adapters, sources, workflow
+from netwatch import adapters, cli, sources, workflow
 from netwatch.cli import main
 from netwatch.core import Error, canonical
 from netwatch.demo import DemoRunner, NOTICE, demo
@@ -515,6 +515,25 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertNotIn("env PATH", str(caught.exception))
         self.assertEqual(self.store.db.execute("SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0],
                          "needs_attention")
+
+    def test_text_report_shows_held_and_default_list_markers(self):
+        report = {"target": self.t, "packages": [adapters.package("libheif", "1.23.7", "Homebrew")],
+                  "findings": [], "context": {},
+                  "updates": [{"package": "openssl@3", "candidate": "3.5.9", "ecosystem": "Homebrew",
+                               "held": True, "held_version": "3.5.8"},
+                              {"package": "1password", "candidate": "8.12.46", "ecosystem": "Homebrew-cask",
+                               "greedy_only": True, "reason": "Excluded from the default outdated list"}],
+                  "warnings": [], "advisory_check_ok": True, "evidence": [], "update_error": None,
+                  "coverage": {"scanner": True, "checked": 1, "complete": True, "skipped": [],
+                               "unscanned": {}, "scanned": ["libheif"], "retained": []},
+                  "at": 0}
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.display([{"target": self.t, "last_attempt": None, "report": report, "pending_updates": []}],
+                        False, show_all=True)
+        plain = buffer.getvalue()
+        self.assertIn("[held 3.5.8]", plain)
+        self.assertIn("[not in default upgrade]", plain)
 
     def test_preview_warns_about_casks(self):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]

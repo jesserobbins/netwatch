@@ -207,7 +207,7 @@ def display(result, json_output=False, show_all=False):
         omitted = sum(e.get("matching", {}).get("fixed_notices_omitted", 0) for e in report.get("evidence", []))
         if omitted:
             emit(f"\n{omitted} historical notices omitted: installed versions meet the tracker fixes.", "dim")
-        if updates:
+        if report["updates"]:
             emit("\nAvailable updates:", "bold cyan")
             emit("  Repository candidates; not all are security fixes.", "dim")
             versions = defaultdict(set)
@@ -215,22 +215,29 @@ def display(result, json_output=False, show_all=False):
                 versions[p["name"]].add(p["version"])
             affected = {r["package"] for r in report["findings"] if r["state"] == "affected"}
             review = {r["package"] for r in report["findings"] if r["state"] == "unknown"}
-            ordered = sorted(updates, key=lambda n: (n not in affected, n not in review, n))
+            rows = sorted(report["updates"], key=lambda u: (u["package"] not in affected,
+                                                             u["package"] not in review, u["package"]))
             grid = table("Package", "Installed", "Available", "Finding") if wide else None
-            for n in ordered if show_all else ordered[:10]:
+            for row in rows if show_all else rows[:10]:
+                n = row["package"]
                 label, style = (" [affected]", "bold red") if n in affected else ((" [review]", "yellow") if n in review else ("", "cyan"))
+                # A held formula and a cask excluded from the default list are not
+                # updates the approved plan will take, so say which one it is.
+                state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
+                    " [not in default upgrade]" if row.get("greedy_only") else "")
                 installed = safe(', '.join(sorted(versions[n])) or '?')
-                candidate = safe(updates[n].get('candidate') or 'unknown')
+                candidate = safe(row.get('candidate') or 'unknown')
                 if grid is not None:
                     grid.add_row(Text(safe(n), style="bold"), Text(installed, style="dim"), Text(candidate, style="bold cyan"),
-                                 Text(label.strip() or "No matching advisory", style=style if label else "dim"))
+                                 Text((label + state).strip() or "No matching advisory",
+                                      style=style if label or row.get("held") else "dim"))
                 else:
-                    emit(f"  {safe(n)}: {installed} -> {candidate}{label}", style)
+                    emit(f"  {safe(n)}: {installed} -> {candidate}{label}{state}", style)
             if grid is not None:
                 console.print(grid)
-                if not show_all and len(ordered) > 10:
-                    emit(f"  Showing 10 of {len(ordered)} updates.", "dim")
-            shortened |= not show_all and len(ordered) > 10
+                if not show_all and len(rows) > 10:
+                    emit(f"  Showing 10 of {len(rows)} updates.", "dim")
+            shortened |= not show_all and len(rows) > 10
         for source, label in (("cve_now", "cve.now CVE context"), ("pwn_watch", "pwn.watch incident leads"),
                               ("zero_wire", "Cloudflare Zero Wire briefings")):
             context = report.get("context", {}).get(source)
