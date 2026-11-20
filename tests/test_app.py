@@ -255,6 +255,8 @@ class AdapterTests(unittest.TestCase):
     def test_step_label_names_the_tool_behind_wrappers(self):
         self.assertEqual(adapters.step_label(adapters.brew_env("brew", "upgrade", "--cask")),
                          "brew upgrade --cask")
+        self.assertNotEqual(adapters.step_label(["sudo", "-n", "apt-get", "update"]),
+                            adapters.step_label(["sudo", "-n", "apt-get", "upgrade", "-y"]))
         remote = ["ssh", "-o", "BatchMode=yes", "host", "cd -- /srv/a && uv lock --upgrade"]
         self.assertEqual(adapters.step_label(remote), "uv lock --upgrade")
         self.assertEqual(adapters.step_label(["ssh", "host", "npm update --ignore-scripts"]),
@@ -404,11 +406,11 @@ class BrewWorkflowTests(unittest.TestCase):
         """Run a check. `after` is the inventory seen when the scan's own re-collection runs:
         "same" (the host held still), None (no re-collection), or an explicit inventory."""
         tail = formulae if after == "same" else after
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae, "", "vulns\n", scan_json, "{}", "{}"]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae, "", "vulns\n", scan_json]
         if after is not None:
-            # A scan that could clear a prior finding re-collects inventory; extra outputs
-            # are harmless when it does not run.
+            # workflow.check re-collects inventory after the scan, before discovering updates.
             outputs += ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", tail, ""]
+        outputs += ["{}", "{}"]  # brew outdated, then --greedy
         return workflow.check(self.store, self.t, runner=self.scripted(outputs),
                               request=lambda url, body=None: {})
 
@@ -448,7 +450,8 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
         self.assertEqual(report["findings"][0]["state"], "unknown")
         self.assertTrue(report["coverage"]["changed_during_scan"])
-        self.assertTrue(any("changed while Homebrew's scan ran" in w for w in report["warnings"]))
+        self.assertTrue(any("did not hold still" in w or "changed or could not be re-read" in w
+                            for w in report["warnings"]))
 
     def test_outdated_without_sbom_findings_are_not_published(self):
         report = self.check(self.INSTALLED, json.dumps({
@@ -473,6 +476,17 @@ class BrewWorkflowTests(unittest.TestCase):
         saved = json.loads(self.store.db.execute("SELECT result FROM plans WHERE id=?", (plan["id"],)).fetchone()[0])
         self.assertIn("brew upgrade --cask", saved["failed_step"])
         self.assertNotIn("nope", json.dumps(saved))  # raw tool text stays out of history
+
+    def test_stable_host_clears_a_scanned_formula_without_a_change_warning(self):
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7"), self.finding("lame", "3.100")],
+                                             complete=True, checked=2))
+        report = self.check(self.INSTALLED, self.scan([], skipped=["lame"]))
+        # The scanned formula clears; the skipped one keeps its finding for this version.
+        self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
+        self.assertEqual(report["findings"][0]["state"], "unknown")
+        self.assertNotIn("changed_during_scan", report["coverage"])
+        self.assertFalse(any("changed or could not be re-read" in w for w in report["warnings"]))
+        self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
     def test_uninstalled_formula_finding_is_retired(self):
         self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100")], complete=True, checked=2))
@@ -500,7 +514,8 @@ class BrewWorkflowTests(unittest.TestCase):
     def test_scan_findings_for_uninstalled_versions_are_dropped(self):
         report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "9.9.9")], complete=True, checked=2))
         self.assertEqual(report["findings"], [])
-        self.assertTrue(any("does not report installed" in w for w in report["warnings"]))
+        self.assertTrue(any("changed version between collection" in w for w in report["warnings"]))
+        self.assertFalse(any("{'" in w for w in report["warnings"]))  # no raw set literals
 
     def test_unscanned_formula_keeps_prior_finding_as_unknown(self):
         self.check(self.INSTALLED,
@@ -530,6 +545,13 @@ class BrewWorkflowTests(unittest.TestCase):
         formula, cask = rows
         self.assertTrue(cask["greedy_only"])
         self.assertNotIn("greedy_only", formula)
+
+    def test_brew_outdated_rejects_non_string_versions(self):
+        bad = json.dumps({"formulae": [{"name": "x", "installed_versions": ["1"],
+                                        "current_version": 1e400, "pinned": False, "pinned_version": None}],
+                          "casks": []})
+        with self.assertRaises(Error):
+            adapters.brew_outdated(self.t, self.scripted([bad]))
 
     def test_brew_outdated_marks_greedy_only_and_held(self):
         plain = json.dumps({"formulae": [{"name": "pydantic", "installed_versions": ["2.14.3"],

@@ -188,14 +188,22 @@ def advisory_fields(advisory):
     serialise; an object where a string belongs is equally able to replace a
     recorded fix with nonsense.
     """
-    aliases = advisory.get("aliases") or []
-    if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+    aliases = advisory.get("aliases")
+    if aliases is None:
+        aliases = []
+    elif not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
         raise TypeError("unexpected aliases type")
+    fixed = advisory.get("fixed_versions")
+    if fixed is None:
+        fixed = []
+    elif not isinstance(fixed, list) or any(not isinstance(value, str) or BREW_FIXED.fullmatch(value) is None
+                                            for value in fixed):
+        raise TypeError("unexpected fixed_versions type")
     severity, summary = advisory.get("severity"), advisory.get("summary")
     return {"id": text(advisory["id"], "advisory id"),
             "severity": "Unknown" if severity is None else text(severity, "advisory severity"),
             "summary": "" if summary is None else text(summary, "advisory summary"),
-            "aliases": aliases, "fixed": advisory.get("fixed_versions") or []}
+            "aliases": aliases, "fixed": fixed}
 
 
 def brew_scan(t, packages, runner, *, offline=False):
@@ -228,6 +236,8 @@ def brew_scan(t, packages, runner, *, offline=False):
                 or not isinstance(data["complete"], bool) \
                 or not isinstance(data.get("outdated_without_sbom", []), list):
             raise TypeError("unexpected scan field types")
+        if data["checked"] == 0 and formulae:
+            raise TypeError("scan reported nothing checked")
         coverage.update(checked=data["checked"], complete=data["complete"],
                         skipped=sorted(text(name, "skipped formula") for name in data["skipped_formulae"]),
                         unscanned={text(k, "unscanned formula"): text(v, "reason")
@@ -242,12 +252,6 @@ def brew_scan(t, packages, runner, *, offline=False):
             vulnerabilities = row["vulnerabilities"]
             if not isinstance(vulnerabilities, list):
                 raise TypeError("unexpected vulnerabilities type")
-            for advisory in vulnerabilities:
-                fixed = advisory.get("fixed_versions") or []
-                if not isinstance(fixed, list) or any(BREW_FIXED.fullmatch(value or "") is None for value in fixed
-                                                     if isinstance(value, str)) \
-                        or any(not isinstance(value, str) for value in fixed):
-                    raise TypeError("unexpected fixed_versions type")
             parsed.append({"formula": formula, "version": version,
                            "repository": text(row["repo_url"], "repository URL"), "tag": text(row["tag"], "upstream tag"),
                            "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
@@ -269,7 +273,7 @@ def brew_scan(t, packages, runner, *, offline=False):
     warnings, result = [], []
     if unmatched:
         warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
-                        "scan; their earlier findings are retained — re-run the check")
+                        "scan; their earlier findings are retained and their scan results are not used — re-run the check")
     for row in parsed:
         if row["formula"] in unmatched:
             continue
@@ -282,9 +286,6 @@ def brew_scan(t, packages, runner, *, offline=False):
             item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
                         summary=advisory["summary"], references=advisory["aliases"])
             result.append(item)
-    if unmatched:
-        warnings.append(f"Coverage: {unmatched} scan result(s) named a version this host does not report installed; "
-                        "re-run the check")
     if coverage["retained"]:
         warnings.append(f"Coverage: {len(coverage['retained'])} installed formulae were not scanned by Homebrew; "
                         "their earlier findings are retained and absence of findings is absence of evidence")

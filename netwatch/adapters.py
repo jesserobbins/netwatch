@@ -57,6 +57,10 @@ def step_label(argv):
         args = args[1:]
         while args and "=" in args[0]:
             args = args[1:]
+    if args and args[0] == "sudo":
+        args = args[1:]
+        while args and args[0].startswith("-"):
+            args = args[1:]
     return " ".join(args[:3]) if args else str(argv[0])
 
 
@@ -250,6 +254,11 @@ def brew_outdated(t, runner):
         # A formula and a cask can share a name, so the identity is the pair.
         found = {("Homebrew", r["name"]): r for r in data.get("formulae", [])}
         found.update({("Homebrew-cask", r["name"]): r for r in data.get("casks", [])})
+        for row in found.values():
+            for field in ("current_version", "pinned_version"):
+                value = row.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise Error("Unrecognized Homebrew update version")
         return found
     plain, greedy = rows(), rows("--greedy")
     result = []

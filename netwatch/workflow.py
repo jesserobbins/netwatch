@@ -16,24 +16,24 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         raise Error(f"Inventory collection failed: {reason}; previous report retained (see history)") from exc
     findings, warnings, complete, evidence = sources.assess(t, packages, store, offline=offline, refresh=refresh, refreshed=refreshed, request=request, runner=runner)
     coverage = next((e["coverage"] for e in evidence if "coverage" in e), None)
-    # Only a scan that could clear a prior finding needs to prove the host held still:
-    # reconciliation exists to protect findings, and costs a second collection.
-    before = store.latest(t["name"])
-    if coverage is not None and coverage.get("scanner") is True and not coverage.get("deferred") \
-            and before and before.get("findings"):
-        # The scan is a second observation of the same host. If inventory moved while it
-        # ran, its version claims cannot be reconciled with this report, so no finding of
-        # the previous check may be cleared on its evidence.
+    if coverage is not None and coverage.get("scanner") is True and not coverage.get("deferred"):
+        # The scan is a second observation of the same host. Cask changes say nothing about
+        # formula advisories, so reconciliation compares formulae only. If they moved while
+        # the scan ran, its version claims cannot be tied to this report: retain the earlier
+        # findings and publish none of the new ones.
+        formulae = [(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"]
         try:
-            after = adapters.inventory(t, runner)
-        except Error:
+            after = [(p["name"], p["version"]) for p in adapters.inventory(t, runner)
+                     if p["ecosystem"] == "Homebrew"]
+        except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             after = None
-        if after is None or digest(after) != digest(packages):
-            coverage.update(scanned=[], retained=sorted({p["name"] for p in packages}),
-                            retained_versions=sorted([p["name"], p["version"]] for p in packages),
+        if after is None or sorted(after) != sorted(formulae):
+            findings = []
+            coverage.update(scanned=[], retained=sorted({name for name, _ in formulae}),
+                            retained_versions=sorted([name, version] for name, version in formulae),
                             complete=False, changed_during_scan=True)
-            warnings.append("Coverage: installed versions changed while Homebrew's scan ran; "
-                            "earlier findings are retained — re-run the check")
+            warnings.append("Coverage: installed formulae changed or could not be re-read while Homebrew's "
+                            "scan ran; earlier findings are retained and no scan result is used — re-run the check")
     available, update_error = [], None
     if offline:
         update_error = "Update availability not refreshed in offline mode"

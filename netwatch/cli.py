@@ -224,8 +224,11 @@ def display(result, json_output=False, show_all=False):
                 return by_name[row["package"]]
             affected = {r["package"] for r in report["findings"] if r["state"] == "affected"}
             review = {r["package"] for r in report["findings"] if r["state"] == "unknown"}
-            rows = sorted(report["updates"], key=lambda u: (u["package"] not in affected,
-                                                             u["package"] not in review, u["package"]))
+            def has(row, names):
+                # Advisories cover formulae, never casks; sorting must agree with the label.
+                return row.get("ecosystem") in (None, "Homebrew") and row["package"] in names
+            rows = sorted(report["updates"], key=lambda u: (not has(u, affected), not has(u, review),
+                                                            u["package"], u.get("ecosystem") or ""))
             grid = table("Package", "Installed", "Available", "Finding") if wide else None
             for row in rows if show_all else rows[:10]:
                 n = row["package"]
