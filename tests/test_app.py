@@ -398,22 +398,52 @@ class BrewWorkflowTests(unittest.TestCase):
         return workflow.check(self.store, self.t, runner=self.scripted(outputs),
                               request=lambda url, body=None: {})
 
+    INSTALLED = "libheif 1.23.7\nlame 3.100\n"
+
     def test_coverage_is_on_the_report_and_partial_scan_is_not_a_failure(self):
-        report = self.check("libheif 1.23.7\n", self.scan([self.finding("libheif", "1.23.7")],
-                                                           skipped=["lame"]))
+        report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], skipped=["lame"]))
         self.assertTrue(report["advisory_check_ok"])
         self.assertFalse(report["coverage"]["complete"])
         self.assertEqual(report["coverage"]["scanned"], ["libheif"])
+        self.assertEqual(report["coverage"]["retained"], ["lame"])
         self.assertTrue(any("absence of findings" in w for w in report["warnings"]))
 
     def test_scanned_formula_clears_after_upgrade_despite_partial_coverage(self):
-        self.check("libheif 1.23.7\n", self.scan([self.finding("libheif", "1.23.7")], skipped=["lame"]))
-        report = self.check("libheif 1.24.0\n", self.scan([], skipped=["lame"]))
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], skipped=["lame"]))
+        report = self.check("libheif 1.24.0\nlame 3.100\n", self.scan([], skipped=["lame"]))
         self.assertEqual(report["findings"], [])
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
+    def test_uninstalled_formula_finding_is_retired(self):
+        self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100")], complete=True, checked=2))
+        report = self.check("libheif 1.23.7\n", self.scan([], complete=True))
+        self.assertEqual(report["findings"], [])
+        self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
+
+    def test_no_scanner_is_an_incomplete_advisory_check(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", self.INSTALLED, "", "install update\n", "{}", "{}"]
+        report = workflow.check(self.store, self.t, runner=self.scripted(outputs),
+                                request=lambda url, body=None: {})
+        self.assertFalse(report["advisory_check_ok"])
+        self.assertFalse(report["coverage"]["scanner"])
+        self.assertEqual(report["coverage"]["retained"], ["lame", "libheif"])
+
+    def test_offline_skips_the_scan_and_marks_the_check_incomplete(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", self.INSTALLED, ""]
+        report = workflow.check(self.store, self.t, offline=True, runner=self.scripted(outputs),
+                                request=lambda url, body=None: {})
+        self.assertFalse(report["advisory_check_ok"])
+        self.assertTrue(report["coverage"]["deferred"])
+        self.assertTrue(any("offline mode" in w for w in report["warnings"]))
+        self.assertEqual(len(self.calls), 6)  # probe + inventory only; no scan, no outdated
+
+    def test_scan_findings_for_uninstalled_versions_are_dropped(self):
+        report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "9.9.9")], complete=True, checked=2))
+        self.assertEqual(report["findings"], [])
+        self.assertTrue(any("does not report installed" in w for w in report["warnings"]))
+
     def test_unscanned_formula_keeps_prior_finding_as_unknown(self):
-        self.check("libheif 1.24.0\nlame 3.100\n",
+        self.check(self.INSTALLED,
                    self.scan([self.finding("lame", "3.100", "OSV-2020-9999")], complete=True, checked=2))
         report = self.check("libheif 1.24.0\nlame 3.100\n", self.scan([], skipped=["lame"]))
         self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-9999"])
@@ -486,18 +516,20 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(self.calls[1][1]["ok"], (0, 1))
 
     def test_finding_binds_to_version_not_name(self):
-        rows = self.packages(("python@3.12", "3.12.7"), ("python@3.13", "3.13.1"))
-        scan = json.dumps({"findings": [{"formula": "python@3.12", "version": "3.12.7", "tag": "v3.12.7",
-                                         "repo_url": "https://github.com/python/cpython",
-                                         "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s",
-                                                              "aliases": [], "fixed_versions": []}]}],
-                           "skipped_formulae": [], "checked": 2, "complete": True,
-                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        # Two keg versions of the SAME formula, same advisory: one finding each, distinct keys.
+        rows = self.packages(("python@3.12", "3.12.7"), ("python@3.12", "3.12.9"))
+        scan = json.dumps({"findings": [
+            {"formula": "python@3.12", "version": "3.12.7", "tag": "v3.12.7",
+             "repo_url": "https://github.com/python/cpython",
+             "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]},
+            {"formula": "python@3.12", "version": "3.12.9", "tag": "v3.12.9",
+             "repo_url": "https://github.com/python/cpython",
+             "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]}],
+            "skipped_formulae": [], "checked": 2, "complete": True,
+            "outdated_without_sbom": [], "unscanned_formulae": {}})
         findings, _, _ = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", scan]))
-        self.assertEqual(findings[0]["installed"], "3.12.7")
-        self.assertEqual(len({findings[0]["key"],
-                              sources.finding({"ecosystem": "Homebrew", "name": "python@3.13",
-                                               "version": "3.13.1"}, "GHSA-x", "affected", [], "r", "u")["key"]}), 2)
+        self.assertEqual(sorted(f["installed"] for f in findings), ["3.12.7", "3.12.9"])
+        self.assertEqual(len({f["key"] for f in findings}), 2)
 
     def test_missing_vulns_command_is_a_coverage_gap(self):
         findings, warnings, coverage = sources.brew_scan(TARGET, self.packages(("x", "1")),
@@ -505,7 +537,23 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertFalse(coverage["scanner"])
         self.assertEqual(coverage["scanned"], [])
+        self.assertEqual(coverage["retained"], ["x"])
         self.assertTrue(any("no vulnerability scanner" in w for w in warnings))
+
+    def test_offline_defers_the_scan_without_touching_the_runner(self):
+        findings, warnings, coverage = sources.brew_scan(TARGET, self.packages(("x", "1")),
+                                                         self.scripted([]), offline=True)
+        self.assertEqual(findings, [])
+        self.assertTrue(coverage["deferred"])
+        self.assertEqual(coverage["retained"], ["x"])
+        self.assertEqual(self.calls, [])
+        self.assertTrue(any("offline mode" in w for w in warnings))
+
+    def test_dict_findings_field_is_rejected(self):
+        bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,
+                          "outdated_without_sbom": [], "unscanned_formulae": {}})
+        with self.assertRaises(Error):
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
 
     def test_pwn_watch_matches_formulae_but_not_colliding_cask_names(self):
         catalog = {"generatedAt": "2026-11-20T00:00:00Z", "incidents": [
