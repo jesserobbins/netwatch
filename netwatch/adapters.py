@@ -10,7 +10,20 @@ from pathlib import PurePosixPath
 from .core import Error, name, text
 
 
-KINDS = ("ubuntu", "arch", "cachyos", "conda", "mamba", "uv", "npm")
+KINDS = ("ubuntu", "arch", "cachyos", "conda", "mamba", "uv", "npm", "brew")
+
+# Homebrew and MacPorts are not on the PATH of a BatchMode SSH command. The
+# prefix travels inside the argv rather than being resolved at registration,
+# because `add` must not connect and `commands(t)` is compared against the
+# approved plan body.
+MAC_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def brew_env(*args):
+    """Fixed PATH and Homebrew's non-interactive settings, carried in argv."""
+    pairs = {"PATH": MAC_PATH, "HOMEBREW_NO_AUTO_UPDATE": "1",
+             "HOMEBREW_NO_INSTALL_CLEANUP": "1", "NONINTERACTIVE": "1"}
+    return ["env", *[f"{key}={value}" for key, value in pairs.items()], *args]
 
 
 def target(name_, kind, host="local", path=None):
@@ -63,6 +76,11 @@ def package(n, v, ecosystem, **extra):
 
 
 def os_info(t, runner):
+    if t["kind"] == "brew":
+        if runner(t, ["uname", "-s"]).strip() != "Darwin":
+            raise Error("Homebrew adapter requires a macOS host")
+        return {"ID": "macos", "PLATFORM": runner(t, ["uname", "-m"]).strip(),
+                "VERSION": runner(t, ["sw_vers", "-productVersion"]).strip()}
     data = {}
     for line in runner(t, ["cat", "/etc/os-release"]).splitlines():
         if "=" in line and not line.startswith("#"):
@@ -191,4 +209,5 @@ def commands(t):
         "mamba": [["mamba", "update", "--all", "--yes", "--prefix", t.get("path")]],
         "uv": [["uv", "lock", "--upgrade"], ["uv", "sync", "--locked"]],
         "npm": [["npm", "update", "--ignore-scripts"]],
+        "brew": [brew_env("brew", "upgrade", "--formula"), brew_env("brew", "upgrade", "--cask")],
     }[t["kind"]]

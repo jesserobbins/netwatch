@@ -242,6 +242,32 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(argv[-2], "user@host")
             self.assertNotIn("shell", popen.call_args.kwargs)
 
+    def test_brew_target_and_darwin_probe(self):
+        t = adapters.target("laptop", "brew")
+        self.assertIsNone(t["path"])
+        with self.assertRaises(Error):
+            adapters.target("laptop", "brew", path="/opt/thing")
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n"])
+        self.assertEqual(adapters.os_info(t, run),
+                         {"ID": "macos", "PLATFORM": "arm64", "VERSION": "15.3.1"})
+        self.assertEqual(self.calls[0][0], ["uname", "-s"])
+
+    def test_brew_refuses_non_darwin_host(self):
+        t = adapters.target("server", "brew")
+        with self.assertRaises(Error):
+            adapters.os_info(t, self.runner(["Linux\n"]))
+
+    def test_brew_argv_carries_fixed_path(self):
+        t = adapters.target("laptop", "brew")
+        argv = adapters.brew_env("brew", "list", "--versions")
+        self.assertEqual(argv[0], "env")
+        self.assertIn("PATH=" + adapters.MAC_PATH, argv)
+        self.assertIn("NONINTERACTIVE=1", argv)
+        self.assertEqual(argv[-3:], ["brew", "list", "--versions"])
+        self.assertNotIn("sudo", " ".join(" ".join(argv) for argv in adapters.commands(t)))
+        self.assertTrue(all(commands[:5] == adapters.brew_env("brew", "upgrade", flag)[:5]
+                            for commands, flag in zip(adapters.commands(t), ("--formula", "--cask"))))
+
 
 class SourceTests(unittest.TestCase):
     def setUp(self):
