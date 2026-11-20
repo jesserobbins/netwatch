@@ -352,5 +352,82 @@ class SourceTests(unittest.TestCase):
                 db.close()
 
 
+SCAN_PARTIAL = json.dumps({
+    "findings": [{"formula": "libheif", "version": "1.23.7", "tag": "v1.23.7",
+                  "repo_url": "https://github.com/strukturag/libheif",
+                  "vulnerabilities": [{"id": "OSV-2020-2308", "severity": "MEDIUM",
+                                       "summary": "Heap-buffer-overflow", "aliases": [],
+                                       "fixed_versions": []}]}],
+    "skipped_formulae": ["playwright-cli", "lame"], "checked": 2, "complete": False,
+    "outdated_without_sbom": [], "unscanned_formulae": {"wacli": "untrusted_tap"}})
+
+
+TARGET = adapters.target("laptop", "brew")
+
+
+class BrewScanTests(unittest.TestCase):
+    def scripted(self, outputs, calls=None):
+        outputs = list(outputs)
+        self.calls = [] if calls is None else calls
+        def run(t, argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            if not outputs:
+                raise AssertionError("Unexpected command: " + json.dumps(argv))
+            return outputs.pop(0)
+        return run
+
+    def packages(self, *rows):
+        return [adapters.package(name, version, "Homebrew") for name, version in rows]
+
+    def test_partial_scan_reports_findings_and_coverage(self):
+        rows = self.packages(("libheif", "1.23.7"), ("lame", "3.100"))
+        run = self.scripted(["vulns update install\n", SCAN_PARTIAL])
+        findings, warnings, coverage = sources.brew_scan(TARGET, rows, run)
+        self.assertEqual([f["advisory"] for f in findings], ["OSV-2020-2308"])
+        self.assertEqual(findings[0]["installed"], "1.23.7")
+        self.assertEqual(findings[0]["state"], "affected")
+        self.assertEqual(findings[0]["repository"], "https://github.com/strukturag/libheif")
+        self.assertFalse(coverage["complete"])
+        self.assertEqual(coverage["skipped"], ["lame", "playwright-cli"])
+        self.assertEqual(coverage["unscanned"], {"wacli": "untrusted_tap"})
+        self.assertEqual(coverage["scanned"], ["libheif"])
+        self.assertTrue(any("absence of findings" in w for w in warnings))
+        self.assertEqual(self.calls[1][1]["ok"], (0, 1))
+
+    def test_finding_binds_to_version_not_name(self):
+        rows = self.packages(("python@3.12", "3.12.7"), ("python@3.13", "3.13.1"))
+        scan = json.dumps({"findings": [{"formula": "python@3.12", "version": "3.12.7", "tag": "v3.12.7",
+                                         "repo_url": "https://github.com/python/cpython",
+                                         "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s",
+                                                              "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 2, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        findings, _, _ = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", scan]))
+        self.assertEqual(findings[0]["installed"], "3.12.7")
+        self.assertEqual(len({findings[0]["key"],
+                              sources.finding({"ecosystem": "Homebrew", "name": "python@3.13",
+                                               "version": "3.13.1"}, "GHSA-x", "affected", [], "r", "u")["key"]}), 2)
+
+    def test_missing_vulns_command_is_a_coverage_gap(self):
+        findings, warnings, coverage = sources.brew_scan(TARGET, self.packages(("x", "1")),
+                                                         self.scripted(["install update\n"]))
+        self.assertEqual(findings, [])
+        self.assertFalse(coverage["scanner"])
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(any("no vulnerability scanner" in w for w in warnings))
+
+    def test_malformed_scan_output_fails_loudly(self):
+        with self.assertRaises(Error):
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", "not json"]))
+
+    def test_withdrawn_or_unknown_shapes_are_rejected(self):
+        bad = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
+                                        "repo_url": "https://example.com/x", "vulnerabilities": [{}]}],
+                          "skipped_formulae": [], "checked": 1, "complete": True,
+                          "outdated_without_sbom": [], "unscanned_formulae": {}})
+        with self.assertRaises(Error):
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+
+
 if __name__ == "__main__":
     unittest.main()

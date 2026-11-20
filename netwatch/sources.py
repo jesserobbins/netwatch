@@ -177,6 +177,60 @@ def osv(p, data):
     return result
 
 
+
+def brew_scan(t, packages, runner):
+    """Homebrew's own OSV scan. Partial coverage is not a failure.
+
+    Returns (findings, warnings, coverage). `coverage["scanned"]` is the set of
+    installed names the scan actually covered, which is what lets a later check
+    clear a fixed finding on a host that always reports complete: false.
+    """
+    installed = {(p["name"], p["version"]) for p in packages}
+    words = runner(t, adapters.brew_env("brew", "commands")).split()
+    coverage = {"scanner": "vulns" in words, "checked": 0, "complete": False,
+                "skipped": [], "unscanned": {}, "scanned": []}
+    if not coverage["scanner"]:
+        return [], ["Coverage: this Homebrew has no vulnerability scanner; no formula was assessed"], coverage
+    raw = runner(t, adapters.brew_env("brew", "vulns", "--json"), ok=(0, 1), timeout=300)
+    try:
+        data = json.loads(raw)
+        rows = data["findings"]
+        coverage.update(checked=int(data["checked"]), complete=bool(data["complete"]),
+                        skipped=sorted(text(name, "skipped formula") for name in data["skipped_formulae"]),
+                        unscanned={text(k, "unscanned formula"): text(v, "reason")
+                                   for k, v in data["unscanned_formulae"].items()})
+        parsed = []
+        for row in rows:
+            formula, version = text(row["formula"], "formula name"), text(row["version"], "installed version")
+            entry = {"formula": formula, "version": version,
+                     "repository": text(row["repo_url"], "repository URL"), "tag": text(row["tag"], "upstream tag"),
+                     "vulnerabilities": [{"id": text(a["id"], "advisory id"), "severity": a.get("severity", "Unknown"),
+                                          "summary": a.get("summary", ""), "aliases": a.get("aliases") or [],
+                                          "fixed": a.get("fixed_versions") or []} for a in row["vulnerabilities"]]}
+            parsed.append(entry)
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise Error("Homebrew vulnerability scan output is malformed") from exc
+    coverage["scanned"] = sorted({n for n, _ in installed} - set(coverage["skipped"]) - set(coverage["unscanned"]))
+    result = []
+    for row in parsed:
+        for advisory in row["vulnerabilities"]:
+            item = finding({"ecosystem": "Homebrew", "name": row["formula"], "version": row["version"]},
+                           advisory["id"], "affected", advisory["fixed"],
+                           "Homebrew OSV scan matched the upstream repository and tag; coverage limited to scanned formulae",
+                           "https://osv.dev/vulnerability/" + advisory["id"])
+            item["key"] = digest(["Homebrew", row["formula"], row["version"], advisory["id"]])
+            item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
+                        summary=advisory["summary"], references=advisory["aliases"])
+            result.append(item)
+    warnings = []
+    if coverage["skipped"] or coverage["unscanned"]:
+        warnings.append(f"Coverage: {len(coverage['skipped']) + len(coverage['unscanned'])} formulae were not scanned "
+                        "by Homebrew; absence of findings is absence of evidence")
+    known = {name for name, _ in installed}
+    if any(name not in known for name in coverage["skipped"]):
+        warnings.append("Coverage: scan named packages this host does not report as installed")
+    return result, warnings, coverage
+
 def advisory_references(findings, *, cves_only=False):
     """Notice-level links are context, not per-package applicability claims."""
     values = set()
@@ -396,6 +450,10 @@ def assess(t, packages, store, *, offline=False, refresh=False, refreshed=None, 
             findings = arch(packages, data, kind, compare=lambda pairs: adapters.arch_compare(t, pairs, runner), stats=stats)
             evidence[-1]["matching"] = stats
             warnings.append("Coverage: Arch tracker may lag releases; remaining CachyOS and foreign-package matches require investigation")
+        elif kind == "brew":
+            findings, brew_warnings, coverage = brew_scan(t, packages, runner)
+            warnings.extend(brew_warnings)
+            evidence.append({"source": "Homebrew OSV scan", "coverage": coverage})
         else:
             unknown = sum(p["ecosystem"] == "Conda" for p in packages)
             if unknown:
