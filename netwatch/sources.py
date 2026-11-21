@@ -200,10 +200,17 @@ def advisory_fields(advisory):
                                             for value in fixed):
         raise TypeError("unexpected fixed_versions type")
     severity, summary = advisory.get("severity"), advisory.get("summary")
+    if summary is None:
+        summary = ""
+    elif isinstance(summary, str):
+        # A display string: empty is fine, newlines collapse so it cannot break the
+        # report layout. Only a non-string is malformed.
+        summary = " ".join(summary.split())[:500]
+    else:
+        raise TypeError("unexpected advisory summary type")
     return {"id": text(advisory["id"], "advisory id"),
             "severity": "Unknown" if severity is None else text(severity, "advisory severity"),
-            "summary": "" if summary is None else text(summary, "advisory summary"),
-            "aliases": aliases, "fixed": fixed}
+            "summary": summary, "aliases": aliases, "fixed": fixed}
 
 
 def brew_scan(t, packages, runner, *, offline=False):

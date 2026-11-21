@@ -22,14 +22,16 @@ MAC_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 def brew_env(*args, cleanup=True):
     """Fixed PATH and Homebrew's non-interactive settings, carried in argv.
 
-    `cleanup=False` drops HOMEBREW_NO_INSTALL_CLEANUP so an approved upgrade may
-    remove the superseded keg; read-only commands keep it.
+    `cleanup=False` unsets HOMEBREW_NO_INSTALL_CLEANUP so an approved upgrade may
+    remove the superseded keg; read-only commands keep it set. `env -u` is needed
+    because a locally exported variable would otherwise be inherited.
     """
     pairs = {"PATH": MAC_PATH, "HOMEBREW_NO_AUTO_UPDATE": "1",
              "HOMEBREW_NO_INSTALL_CLEANUP": "1", "NONINTERACTIVE": "1"}
+    head = ["env"] + [f"{key}={value}" for key, value in pairs.items()]
     if not cleanup:
-        del pairs["HOMEBREW_NO_INSTALL_CLEANUP"]
-    return ["env", *[f"{key}={value}" for key, value in pairs.items()], *args]
+        head = ["env", "-u", "HOMEBREW_NO_INSTALL_CLEANUP"] + head[1:]
+    return [*head, *args]
 
 
 def target(name_, kind, host="local", path=None):
@@ -61,8 +63,8 @@ def step_label(argv):
             args = args[args.index("&&") + 1:]
     if args and args[0] == "env":
         args = args[1:]
-        while args and "=" in args[0]:
-            args = args[1:]
+        while args and ("=" in args[0] or (args[0] == "-u" and len(args) > 1)):
+            args = args[2:] if args[0] == "-u" else args[1:]
     if args and args[0] == "sudo":
         args = args[1:]
         while args and args[0].startswith("-"):
@@ -304,7 +306,7 @@ def brew_outdated(t, runner):
         # A formula and a cask can share a name, so the identity is the pair. An empty
         # object where an array belongs is malformed, not an empty update list.
         for field in ("formulae", "casks"):
-            value = data.get(field, [])
+            value = data.get(field)
             if not isinstance(value, list):
                 raise Error("Unrecognized Homebrew update output")
         found = {("Homebrew", r["name"]): r for r in data.get("formulae", [])}

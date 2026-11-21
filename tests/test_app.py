@@ -255,6 +255,10 @@ class AdapterTests(unittest.TestCase):
     def test_step_label_names_the_tool_behind_wrappers(self):
         self.assertEqual(adapters.step_label(adapters.brew_env("brew", "upgrade", "--cask")),
                          "brew upgrade --cask")
+        self.assertEqual(adapters.step_label(adapters.brew_env("brew", "upgrade", "--formula", cleanup=False)),
+                         "brew upgrade --formula")
+        self.assertEqual(adapters.brew_env("brew", "upgrade", "--formula", cleanup=False)[:3],
+                         ["env", "-u", "HOMEBREW_NO_INSTALL_CLEANUP"])
         self.assertNotEqual(adapters.step_label(["sudo", "-n", "apt-get", "update"]),
                             adapters.step_label(["sudo", "-n", "apt-get", "upgrade", "-y"]))
         remote = ["ssh", "-o", "BatchMode=yes", "host", "cd -- /srv/a && uv lock --upgrade"]
@@ -850,6 +854,22 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["scanned"], [])
         self.assertEqual(coverage["retained"], ["x", "y"])
         self.assertTrue(any("does not match the installed set" in w for w in warnings))
+
+    def test_empty_or_multiline_summary_does_not_discard_the_scan(self):
+        scan = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
+                                        "repo_url": "https://example.com/x",
+                                        "vulnerabilities": [{"id": "OSV-1", "severity": "LOW",
+                                                             "summary": "", "aliases": [],
+                                                             "fixed_versions": []},
+                                                            {"id": "OSV-2", "severity": "LOW",
+                                                             "summary": "line one\nline two",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        findings, _, _ = sources.brew_scan(TARGET, self.packages(("x", "1")),
+                                           self.scripted(["vulns\n", scan], seen=("x",)))
+        self.assertEqual(sorted(f["advisory"] for f in findings), ["OSV-1", "OSV-2"])
+        self.assertEqual(findings[1]["summary"], "line one line two")
 
     def test_dict_findings_field_is_rejected(self):
         bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,
