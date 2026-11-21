@@ -341,6 +341,9 @@ def brew_scan(t, packages, runner, *, offline=False):
     # A stale target that names no installed formula consumed one of Homebrew's checked
     # slots that cannot be credited to any keg here.
     stale_unresolved = [name for name in coverage["outdated_without_sbom"] if resolve(name) is None]
+    # A formula that is both skipped and stale is a contradictory scan: it cannot be
+    # both refused and assessed against a stale target.
+    contradictory = skipped & stale
     # `checked` is `queryable.size` in Homebrew's scanner, so it counts queryable formulae —
     # skipped and refused ones are excluded, stale ones are included.
     claimed = considered - skipped - unscanned.keys()
@@ -356,7 +359,7 @@ def brew_scan(t, packages, runner, *, offline=False):
     outside = {row["formula"] for row in parsed if row["formula"] not in considered_identities}
     # A stale target consumes one of Homebrew's checked slots; if its identity is not an
     # installed formula, the slot cannot be credited to any keg that was scanned.
-    if any(identity(n) not in considered_identities for n in stale) or stale_unresolved:
+    if any(identity(n) not in considered_identities for n in stale) or stale_unresolved or contradictory:
         outside.add("\x00stale-outside-inventory")
     if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:

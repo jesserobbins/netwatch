@@ -255,11 +255,14 @@ def brew_formula_rows(t, runner):
             raise TypeError("formulae must be a list")
     except (ValueError, KeyError, TypeError) as exc:
         raise Error("Unrecognized Homebrew installed formulae output") from exc
-    known = set()
+    known = {}
     for entry in formulae:
         name = text(entry["name"], "formula name")
-        full = text(entry.get("full_name") or name, "formula full name")
-        known.add(name)
+        if not entry.get("full_name"):
+            raise Error("Unrecognized Homebrew installed formulae output")
+        full = text(entry["full_name"], "formula full name")
+        known[name] = {keg.get("version") for keg in (entry.get("installed") or [])
+                       if isinstance(keg, dict) and isinstance(keg.get("version"), str)}
         installed = entry.get("installed")
         if not isinstance(installed, list) or not installed:
             raise Error("Unrecognized Homebrew installed formulae output")
@@ -272,10 +275,11 @@ def brew_formula_rows(t, runner):
         parts = line.split()
         if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
             raise Error("Unrecognized Homebrew inventory line")
-        if parts[0] in known:
-            continue
         for version in parts[1:]:
-            yield parts[0], parts[0], version, True
+            if version not in known.get(parts[0], ()):
+                # The Cellar has a keg the metadata read does not describe: keep it, but
+                # no advisory assessment can reach it.
+                yield parts[0], parts[0], version, True
 
 
 def brew_formula_inventory(t, runner):

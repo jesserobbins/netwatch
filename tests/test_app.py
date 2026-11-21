@@ -755,7 +755,7 @@ TARGET = adapters.target("laptop", "brew")
 
 
 class BrewScanTests(unittest.TestCase):
-    def scripted(self, outputs, calls=None, seen=(), aliases=None, formulae=""):
+    def scripted(self, outputs, calls=None, seen=(), aliases=None, formulae="", cellar=None):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
         state = {"seen": set(seen), "versions": {}}
@@ -773,6 +773,8 @@ class BrewScanTests(unittest.TestCase):
                                                  "installed": [{"version": v} for v in state["versions"].get(name, ["1"])]}
                                                 for name in sorted(state["seen"])]})
             if "list" in argv and "--formula" in argv and "--versions" in argv:
+                if cellar is not None:
+                    return cellar
                 return "".join(f"{name} {' '.join(state['versions'].get(name, ['1']))}\n"
                                for name in sorted(state["seen"]))
             if not outputs:
@@ -865,6 +867,25 @@ class BrewScanTests(unittest.TestCase):
         findings, _, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(coverage.get("unaccounted"))
+
+    def test_a_formula_both_skipped_and_stale_is_a_contradictory_scan(self):
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": ["x"], "checked": 1, "complete": True,
+                           "outdated_without_sbom": ["x"], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("x",), formulae="x 1\n")
+        findings, _, coverage = sources.brew_scan(t, self.packages(("x", "1")), run)
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(coverage.get("unaccounted"))
+
+    def test_a_cellar_keg_the_info_read_misses_stays_in_the_inventory(self):
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="x 2\n", cellar="x 1 2\n")
+        rows = [p for p in adapters.inventory(t, run) if p["ecosystem"] == "Homebrew"]
+        versions = sorted((p["name"], p["version"], bool(p.get("unloadable"))) for p in rows)
+        self.assertEqual(versions, [("x", "1", True), ("x", "2", False)])
 
     def test_a_stale_target_outside_the_inventory_claims_no_coverage(self):
         # The only checked slot belongs to a stale formula that is not installed; the
