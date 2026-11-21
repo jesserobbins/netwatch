@@ -257,8 +257,10 @@ class AdapterTests(unittest.TestCase):
                          "brew upgrade --cask")
         self.assertEqual(adapters.step_label(adapters.brew_env("brew", "upgrade", "--formula", cleanup=False)),
                          "brew upgrade --formula")
-        self.assertEqual(adapters.brew_env("brew", "upgrade", "--formula", cleanup=False)[:3],
-                         ["env", "-u", "HOMEBREW_NO_INSTALL_CLEANUP"])
+        argv = adapters.brew_env("brew", "upgrade", "--formula", cleanup=False)
+        self.assertEqual(argv[:3], ["env", "-u", "HOMEBREW_NO_INSTALL_CLEANUP"])
+        self.assertNotIn("HOMEBREW_NO_INSTALL_CLEANUP=1", argv)  # -u must not be undone
+        self.assertIn("NONINTERACTIVE=1", argv)
         self.assertNotEqual(adapters.step_label(["sudo", "-n", "apt-get", "update"]),
                             adapters.step_label(["sudo", "-n", "apt-get", "upgrade", "-y"]))
         remote = ["ssh", "-o", "BatchMode=yes", "host", "cd -- /srv/a && uv lock --upgrade"]
@@ -803,6 +805,23 @@ class BrewScanTests(unittest.TestCase):
         # only the unambiguous 1_2_1 keg receives the finding.
         self.assertEqual([f["installed"] for f in findings], ["1_2_1"])
         self.assertEqual(coverage["retained_versions"], [["tool", "1_2"]])  # ambiguous keg stays unknown
+
+    def test_a_revised_keg_of_an_older_upstream_is_not_claimed_by_a_newer_row(self):
+        # Kegs 1 and 1_2: 1_2 could be upstream 1 rev 2 OR upstream 1_2 rev 0. A scan row
+        # for upstream 1 covers only the bare 1 keg; 1_2 stays unknown.
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "tool", "version": "1", "tag": "v1",
+                                        "repo_url": "https://example.com/tool",
+                                        "vulnerabilities": [{"id": "OSV-1", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "tool 1 1_2\n", "",
+                             "vulns\n", scan])
+        rows = adapters.inventory(t, run)
+        findings, _, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual([f["installed"] for f in findings], ["1"])
+        self.assertEqual(coverage["retained_versions"], [["tool", "1_2"]])
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET

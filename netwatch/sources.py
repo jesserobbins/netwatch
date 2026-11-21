@@ -227,9 +227,14 @@ def brew_scan(t, packages, runner, *, offline=False):
     # is ambiguous — it could be upstream 1 at revision 2 — so it is excluded from the
     # index and its findings stay unknown rather than inheriting another version's advisory.
     def is_ambiguous(name, version):
+        # A bare version (base == itself) is upstream at revision 0: unambiguous.
         if adapters.brew_base(version) == version:
-            return False  # a bare version is upstream at revision 0
+            return False
+        # A revised keg (`1_2` = upstream 1 rev 2) is ambiguous only when another keg
+        # claims the literal as its own upstream version (`1_2_1` = upstream 1_2 rev 1)
+        # AND that other keg is not simply a later revision of the same upstream.
         return any(other != version and adapters.brew_base(other) == version
+                   and adapters.brew_base(version) != other
                    for other in (v for n, v in pairs if n == name))
     ambiguous = {(name, version) for name, version in pairs if is_ambiguous(name, version)}
     by_base = {}

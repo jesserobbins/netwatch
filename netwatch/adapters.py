@@ -26,10 +26,13 @@ def brew_env(*args, cleanup=True):
     remove the superseded keg; read-only commands keep it set. `env -u` is needed
     because a locally exported variable would otherwise be inherited.
     """
-    pairs = {"PATH": MAC_PATH, "HOMEBREW_NO_AUTO_UPDATE": "1",
-             "HOMEBREW_NO_INSTALL_CLEANUP": "1", "NONINTERACTIVE": "1"}
+    pairs = {"PATH": MAC_PATH, "HOMEBREW_NO_AUTO_UPDATE": "1", "NONINTERACTIVE": "1"}
+    if cleanup:
+        pairs["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
     head = ["env"] + [f"{key}={value}" for key, value in pairs.items()]
     if not cleanup:
+        # Unset an inherited value; `env` applies -u before any assignments, and none
+        # of the assignments may re-set the variable.
         head = ["env", "-u", "HOMEBREW_NO_INSTALL_CLEANUP"] + head[1:]
     return [*head, *args]
 
