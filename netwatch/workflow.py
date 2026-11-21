@@ -27,7 +27,8 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             after = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
                      for p in adapters.brew_formula_inventory(t, runner)]
         except Error as exc:
-            if str(exc).startswith(adapters.HOST_STATE_ERRORS):
+            if str(exc).startswith(adapters.HOST_STATE_ERRORS) \
+                    or "requires a macOS host" in str(exc):
                 # The host can no longer be probed as the invoking user (or is no longer
                 # a macOS host): no further Homebrew command runs, the refusal or
                 # rejection is recorded, and the check fails as it happened.

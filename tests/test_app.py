@@ -270,8 +270,9 @@ class AdapterTests(unittest.TestCase):
 
     def test_brew_refuses_non_darwin_host(self):
         t = adapters.target("server", "brew")
-        with self.assertRaises(Error):
+        with self.assertRaises(Error) as caught:
             adapters.os_info(t, self.runner(["Linux\n"]))
+        self.assertIn("the host is no longer macOS", str(caught.exception))
 
     def test_brew_inventory_formulae_and_casks(self):
         t = adapters.target("laptop", "brew")
@@ -591,6 +592,17 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(result["status"], "applied")
         self.assertTrue(result["advisory_check_ok"])
         self.assertEqual(result["coverage"]["retained"], ["lame"])
+
+    def test_a_non_macos_flip_at_the_reconciliation_stops_the_check(self):
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n",
+                   self.scan([], complete=True, checked=1),
+                   "Linux\n"]
+        with self.assertRaises(Error) as caught:
+            workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
+                           request=lambda url, body=None: {})
+        self.assertIn("the host is no longer macOS", str(caught.exception))
+        self.assertIn("collection_failed", [e["kind"] for e in self.store.events()])
 
     def test_a_root_flip_at_the_reconciliation_refuses_the_read(self):
         self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
