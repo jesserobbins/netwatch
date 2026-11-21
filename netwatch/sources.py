@@ -368,6 +368,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # installed formula, the slot cannot be credited to any keg that was scanned.
     if any(identity(n) not in considered_identities for n in stale) or stale_unresolved or contradictory:
         outside.add("\x00stale-outside-inventory")
+    # Homebrew reports an incomplete scan without naming the gap: no keg can be tied to
+    # an assessment, so nothing can be credited clean.
+    if not coverage["complete"] and not (skipped or unscanned or stale):
+        coverage["unaccounted"] = True
     if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:
         coverage["unaccounted"] = True

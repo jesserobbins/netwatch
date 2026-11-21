@@ -743,6 +743,26 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0],
                          "needs_attention")
 
+    def test_text_report_marks_stale_and_cask_update_rows(self):
+        report = {"target": self.t, "packages": [adapters.package("dup", "1.0", "Homebrew"),
+                                                  adapters.package("dup", "1.0", "Homebrew-cask")],
+                  "findings": [], "context": {},
+                  "updates": [{"package": "gone", "candidate": "2.0", "ecosystem": "Homebrew"},
+                              {"package": "dup", "candidate": "2.0", "ecosystem": "Homebrew"},
+                              {"package": "dup", "candidate": "2.0", "ecosystem": "Homebrew-cask"}],
+                  "warnings": [], "advisory_check_ok": True, "evidence": [], "update_error": "offline",
+                  "coverage": None, "at": 0}
+        result = [{"target": self.t, "report": report, "pending_updates": [], "last_attempt": {"kind": "checked"}}]
+        import io, contextlib
+        from netwatch.cli import display
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            display(result)
+        rendered = out.getvalue()
+        self.assertIn("gone: ? -> 2.0 [not installed]", rendered)
+        self.assertEqual(rendered.count("dup:"), 2)
+        self.assertIn("dup: 1.0 -> 2.0 [cask]", rendered)
+
     def test_text_report_shows_held_and_default_list_markers(self):
         report = {"target": self.t, "packages": [adapters.package("libheif", "1.23.7", "Homebrew")],
                   "findings": [], "context": {},
@@ -870,6 +890,17 @@ class BrewScanTests(unittest.TestCase):
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
+
+    def test_an_unexplained_incomplete_scan_claims_no_coverage(self):
+        # Homebrew reports complete:false with no skipped, refused or stale formula: the
+        # gap is unnamed, so no keg can be tied to an assessment.
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 1, "complete": False,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("x",), formulae="x 1\n")
+        findings, _, coverage = sources.brew_scan(t, self.packages(("x", "1")), run)
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(coverage.get("unaccounted"))
 
     def test_a_stale_name_shadowed_by_a_tap_claims_no_coverage(self):
         # The stale entry names core `foo`; the inventory knows foo only as

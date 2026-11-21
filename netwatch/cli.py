@@ -255,8 +255,7 @@ def display(result, json_output=False, show_all=False):
                 # An update row retained from an earlier report may name a formula that
                 # is no longer installed; say so, so a same-named cask row cannot be
                 # mistaken for it.
-                if row.get("ecosystem") == "Homebrew" and not installed_for(row) \
-                        and not any(f["package"] == row["package"] for f in report["findings"]):
+                if row.get("ecosystem") == "Homebrew" and not installed_for(row):
                     state += " [not installed]"
                 if row.get("ecosystem") == "Homebrew-cask" and (
                         any(p["name"] == row["package"] and p["ecosystem"] == "Homebrew"

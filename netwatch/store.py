@@ -67,7 +67,7 @@ class Store:
         row = self.db.execute("SELECT id,at,body FROM scans WHERE target=? ORDER BY id DESC LIMIT 1", (name,)).fetchone()
         return {"id": row["id"], "at": row["at"], **json.loads(row["body"])} if row else None
 
-    def _trim_context(self, name, report):
+    def _trim_context(self, name, report, previous):
         """Drop context rows whose subject is no longer a finding.
 
         A concurrent check can clear a finding between this check's snapshot and this
@@ -108,7 +108,7 @@ class Store:
                     if isinstance(item, dict) and not item.get("retained"):
                         item["matched_references"] = sorted(set(item.get("references") or []) & cves)
 
-    def _restore_trimmed(self, name, report):
+    def _restore_trimmed(self, name, report, previous):
         """When a fresh row is trimmed, its retained copy (same id) comes back.
 
         The retention merge prefers fresh data; if the trim then drops the fresh row
@@ -118,7 +118,7 @@ class Store:
         context = report.get("context")
         if not isinstance(context, dict):
             return
-        old_context = self.latest(name).get("context", {}) if self.latest(name) else {}
+        old_context = previous.get("context", {}) if previous else {}
         for source, value in context.items():
             # Only a source that fetched this check (incomplete) can have lost a retained
             # row to the trim; a skipped source deliberately clears gone findings'
@@ -188,8 +188,8 @@ class Store:
                     for row in old_context.get(source, {}).get("items", []):
                         current.setdefault(row["id"], {**row, "retained": True})
                     value["items"] = list(current.values())
-            self._trim_context(name, report)
-            self._restore_trimmed(name, report)
+            self._trim_context(name, report, previous)
+            self._restore_trimmed(name, report, previous)
             def context_semantics(context):
                 return {source: {"status": value["status"], "errors": value["errors"],
                     "items": [{k: v for k, v in row.items() if k != "fetched_at"} for row in value["items"]]}
