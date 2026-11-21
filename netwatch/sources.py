@@ -370,7 +370,7 @@ def brew_scan(t, packages, runner, *, offline=False):
         outside.add("\x00stale-outside-inventory")
     # Homebrew reports an incomplete scan: the gap must be named by an installed
     # formula, or no keg can be tied to an assessment.
-    if not coverage["complete"] and not ((skipped | unscanned.keys() | stale) & formulae):
+    if not coverage["complete"] and not ((skipped | unscanned.keys() | stale) & considered):
         coverage["unaccounted"] = True
         coverage["unexplained_gap"] = True
     if len(claimed) != coverage["checked"] or \
@@ -388,6 +388,12 @@ def brew_scan(t, packages, runner, *, offline=False):
     # Homebrew scans one keg per formula (`formula.any_installed_prefix`) and reports the
     # upstream version as-is; installed kegs are indexed by base so a revision suffix
     # (`9.0.2_1`) still matches its upstream version (`9.0.2`). Other kegs stay unknown.
+    seen_formulas = [resolve(row["formula"]) for row in parsed]
+    duplicated = {name for name in seen_formulas if seen_formulas.count(name) > 1 and name is not None}
+    if duplicated:
+        # Homebrew scans one keg per formula (`any_installed_prefix`); two rows for one
+        # formula contradict the scanner's own model.
+        coverage["unaccounted"] = True
     matched_versions, matched_names = set(), set()
     unmatched = set()
     for row in parsed:

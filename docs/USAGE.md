@@ -37,7 +37,7 @@ netwatch apply PLAN_ID --yes
 netwatch status server
 ```
 
-OS updates require `sudo -n` access. Application updates use the invoking account. `apply` updates the whole selected environment, including dependencies. Live updates have not been tested; start on a disposable target. See [update behavior and recovery](#updates).
+OS updates on Linux require `sudo -n` access. Application updates, including Homebrew on macOS, use the invoking account; Homebrew is never run as root. `apply` updates the whole selected environment, including dependencies. Live updates have not been tested; start on a disposable target. See [update behavior and recovery](#updates).
 
 ## Agent and script queries
 

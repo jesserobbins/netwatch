@@ -838,20 +838,21 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(self.calls[1][1]["ok"], (0, 1))
 
     def test_finding_binds_to_version_not_name(self):
-        # Two keg versions of the SAME formula, same advisory: one finding each, distinct keys.
-        rows = self.packages(("python@3.12", "3.12.7"), ("python@3.12", "3.12.9"))
+        # One scan row (the scanner's one-keg model) binds to the installed kegs sharing
+        # its base: 3.12.7 and its revision 3.12.7_1 both get the finding, distinct keys;
+        # the 3.12.9 keg is a different upstream version and stays retained.
+        rows = self.packages(("python@3.12", "3.12.7"), ("python@3.12", "3.12.7_1"),
+                             ("python@3.12", "3.12.9"))
         scan = json.dumps({"findings": [
             {"formula": "python@3.12", "version": "3.12.7", "tag": "v3.12.7",
-             "repo_url": "https://github.com/python/cpython",
-             "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]},
-            {"formula": "python@3.12", "version": "3.12.9", "tag": "v3.12.9",
              "repo_url": "https://github.com/python/cpython",
              "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]}],
             "skipped_formulae": [], "checked": 1, "complete": True,
             "outdated_without_sbom": [], "unscanned_formulae": {}})
-        findings, _, _ = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", scan], seen=("python@3.12",)))
-        self.assertEqual(sorted(f["installed"] for f in findings), ["3.12.7", "3.12.9"])
+        findings, _, coverage = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", scan], seen=("python@3.12",)))
+        self.assertEqual(sorted(f["installed"] for f in findings), ["3.12.7", "3.12.7_1"])
         self.assertEqual(len({f["key"] for f in findings}), 2)
+        self.assertEqual(sorted(coverage["retained_versions"]), [["python@3.12", "3.12.9"]])
 
     def test_missing_vulns_command_is_a_coverage_gap(self):
         findings, warnings, coverage = sources.brew_scan(TARGET, self.packages(("x", "1")),
