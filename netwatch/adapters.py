@@ -208,12 +208,19 @@ def brew_considered(t, runner):
     `brew list --versions` lists more than this: on the reference host 269 names
     against `brew info --installed`'s 236, so coverage claimed from the wider list
     would include formulae Homebrew never looked at.
+
+    Returns (names, aliases): the considered set and the full_name -> name map.
     """
     data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
     try:
-        return {text(entry["name"], "formula name") for entry in data["formulae"]}
+        names = {text(entry["name"], "formula name") for entry in data["formulae"]}
+        # `brew vulns` reports `full_name`, which is tap-qualified for third-party taps
+        # (scouzi1966/afm/afm-next on this host) and plain for core.
+        aliases = {text(entry["full_name"], "formula full name"): text(entry["name"], "formula name")
+                   for entry in data["formulae"] if entry.get("full_name")}
     except (KeyError, TypeError) as exc:
         raise Error("Unrecognized Homebrew installed formulae output") from exc
+    return names, aliases
 
 
 def brew_formula_inventory(t, runner):

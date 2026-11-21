@@ -465,7 +465,7 @@ class BrewWorkflowTests(unittest.TestCase):
 
     def test_outdated_without_sbom_findings_are_not_published(self):
         report = self.check(self.INSTALLED, json.dumps({
-            "findings": [self.finding("lame", "3.099")], "skipped_formulae": [], "checked": 1,
+            "findings": [self.finding("lame", "3.099")], "skipped_formulae": [], "checked": 2,
             "complete": False, "outdated_without_sbom": ["lame"], "unscanned_formulae": {}}))
         self.assertEqual(report["coverage"]["retained"], ["lame"])
         self.assertEqual(report["coverage"]["scanned"], ["libheif"])
@@ -490,7 +490,7 @@ class BrewWorkflowTests(unittest.TestCase):
     def test_stable_host_clears_a_scanned_formula_without_a_change_warning(self):
         self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7"), self.finding("lame", "3.100")],
                                              complete=True, checked=2))
-        report = self.check(self.INSTALLED, self.scan([], skipped=["lame"]))
+        report = self.check(self.INSTALLED, self.scan([], skipped=["lame"], checked=1))
         # The scanned formula clears; the skipped one keeps its finding for this version.
         self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
         self.assertEqual(report["findings"][0]["state"], "unknown")
@@ -637,15 +637,17 @@ TARGET = adapters.target("laptop", "brew")
 
 
 class BrewScanTests(unittest.TestCase):
-    def scripted(self, outputs, calls=None, seen=()):
+    def scripted(self, outputs, calls=None, seen=(), aliases=None):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
         seen = set(seen)
+        full = dict(aliases or {})
         def run(t, argv, **kwargs):
             self.calls.append((argv, kwargs))
             # `brew info --installed` knows exactly what `brew list` reported.
             if "--installed" in argv:
-                return json.dumps({"formulae": [{"name": name} for name in sorted(seen)]})
+                return json.dumps({"formulae": [{"name": name, "full_name": full.get(name, name)}
+                                                for name in sorted(seen)]})
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
             value = outputs.pop(0)
@@ -725,6 +727,35 @@ class BrewScanTests(unittest.TestCase):
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
+
+    def test_tap_qualified_full_name_resolves_to_the_inventory_name(self):
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "kenn-io/tap/agentsview", "version": "0.47.0",
+                                         "tag": "v0.47.0", "repo_url": "https://github.com/kenn-io/agentsview",
+                                         "vulnerabilities": [{"id": "OSV-7", "severity": "HIGH", "summary": "s",
+                                                              "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "agentsview 0.47.0\n", "",
+                             "vulns\n", scan], aliases={"agentsview": "kenn-io/tap/agentsview"})
+        rows = adapters.inventory(t, run)
+        findings, warnings, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual([f["package"] for f in findings], ["agentsview"])
+        self.assertEqual(coverage["scanned"], ["agentsview"])
+        self.assertFalse(any("changed version" in w for w in warnings))
+
+    def test_a_multi_keg_formula_covers_only_the_keg_homebrew_scanned(self):
+        # Homebrew scans one keg per formula (any_installed_prefix). An 8.0 finding stays
+        # unknown while 9.0.2 is covered, even though the formula counts as checked.
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                             "ffmpeg 8.0\nffmpeg 9.0.2\n", "", "vulns\n", scan])
+        rows = adapters.inventory(t, run)
+        findings, warnings, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(coverage["scanned"], ["ffmpeg"])
+        self.assertEqual(sorted(coverage["retained_versions"]), [["ffmpeg", "8.0"], ["ffmpeg", "9.0.2"]])
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET

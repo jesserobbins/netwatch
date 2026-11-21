@@ -262,33 +262,64 @@ def brew_scan(t, packages, runner, *, offline=False):
                            "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Error("Homebrew vulnerability scan output is malformed") from exc
-    uncovered = set(coverage["skipped"]) | set(coverage["unscanned"]) | set(coverage["outdated_without_sbom"])
-    # A formula can be upgraded between inventory and scan. A finding for a version
-    # this host does not report installed cannot be trusted either way, so that
-    # formula's coverage is unknown and its prior findings are kept.
     # Homebrew only considers what `brew info --installed` knows: on the reference host that
     # is 236 formulae against `brew list --versions`'s 269, and anything else was never scanned.
-    considered = adapters.brew_considered(t, runner) & formulae
-    claimed = considered - set(coverage["skipped"]) - set(coverage["unscanned"]) \
-        - set(coverage["outdated_without_sbom"])
+    considered, full_names = adapters.brew_considered(t, runner)
+    considered &= formulae
     coverage["considered"] = sorted(considered)
-    # `checked` must account for exactly the formulae claimed as covered, and cannot be
-    # smaller than the number of results it produced.
+    # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
+    # the inventory's short names before any comparison.
+    resolve = lambda name: full_names.get(name, name)
+    skipped = {resolve(name) for name in coverage["skipped"]}
+    unscanned = {resolve(name): reason for name, reason in coverage["unscanned"].items()}
+    stale = {resolve(name) for name in coverage["outdated_without_sbom"]}
+    # `checked` is `queryable.size` in Homebrew's scanner, so it counts queryable formulae —
+    # skipped and refused ones are excluded, stale ones are included.
+    claimed = considered - skipped - unscanned.keys()
     if len(claimed) != coverage["checked"] or \
-            len({row["formula"] for row in parsed}) > coverage["checked"]:
+            len({resolve(row["formula"]) for row in parsed}) > coverage["checked"]:
         coverage["unaccounted"] = True
         claimed = set()
-    unreliable = set(coverage["outdated_without_sbom"]) | set(coverage["unscanned"]) | set(coverage["skipped"])
-    # A finding for a formula Homebrew assessed against another version, or refused outright,
-    # is not evidence about this host.
-    parsed = [row for row in parsed if row["formula"] not in unreliable]
+    # Homebrew assessed stale targets against the current formula version, and refused
+    # others outright; findings for either are not evidence about this host. Both stay
+    # inside `checked`, which is why they are dropped only after the count check.
+    unreliable = unscanned.keys() | stale | skipped
+    parsed = [row for row in parsed if resolve(row["formula"]) not in unreliable]
+    for row in parsed:
+        row["formula"] = resolve(row["formula"])
     pairs_base = {(name, adapters.brew_base(version)) for name, version in pairs}
-    unmatched = {row["formula"] for row in parsed if (row["formula"], row["version"]) not in pairs_base}
-    covered_names = claimed - unmatched
+    # Homebrew scans one keg per formula (`formula.any_installed_prefix`), so only the
+    # installed version its reported base maps to is covered; other kegs stay unknown.
+    covered_versions, matched_names = set(), set()
+    unmatched = set()
+    for row in parsed:
+        base = adapters.brew_base(row["version"])
+        installed = by_base.get((row["formula"], base))
+        if installed:
+            matched_names.add(row["formula"])
+            covered_versions.update((row["formula"], version) for version in installed)
+        else:
+            unmatched.add(row["formula"])
+    # A clean formula has no row at all; absence of a finding is evidence of assessment.
+    # Only a MISMATCHED row (a version the host does not have) invalidates a formula.
+    # Stale targets were assessed against the wrong version, so they are never covered.
+    if coverage.get("unaccounted"):
+        # The accounting does not balance, so no formula can be claimed as covered.
+        matched_names, clean = set(), set()
+    clean = claimed - unmatched - stale - matched_names  # assessed, no open vulnerability
+    covered_names = matched_names | clean
     coverage["scanned"] = sorted(covered_names)
     coverage["retained"] = sorted(formulae - covered_names)
+    # A matched row covers only the kegs sharing its base; a clean formula covers its kegs
+    # only when a single one is installed, because `any_installed_prefix` is not identified.
+    multi_keg = {name for name in clean
+                 if sum(1 for n, _ in pairs if n == name) > 1}
+    covered_names = matched_names | {name for name in clean if name not in multi_keg}
+    # Every installed keg of a covered formula is covered; kegs of uncovered ones are not.
+    covered_versions = {(name, version) for name, version in pairs if name in covered_names} \
+        | covered_versions
     coverage["retained_versions"] = sorted([name, version] for name, version in pairs
-                                           if name not in covered_names)
+                                           if (name, version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported.
     coverage["reported_complete"] = coverage["complete"]
     coverage["complete"] = coverage["complete"] and not coverage["retained"]
@@ -296,6 +327,9 @@ def brew_scan(t, packages, runner, *, offline=False):
     if unmatched:
         warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
                         "scan; their earlier findings are retained and their scan results are not used — re-run the check")
+    if stale:
+        warnings.append(f"Coverage: {len(stale)} formulae were scanned against the current formula version, "
+                        "not the installed one; their results are not used")
     for row in parsed:
         if row["formula"] in unmatched or coverage.get("unaccounted"):
             continue
