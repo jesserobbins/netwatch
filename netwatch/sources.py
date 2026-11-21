@@ -368,10 +368,11 @@ def brew_scan(t, packages, runner, *, offline=False):
     # installed formula, the slot cannot be credited to any keg that was scanned.
     if any(identity(n) not in considered_identities for n in stale) or stale_unresolved or contradictory:
         outside.add("\x00stale-outside-inventory")
-    # Homebrew reports an incomplete scan without naming the gap: no keg can be tied to
-    # an assessment, so nothing can be credited clean.
-    if not coverage["complete"] and not (skipped or unscanned or stale):
+    # Homebrew reports an incomplete scan: the gap must be named by an installed
+    # formula, or no keg can be tied to an assessment.
+    if not coverage["complete"] and not ((skipped | unscanned.keys() | stale) & formulae):
         coverage["unaccounted"] = True
+        coverage["unexplained_gap"] = True
     if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:
         coverage["unaccounted"] = True
@@ -491,6 +492,9 @@ def brew_scan(t, packages, runner, *, offline=False):
                             summary=advisory["summary"], references=advisory["aliases"],
                             tap=row["full_name"])
                 result.append(item)
+    if coverage.get("unexplained_gap"):
+        warnings.append("Coverage: Homebrew reported an incomplete scan without a gap among the installed "
+                        "formulae; no formula is claimed as covered and earlier findings are retained")
     if coverage["retained"]:
         warnings.append(f"Coverage: {len(coverage['retained'])} installed formulae were not scanned by Homebrew; "
                         "their earlier findings are retained and absence of findings is absence of evidence")

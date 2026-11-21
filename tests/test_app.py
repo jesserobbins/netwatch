@@ -891,6 +891,16 @@ class BrewScanTests(unittest.TestCase):
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
+    def test_a_gap_outside_the_inventory_explains_nothing(self):
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": ["ghost"], "checked": 1, "complete": False,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("foo",), formulae="foo 1\n")
+        findings, warnings, coverage = sources.brew_scan(t, self.packages(("foo", "1")), run)
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(coverage.get("unexplained_gap"))
+        self.assertTrue(any("without a gap among the installed" in w for w in warnings))
+
     def test_an_unexplained_incomplete_scan_claims_no_coverage(self):
         # Homebrew reports complete:false with no skipped, refused or stale formula: the
         # gap is unnamed, so no keg can be tied to an assessment.
