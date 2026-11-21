@@ -269,7 +269,10 @@ def brew_formula_rows(t, runner):
 
 def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
-    os_info(t, runner)
+    if os_info(t, runner)["UID"] == "0":
+        # The same refusal as the full inventory: no Homebrew command runs as root,
+        # including the reconciliation read.
+        raise Error("Homebrew must not run as root; re-run as the invoking user")
     return [package(name, version, "Homebrew", **({**({"tap": full} if full else {}), **({"unloadable": True} if stale else {})}))
             for name, full, version, stale in brew_formula_rows(t, runner)]
 

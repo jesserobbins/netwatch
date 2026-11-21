@@ -574,6 +574,19 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("brew upgrade --cask", saved["failed_step"])
         self.assertNotIn("nope", json.dumps(saved))  # raw tool text stays out of history
 
+    def test_a_root_flip_at_the_reconciliation_refuses_the_read(self):
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n",
+                   self.scan([], complete=True, checked=1),
+                   "Darwin\n", "arm64\n", "15.3.1\n", "0\n",
+                   EMPTY_OUTDATED, EMPTY_OUTDATED]
+        report = workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
+                                request=lambda url, body=None: {})
+        # The reconciliation could not run, so the scan is discarded and the prior
+        # finding is retained; the check is incomplete.
+        self.assertFalse(report["advisory_check_ok"])
+        self.assertEqual([f["state"] for f in report["findings"]], ["unknown"])
+
     def test_stable_host_clears_a_scanned_formula_without_a_change_warning(self):
         self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7"), self.finding("lame", "3.100")],
                                              complete=True, checked=2))
