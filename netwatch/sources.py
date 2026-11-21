@@ -215,14 +215,21 @@ def brew_scan(t, packages, runner, *, offline=False):
     offline check collected no evidence at all, so both are incomplete.
     """
     pairs = {(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"}
-    # Scan rows name the upstream version, so installed kegs are found by their base. Two
-    # revisions of one formula can both be installed; each gets its own finding.
+    # Scan rows name the upstream version; installed kegs are indexed by base only. A keg
+    # whose literal version is also another keg's base (`1_2` installed alongside `1_2_1`)
+    # is ambiguous — it could be upstream 1 at revision 2 — so it is excluded from the
+    # index and its findings stay unknown rather than inheriting another version's advisory.
+    def is_ambiguous(name, version):
+        if adapters.brew_base(version) == version:
+            return False  # a bare version is upstream at revision 0
+        return any(other != version and adapters.brew_base(other) == version
+                   for other in (v for n, v in pairs if n == name))
+    ambiguous = {(name, version) for name, version in pairs if is_ambiguous(name, version)}
     by_base = {}
     for name, version in sorted(pairs):
-        base = (name, adapters.brew_base(version))
-        by_base.setdefault(base, []).append(version)
-        if version != base[1]:
-            by_base.setdefault((name, version), []).append(version)
+        if (name, version) in ambiguous:
+            continue
+        by_base.setdefault((name, adapters.brew_base(version)), []).append(version)
     formulae = {name for name, _ in pairs}
     coverage = {"scanner": None, "checked": 0, "complete": False, "deferred": False,
                 "skipped": [], "unscanned": {}, "outdated_without_sbom": [],
@@ -331,6 +338,8 @@ def brew_scan(t, packages, runner, *, offline=False):
                                            if name in clean and name not in multi_keg}
     coverage["scanned"] = sorted(covered_names)
     coverage["retained"] = sorted(formulae - covered_names)
+    covered_versions = {(name, version) for name, version in covered_versions
+                        if (name, version) not in ambiguous}
     coverage["retained_versions"] = sorted([name, version] for name, version in pairs
                                            if (name, version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg

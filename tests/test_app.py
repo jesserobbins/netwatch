@@ -793,7 +793,10 @@ class BrewScanTests(unittest.TestCase):
                              "vulns\n", scan])
         rows = adapters.inventory(t, run)
         findings, _, coverage = sources.brew_scan(t, rows, run)
-        self.assertEqual(sorted(f["installed"] for f in findings), ["1_2", "1_2_1"])
+        # Keg 1_2 could be upstream 1 at revision 2, so it is ambiguous and stays unknown;
+        # only the unambiguous 1_2_1 keg receives the finding.
+        self.assertEqual([f["installed"] for f in findings], ["1_2_1"])
+        self.assertEqual(coverage["retained_versions"], [["tool", "1_2"]])  # ambiguous keg stays unknown
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET
