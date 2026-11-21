@@ -275,8 +275,11 @@ class AdapterTests(unittest.TestCase):
 
     def test_brew_inventory_formulae_and_casks(self):
         t = adapters.target("laptop", "brew")
-        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
-                           "abseil 20260817.0\npython@3.12 3.12.7\npython@3.13 3.13.1\n",
+        formulae = json.dumps({"formulae": [
+            {"name": "abseil", "full_name": "abseil", "installed": [{"version": "20260817.0"}]},
+            {"name": "python@3.12", "full_name": "python@3.12", "installed": [{"version": "3.12.7"}]},
+            {"name": "python@3.13", "full_name": "python@3.13", "installed": [{"version": "3.13.1"}]}]})
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae,
                            "claude-code 2.1.311\nantigravity-cli 1.5.13,5999302598852608\n"])
         rows = adapters.inventory(t, run)
         self.assertEqual([(p["name"], p["version"]) for p in rows],
@@ -284,12 +287,13 @@ class AdapterTests(unittest.TestCase):
                           ("claude-code", "2.1.311"), ("python@3.12", "3.12.7"), ("python@3.13", "3.13.1")])
         self.assertEqual({p["ecosystem"] for p in rows if p["name"].startswith("python")}, {"Homebrew"})
         self.assertEqual(next(p for p in rows if p["name"] == "claude-code")["ecosystem"], "Homebrew-cask")
-        self.assertEqual(self.calls[4][0][-4:], ["brew", "list", "--formula", "--versions"])
+        self.assertEqual(self.calls[4][0][-3:], ["info", "--installed", "--json=v2"])
         self.assertEqual(self.calls[5][0][-4:], ["brew", "list", "--cask", "--versions"])
+        self.assertEqual(next(p for p in rows if p["name"] == "python@3.12")["tap"], "python@3.12")
 
     def test_brew_inventory_rejects_unparsable_line(self):
         t = adapters.target("laptop", "brew")
-        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "abseil\n"])
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "not json\n"])
         with self.assertRaises(Error):
             adapters.inventory(t, run)
 
@@ -389,22 +393,39 @@ class BrewWorkflowTests(unittest.TestCase):
         self.t = adapters.target("laptop", "brew")
         self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("laptop", canonical(self.t)))
 
-    def scripted(self, outputs, calls=None):
+    def scripted(self, outputs, calls=None, formulae="", after=None, taps=None):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
-        seen = set()
+        taps = dict(taps or {})
+        # `brew info --installed` is synthesized from the installed formulae the fixture
+        # describes; once the scan has run, the reconciliation sees the `after` state.
+        state = {"scanned": False, "initial": self.info_map(formulae)}
+        self.info_after = self.info_map(formulae if after is None else after)
         def run(t, argv, **kwargs):
             self.calls.append((argv, kwargs))
-            # `brew info --installed` knows exactly what `brew list` reported.
             if "--installed" in argv:
-                return json.dumps({"formulae": [{"name": name} for name in sorted(seen)]})
+                source = self.info_after if state["scanned"] else state["initial"]
+                return json.dumps({"formulae": [{"name": name, "full_name": taps.get(name, full),
+                                                 "installed": [{"version": v} for v in versions]}
+                                                for name, (full, versions) in sorted(source.items())]})
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
             value = outputs.pop(0)
-            if "--versions" in argv and "--cask" not in argv:
-                seen.update(line.split()[0] for line in value.splitlines() if line.strip())
+            if "vulns" in argv and "--json" in argv:
+                state["scanned"] = True
             return value
         return run
+
+    @staticmethod
+    def info_map(formulae):
+        """`name version` lines -> {name: (full_name, [versions])}, kegs merged per name."""
+        result = {}
+        for line in formulae.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                full, versions = result.get(parts[0], (parts[0], []))
+                result[parts[0]] = (full, versions + parts[1:])
+        return result
 
     def scan(self, findings, skipped=(), unscanned=None, complete=False, checked=1):
         return json.dumps({"findings": findings, "skipped_formulae": list(skipped), "checked": checked,
@@ -417,16 +438,15 @@ class BrewWorkflowTests(unittest.TestCase):
                 "vulnerabilities": [{"id": advisory, "severity": "MEDIUM", "summary": "s",
                                      "aliases": [], "fixed_versions": ["9.9"]}]}
 
-    def check(self, formulae, scan_json, *, after="same"):
+    def check(self, formulae, scan_json, *, after="same", taps=None):
         """Run a check. `after` is the inventory seen when the scan's own re-collection runs:
         "same" (the host held still), None (no re-collection), or an explicit inventory."""
-        tail = formulae if after == "same" else after
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae, "", "vulns\n", scan_json]
-        if after is not None:
-            # workflow.check re-collects inventory after the scan, before discovering updates.
-            outputs += ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", tail]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan_json,
+                   "Darwin\n", "arm64\n", "15.3.1\n", "501\n"]
         outputs += [EMPTY_OUTDATED, EMPTY_OUTDATED]  # brew outdated, then --greedy
-        return workflow.check(self.store, self.t, runner=self.scripted(outputs),
+        runner = self.scripted(outputs, formulae=formulae,
+                               after=formulae if after == "same" else after, taps=taps)
+        return workflow.check(self.store, self.t, runner=runner,
                               request=lambda url, body=None: {})
 
     INSTALLED = "libheif 1.23.7\nlame 3.100\n"
@@ -484,9 +504,9 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertFalse(any("changed version" in w for w in report["warnings"]))
 
     def test_failed_step_is_recorded_in_the_plan_result(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
-        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
-        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", ""]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
+        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs, formulae="libheif 1.23.7\n"))
+        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", '{"formulae": [{"name": "libheif", "full_name": "libheif", "installed": [{"version": "1.23.7"}]}]}', ""]
         def failing(t, argv, **kwargs):
             if argv[-2:] == ["upgrade", "--cask"]:
                 raise Error("nope")
@@ -509,6 +529,22 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertFalse(any("changed or could not be re-read" in w for w in report["warnings"]))
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
+    def test_a_tap_swap_does_not_inherit_the_removed_formula_advisory(self):
+        # libheif (strukturag tap) is replaced by another tap's formula of the same short
+        # name and version; the scanner skips it, and the swap is caught by comparing the
+        # tap-qualified identity across the scan.
+        taps = {"libheif": "strukturag/libheif"}
+        row = self.finding("strukturag/libheif", "1.23.7")
+        self.check(self.INSTALLED, self.scan([row], skipped=["lame"]), taps=taps)
+        # Between checks the formula is replaced by another tap's build of the same name
+        # and version. The next check scans both formulae clean; the prior finding's
+        # tap-qualified identity no longer matches, so it retires instead of describing
+        # the replacement.
+        swapped = dict(taps, libheif="other/libheif")
+        report = self.check(self.INSTALLED, self.scan([], complete=True, checked=2), taps=swapped)
+        self.assertEqual(report["findings"], [])
+        self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
+
     def test_uninstalled_formula_finding_is_retired(self):
         self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100")], complete=True, checked=2))
         report = self.check("libheif 1.23.7\n", self.scan([], complete=True))
@@ -516,8 +552,8 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
     def test_no_scanner_is_an_incomplete_advisory_check(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", self.INSTALLED, "", "install update\n", EMPTY_OUTDATED, EMPTY_OUTDATED]
-        report = workflow.check(self.store, self.t, runner=self.scripted(outputs),
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "install update\n", EMPTY_OUTDATED, EMPTY_OUTDATED]
+        report = workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
                                 request=lambda url, body=None: {})
         self.assertFalse(report["advisory_check_ok"])
         self.assertFalse(report["coverage"]["scanner"])
@@ -603,10 +639,10 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 4)  # probe only; no inventory, no scan, no update
 
     def test_failed_cask_step_names_the_step_not_env(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
-        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
+        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs, formulae="libheif 1.23.7\n"))
         # apply re-collects inventory first, then runs the three approved steps.
-        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", ""]
+        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", '{"formulae": [{"name": "libheif", "full_name": "libheif", "installed": [{"version": "1.23.7"}]}]}', ""]
         def failing(t, argv, **kwargs):
             if argv[-2:] == ["upgrade", "--cask"]:  # not `brew list --cask` during inventory
                 raise Error("Command failed: brew upgrade --cask (exit 1)")
@@ -639,8 +675,8 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("[not in default upgrade]", plain)
 
     def test_preview_warns_about_casks(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
-        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
+        plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs, formulae="libheif 1.23.7\n"))
         self.assertIn("Cask upgrades", plan["scope"])
 
 
@@ -648,23 +684,26 @@ TARGET = adapters.target("laptop", "brew")
 
 
 class BrewScanTests(unittest.TestCase):
-    def scripted(self, outputs, calls=None, seen=(), aliases=None):
+    def scripted(self, outputs, calls=None, seen=(), aliases=None, formulae=""):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
-        seen = set(seen)
+        state = {"seen": set(seen), "versions": {}}
+        for line in formulae.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                state["seen"].add(parts[0])
+                state["versions"][parts[0]] = state["versions"].get(parts[0], []) + parts[1:]
         full = dict(aliases or {})
         def run(t, argv, **kwargs):
             self.calls.append((argv, kwargs))
-            # `brew info --installed` knows exactly what `brew list` reported.
+            # `brew info --installed` knows exactly what the fixture installed.
             if "--installed" in argv:
-                return json.dumps({"formulae": [{"name": name, "full_name": full.get(name, name)}
-                                                for name in sorted(seen)]})
+                return json.dumps({"formulae": [{"name": name, "full_name": full.get(name, name),
+                                                 "installed": [{"version": v} for v in state["versions"].get(name, ["1"])]}
+                                                for name in sorted(state["seen"])]})
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
-            value = outputs.pop(0)
-            if "--versions" in argv and "--cask" not in argv:
-                seen.update(line.split()[0] for line in value.splitlines() if line.strip())
-            return value
+            return outputs.pop(0)
         return run
 
     def packages(self, *rows):
@@ -683,7 +722,7 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["unscanned"], {"wacli": "untrusted_tap"})
         self.assertEqual(coverage["scanned"], ["libheif"])
         self.assertTrue(any("absence of findings" in w for w in warnings))
-        self.assertEqual(self.calls[1][1]["ok"], (0, 1))
+        self.assertEqual(self.calls[2][1]["ok"], (0, 1))
 
     def test_finding_binds_to_version_not_name(self):
         # Two keg versions of the SAME formula, same advisory: one finding each, distinct keys.
@@ -747,8 +786,9 @@ class BrewScanTests(unittest.TestCase):
                                                               "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 1, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "agentsview 0.47.0\n", "",
-                             "vulns\n", scan], aliases={"agentsview": "kenn-io/tap/agentsview"})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            aliases={"agentsview": "kenn-io/tap/agentsview"},
+                            formulae="agentsview 0.47.0\n")
         rows = adapters.inventory(t, run)
         findings, warnings, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual([f["package"] for f in findings], ["agentsview"])
@@ -761,8 +801,8 @@ class BrewScanTests(unittest.TestCase):
         t = TARGET
         scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 1, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
-                             "ffmpeg 8.0\nffmpeg 9.0.2\n", "", "vulns\n", scan])
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="ffmpeg 8.0\nffmpeg 9.0.2\n")
         rows = adapters.inventory(t, run)
         findings, warnings, coverage = sources.brew_scan(t, rows, run)
         # A clean multi-keg assessment cannot identify the scanned keg, so nothing is covered.
@@ -779,8 +819,8 @@ class BrewScanTests(unittest.TestCase):
                                                              "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 1, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
-                             "ffmpeg 8.0\nffmpeg 9.0.2\n", "", "vulns\n", scan])
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="ffmpeg 8.0\nffmpeg 9.0.2\n")
         rows = adapters.inventory(t, run)
         findings, warnings, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual(sorted((f["installed"], f["upstream_version"]) for f in findings),
@@ -797,8 +837,8 @@ class BrewScanTests(unittest.TestCase):
                                                              "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 1, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "tool 1_2 1_2_1\n", "",
-                             "vulns\n", scan])
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="tool 1_2 1_2_1\n")
         rows = adapters.inventory(t, run)
         findings, _, coverage = sources.brew_scan(t, rows, run)
         # Keg 1_2 could be upstream 1 at revision 2, so it is ambiguous and stays unknown;
@@ -817,8 +857,8 @@ class BrewScanTests(unittest.TestCase):
                                                              "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 1, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "tool 1 1_2\n", "",
-                             "vulns\n", scan])
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="tool 1 1_2\n")
         rows = adapters.inventory(t, run)
         findings, _, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual(sorted(f["installed"] for f in findings), ["1", "1_2"])
@@ -832,8 +872,8 @@ class BrewScanTests(unittest.TestCase):
                                                              "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 2, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
-                             "ffmpeg 9.0.2_1\nopenssl@3 3.5.8\n", "", "vulns\n", scan])
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="ffmpeg 9.0.2_1\nopenssl@3 3.5.8\n")
         rows = adapters.inventory(t, run)
         findings, warnings, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual([f["installed"] for f in findings], ["9.0.2_1"])  # the keg's version
@@ -849,8 +889,8 @@ class BrewScanTests(unittest.TestCase):
                                                              "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 1, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "ffmpeg 9.0.2 9.0.2_1\n", "",
-                             "vulns\n", scan])
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="ffmpeg 9.0.2 9.0.2_1\n")
         rows = adapters.inventory(t, run)
         findings, _, _ = sources.brew_scan(t, rows, run)
         self.assertEqual(sorted(f["installed"] for f in findings), ["9.0.2", "9.0.2_1"])

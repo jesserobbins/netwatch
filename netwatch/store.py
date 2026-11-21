@@ -80,10 +80,26 @@ class Store:
             return
         findings = report["findings"]
         cves = set(sources.advisory_references(findings, cves_only=True))
-        value = context.get("cve_now")
-        if isinstance(value, dict) and isinstance(value.get("items"), list):
-            value["items"] = [item for item in value["items"]
-                              if not isinstance(item, dict) or item.get("id") in cves]
+        for source in ("cve_now", "zero_wire", "pwn_watch"):
+            value = context.get(source)
+            # Retained or skipped context is history copied forward by design and stays;
+            # only freshly fetched rows whose subject cleared during this check's
+            # lifetime are dropped. cve_now and Zero Wire rows are subject to a finding's
+            # CVE; a pwn.watch row matched by package tag stays regardless, because it is
+            # a lead about an installed package.
+            if not isinstance(value, dict) or value.get("status") != "ok" \
+                    or not isinstance(value.get("items"), list):
+                continue
+            if source == "pwn_watch":
+                value["items"] = [item for item in value["items"] if not isinstance(item, dict)
+                                  or item.get("matched_tags")
+                                  or set(item.get("references") or []) & cves]
+            elif source == "cve_now":
+                value["items"] = [item for item in value["items"] if not isinstance(item, dict)
+                                  or item.get("id") in cves]
+            else:
+                value["items"] = [item for item in value["items"] if not isinstance(item, dict)
+                                  or set(item.get("references") or []) & cves]
 
     def save_scan(self, name, report):
         with self.transaction():
@@ -107,9 +123,11 @@ class Store:
                 # upgraded is a different observation, so its old finding retires.
                 retained = (report.get("coverage") or {}).get("retained_versions")
                 if retained is not None:
+                    # Retained pairs are tap-qualified; a finding without a tap (recorded
+                    # before this field existed) falls back to its short package name.
                     pairs = {tuple(pair) for pair in retained}
                     for key in old.keys() - new.keys():
-                        if (old[key]["package"], old[key]["installed"]) in pairs:
+                        if (old[key].get("tap") or old[key]["package"], old[key]["installed"]) in pairs:
                             new[key] = {**old[key], "state": "unknown",
                                         "reason": "Not scanned by this check; previous finding retained"}
                             if new[key] != old[key]:

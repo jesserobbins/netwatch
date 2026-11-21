@@ -21,15 +21,19 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         # formula advisories, so reconciliation compares formulae only. If they moved while
         # the scan ran, its version claims cannot be tied to this report: retain the earlier
         # findings and publish none of the new ones.
-        formulae = [(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"]
+        formulae = [(p.get("tap") or p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"]
         try:
-            after = [(p["name"], p["version"]) for p in adapters.brew_formula_inventory(t, runner)]
+            after = [(p.get("tap") or p["name"], p["version"]) for p in adapters.brew_formula_inventory(t, runner)]
         except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             after = None
         if after is None or sorted(after) != sorted(formulae):
             findings = []
-            coverage.update(scanned=[], retained=sorted({name for name, _ in formulae}),
-                            retained_versions=sorted([name, version] for name, version in formulae),
+            # Retention follows the newest observation: a formula replaced between the
+            # two collections (even a same-name same-version tap swap) must not inherit
+            # the removed formula's advisory as an unknown state.
+            newest = after if after is not None else formulae
+            coverage.update(scanned=[], retained=sorted({name for name, _ in newest}),
+                            retained_versions=sorted([name, version] for name, version in newest),
                             complete=False, changed_during_scan=True)
             # The scan's evidence cannot be tied to this host, so the advisory check is
             # incomplete rather than clean, and check exits 1.
@@ -65,7 +69,8 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             carried = prior  # the store keeps every prior finding on incomplete evidence
         else:
             pairs = {tuple(pair) for pair in (coverage or {}).get("retained_versions") or []}
-            carried = [row for row in prior if (row["package"], row["installed"]) in pairs]
+            carried = [row for row in prior
+                       if (row.get("tap") or row["package"], row["installed"]) in pairs]
         linked = [*carried, *findings] if carried else findings
         report["context"] = sources.context(packages, linked, store, offline=offline, refresh=refresh,
                                             refreshed=refreshed, request=request)

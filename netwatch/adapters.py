@@ -235,18 +235,35 @@ def brew_considered(t, runner):
 
 
 def brew_formula_rows(t, runner):
-    """One (name, version) pair per installed formula keg, from one shared parse."""
-    for line in runner(t, brew_env("brew", "list", "--formula", "--versions")).splitlines():
-        parts = line.split()
-        if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
-            raise Error("Unrecognized Homebrew inventory line")
-        yield from ((parts[0], version) for version in parts[1:])
+    """One (name, full_name, version) triple per installed formula keg.
+
+    `brew info --installed --json=v2` is the shared parse: the tap-qualified full_name
+    makes a same-name same-version formula from a different tap a different row, which
+    the plain `brew list --versions` cannot express.
+    """
+    try:
+        data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
+        formulae = data["formulae"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Error("Unrecognized Homebrew installed formulae output") from exc
+    for entry in formulae:
+        name = text(entry["name"], "formula name")
+        full = text(entry.get("full_name") or name, "formula full name")
+        installed = entry.get("installed")
+        if not isinstance(installed, list) or not installed:
+            raise Error("Unrecognized Homebrew installed formulae output")
+        for keg in installed:
+            version = keg.get("version") if isinstance(keg, dict) else None
+            if not isinstance(version, str) or BREW_VERSION.fullmatch(version) is None:
+                raise Error("Unrecognized Homebrew inventory line")
+            yield name, full, version
 
 
 def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
     os_info(t, runner)
-    return [package(name, version, "Homebrew") for name, version in brew_formula_rows(t, runner)]
+    return [package(name, version, "Homebrew", tap=full)
+            for name, full, version in brew_formula_rows(t, runner)]
 
 
 def brew_inventory(t, runner):
@@ -256,7 +273,8 @@ def brew_inventory(t, runner):
         # inventory first, so refusing here covers all of them without adding an
         # unapproved command to the apply sequence.
         raise Error("Homebrew must not run as root; re-run as the invoking user")
-    result = [package(name, version, "Homebrew") for name, version in brew_formula_rows(t, runner)]
+    result = [package(name, version, "Homebrew", tap=full)
+              for name, full, version in brew_formula_rows(t, runner)]
     for line in runner(t, brew_env("brew", "list", "--cask", "--versions")).splitlines():
         parts = line.split()
         if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):

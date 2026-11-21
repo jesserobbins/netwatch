@@ -267,6 +267,11 @@ def brew_scan(t, packages, runner, *, offline=False):
         coverage["scanner"] = False
         return [], ["Coverage: this Homebrew has no vulnerability scanner; no formula was assessed"], coverage
     coverage["scanner"] = True
+    # The considered set is verified twice: a tap metadata refresh between the two
+    # collections changes which installed formulae `brew info --installed` recognizes,
+    # and a same-size swap could otherwise credit a clean scan to a formula the scanner
+    # never assessed.
+    before_scan, _ = adapters.brew_considered(t, runner)
     raw = runner(t, adapters.brew_env("brew", "vulns", "--json"), ok=(0, 1), timeout=300)
     try:
         data = json.loads(raw)
@@ -292,7 +297,7 @@ def brew_scan(t, packages, runner, *, offline=False):
             if not isinstance(vulnerabilities, list):
                 raise TypeError("unexpected vulnerabilities type")
             repository = text(row["repo_url"], "repository URL")
-            parsed.append({"formula": formula, "version": version,
+            parsed.append({"formula": formula, "full_name": formula, "version": version,
                            "repository": strip_credentials(repository), "tag": text(row["tag"], "upstream tag"),
                            "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -300,11 +305,16 @@ def brew_scan(t, packages, runner, *, offline=False):
     # Homebrew only considers what `brew info --installed` knows: on the reference host that
     # is 236 formulae against `brew list --versions`'s 269, and anything else was never scanned.
     considered, full_names = adapters.brew_considered(t, runner)
+    if {full_names.get(n, n) for n in before_scan} != {full_names.get(n, n) for n in considered}:
+        coverage["unaccounted"] = True
     considered &= formulae
     coverage["considered"] = sorted(considered)
     # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
     # the inventory's short names before any comparison.
     resolve = lambda name: full_names.get(name, name)
+    full_names_inverse = {}
+    for qualified, short in full_names.items():
+        full_names_inverse.setdefault(short, qualified)
     skipped = {resolve(name) for name in coverage["skipped"]}
     unscanned = {resolve(name): reason for name, reason in coverage["unscanned"].items()}
     stale = {resolve(name) for name in coverage["outdated_without_sbom"]}
@@ -371,7 +381,11 @@ def brew_scan(t, packages, runner, *, offline=False):
     coverage["retained"] = sorted(formulae - covered_names)
     covered_versions = {(name, version) for name, version in covered_versions
                         if (name, version) not in ambiguous}
-    coverage["retained_versions"] = sorted([name, version] for name, version in pairs
+    # Retention is keyed by the tap-qualified identity, so a formula replaced by a
+    # different tap's formula of the same short name and version cannot inherit the
+    # removed formula's advisory.
+    identity = lambda name: full_names_inverse.get(name, name)
+    coverage["retained_versions"] = sorted([identity(name), version] for name, version in pairs
                                            if (name, version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
     # of a partially covered formula.
@@ -407,7 +421,8 @@ def brew_scan(t, packages, runner, *, offline=False):
                 item["key"] = digest(["Homebrew", row["formula"], installed, advisory["id"]])
                 item["upstream_version"] = row["version"]
                 item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
-                            summary=advisory["summary"], references=advisory["aliases"])
+                            summary=advisory["summary"], references=advisory["aliases"],
+                            tap=row["full_name"])
                 result.append(item)
     if coverage["retained"]:
         warnings.append(f"Coverage: {len(coverage['retained'])} installed formulae were not scanned by Homebrew; "
