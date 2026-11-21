@@ -116,7 +116,9 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
             raise Error("Plan was already claimed")
         store.event(t["name"], "approved_and_started", {"plan": id_, "operator_uid": os.getuid(), "commands": body["commands"]})
     try:
+        last_argv = None
         for argv in body["commands"]:
+            last_argv = argv
             try:
                 runner(t, argv, timeout=1800)
             except Error as exc:
@@ -138,10 +140,15 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
             store.event(t["name"], "applied", result)
         return result
     except BaseException as exc:
-        step = str(exc).split(";")[0] if isinstance(exc, Error) else None
         detail = {"error": "Update interrupted/failed or verification unavailable; inspect the system before retrying"}
-        if step and step.startswith("Update step failed:"):
-            detail["failed_step"] = step.split(":", 1)[1].strip()
+        if isinstance(exc, Error):
+            step = str(exc).split(";")[0]
+            if step.startswith("Update step failed:"):
+                detail["failed_step"] = step.split(":", 1)[1].strip()
+        elif isinstance(exc, UnicodeDecodeError):
+            # A command ran and produced output that is not valid UTF-8; the step is
+            # known even though its output cannot be decoded.
+            detail["failed_step"] = adapters.step_label(last_argv) if last_argv else "unknown step"
         with store.transaction():
             store.db.execute("UPDATE plans SET status='needs_attention',result=? WHERE id=?",
                              (canonical(detail), id_))

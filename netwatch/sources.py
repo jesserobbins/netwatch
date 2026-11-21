@@ -181,6 +181,17 @@ def osv(p, data):
 BREW_FIXED = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
 
 
+def strip_credentials(url):
+    """A repository URL without userinfo or a query string, so no secret reaches the report."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.username is None and not parts.query:
+        return url
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", parts.fragment))
+
+
 def advisory_fields(advisory):
     """Validate the optional fields instead of trusting Homebrew's JSON types.
 
@@ -280,8 +291,9 @@ def brew_scan(t, packages, runner, *, offline=False):
             vulnerabilities = row["vulnerabilities"]
             if not isinstance(vulnerabilities, list):
                 raise TypeError("unexpected vulnerabilities type")
+            repository = text(row["repo_url"], "repository URL")
             parsed.append({"formula": formula, "version": version,
-                           "repository": text(row["repo_url"], "repository URL"), "tag": text(row["tag"], "upstream tag"),
+                           "repository": strip_credentials(repository), "tag": text(row["tag"], "upstream tag"),
                            "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Error("Homebrew vulnerability scan output is malformed") from exc
@@ -299,20 +311,21 @@ def brew_scan(t, packages, runner, *, offline=False):
     # `checked` is `queryable.size` in Homebrew's scanner, so it counts queryable formulae —
     # skipped and refused ones are excluded, stale ones are included.
     claimed = considered - skipped - unscanned.keys()
+    # Homebrew assessed stale targets against the current formula version, and refused
+    # others outright; findings for either are not evidence about this host. Rows for
+    # those formulas are dropped first: they are outside `checked`, so they must not be
+    # counted against its budget.
+    unreliable = unscanned.keys() | stale | skipped
+    parsed = [row for row in parsed if resolve(row["formula"]) not in unreliable]
+    outside = {resolve(row["formula"]) for row in parsed if resolve(row["formula"]) not in considered}
     if len(claimed) != coverage["checked"] or \
-            len({resolve(row["formula"]) for row in parsed}) > coverage["checked"]:
+            len({row["formula"] for row in parsed}) > coverage["checked"]:
         coverage["unaccounted"] = True
         claimed = set()
-    # Homebrew assessed stale targets against the current formula version, and refused
-    # others outright; findings for either are not evidence about this host. Both stay
-    # inside `checked`, which is why they are dropped only after the count check.
-    unreliable = unscanned.keys() | stale | skipped
-    outside = {resolve(row["formula"]) for row in parsed if resolve(row["formula"]) not in considered}
     if outside:
         # A finding for a formula `brew info --installed` does not know contradicts the
         # scan's own accounting; none of its evidence can be used.
         coverage["unaccounted"] = True
-    parsed = [row for row in parsed if resolve(row["formula"]) not in unreliable]
     for row in parsed:
         row["formula"] = resolve(row["formula"])
     # Homebrew scans one keg per formula (`formula.any_installed_prefix`) and reports the
@@ -321,8 +334,8 @@ def brew_scan(t, packages, runner, *, offline=False):
     matched_versions, matched_names = set(), set()
     unmatched = set()
     for row in parsed:
-        # A revision-zero keg (`1_2`) and a revised one (`1_2_1`) are both upstream 1_2; the
-        # dual index lets one scan row reach every installed revision of that version.
+        # The index is base-only: one scan row for upstream 9.0.2 reaches the revised keg
+        # 9.0.2_1. Kegs whose upstream identity is uncertain (`is_ambiguous`) are absent.
         installed = by_base.get((row["formula"], row["version"]))
         if installed:
             if row["vulnerabilities"]:
@@ -363,8 +376,8 @@ def brew_scan(t, packages, runner, *, offline=False):
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
     # of a partially covered formula.
     coverage["reported_complete"] = coverage["complete"]
-    coverage["complete"] = coverage["complete"] and not coverage["retained_versions"] \
-        and not coverage["retained"]
+    coverage["complete"] = coverage["complete"] and not coverage.get("unaccounted") \
+        and not coverage["retained_versions"] and not coverage["retained"]
     warnings, result = [], []
     partially = sorted({name for name, _ in coverage["retained_versions"]} & set(coverage["scanned"]))
     if partially:

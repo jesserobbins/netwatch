@@ -788,7 +788,7 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["retained_versions"], [["ffmpeg", "8.0"]])
         self.assertTrue(any("other installed kegs" in w for w in warnings))
 
-    def test_both_revisions_of_an_upstream_version_get_the_finding(self):
+    def test_a_revision_suffix_keg_matches_its_upstream_version_row(self):
         # A revision-zero keg (1_2) and a revised one (1_2_1) are both upstream 1_2.
         t = TARGET
         scan = json.dumps({"findings": [{"formula": "tool", "version": "1_2", "tag": "v1.2",

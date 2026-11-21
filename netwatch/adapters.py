@@ -234,16 +234,19 @@ def brew_considered(t, runner):
     return names, aliases
 
 
-def brew_formula_inventory(t, runner):
-    """Formulae only. Advisory reconciliation must not pay for a cask listing."""
-    os_info(t, runner)
-    result = []
+def brew_formula_rows(t, runner):
+    """One (name, version) pair per installed formula keg, from one shared parse."""
     for line in runner(t, brew_env("brew", "list", "--formula", "--versions")).splitlines():
         parts = line.split()
         if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
             raise Error("Unrecognized Homebrew inventory line")
-        result.extend(package(parts[0], version, "Homebrew") for version in parts[1:])
-    return result
+        yield from ((parts[0], version) for version in parts[1:])
+
+
+def brew_formula_inventory(t, runner):
+    """Formulae only. Advisory reconciliation must not pay for a cask listing."""
+    os_info(t, runner)
+    return [package(name, version, "Homebrew") for name, version in brew_formula_rows(t, runner)]
 
 
 def brew_inventory(t, runner):
@@ -253,14 +256,12 @@ def brew_inventory(t, runner):
         # inventory first, so refusing here covers all of them without adding an
         # unapproved command to the apply sequence.
         raise Error("Homebrew must not run as root; re-run as the invoking user")
-    result = []
-    for ecosystem, argv in (("Homebrew", ["brew", "list", "--formula", "--versions"]),
-                            ("Homebrew-cask", ["brew", "list", "--cask", "--versions"])):
-        for line in runner(t, brew_env(*argv)).splitlines():
-            parts = line.split()
-            if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
-                raise Error("Unrecognized Homebrew inventory line")
-            result.extend(package(parts[0], version, ecosystem) for version in parts[1:])
+    result = [package(name, version, "Homebrew") for name, version in brew_formula_rows(t, runner)]
+    for line in runner(t, brew_env("brew", "list", "--cask", "--versions")).splitlines():
+        parts = line.split()
+        if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
+            raise Error("Unrecognized Homebrew inventory line")
+        result.extend(package(parts[0], version, "Homebrew-cask") for version in parts[1:])
     return result
 
 
@@ -328,7 +329,11 @@ def brew_outdated(t, runner):
         entry = {"package": name, "candidate": row.get("current_version"), "ecosystem": ecosystem}
         if row.get("pinned"):
             entry.update(held=True, held_version=row.get("pinned_version"))
-        if (ecosystem, name) not in plain:
+        # Only a cask is honestly greedy-only: `brew upgrade --cask` without --greedy
+        # leaves auto-updating casks alone. A formula the plain call missed became
+        # outdated between the two calls (a concurrent `brew update`), and the approved
+        # upgrade will take it, so it is listed as an ordinary update.
+        if (ecosystem, name) not in plain and ecosystem != "Homebrew":
             entry.update(greedy_only=True, reason="Excluded from the default outdated list")
         result.append(entry)
     return result

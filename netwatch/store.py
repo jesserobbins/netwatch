@@ -6,6 +6,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+from . import sources
 from .core import Error, canonical
 
 
@@ -66,6 +67,24 @@ class Store:
         row = self.db.execute("SELECT id,at,body FROM scans WHERE target=? ORDER BY id DESC LIMIT 1", (name,)).fetchone()
         return {"id": row["id"], "at": row["at"], **json.loads(row["body"])} if row else None
 
+    def _trim_context(self, name, report):
+        """Drop context rows whose subject is no longer a finding.
+
+        A concurrent check can clear a finding between this check's snapshot and this
+        save; context fetched only for that finding then describes nothing. Context is
+        never applicability evidence, but a report should not carry rows for findings it
+        does not contain.
+        """
+        context = report.get("context")
+        if not isinstance(context, dict):
+            return
+        findings = report["findings"]
+        cves = set(sources.advisory_references(findings, cves_only=True))
+        value = context.get("cve_now")
+        if isinstance(value, dict) and isinstance(value.get("items"), list):
+            value["items"] = [item for item in value["items"]
+                              if not isinstance(item, dict) or item.get("id") in cves]
+
     def save_scan(self, name, report):
         with self.transaction():
             previous = self.latest(name)
@@ -118,6 +137,7 @@ class Store:
                     for row in old_context.get(source, {}).get("items", []):
                         current.setdefault(row["id"], {**row, "retained": True})
                     value["items"] = list(current.values())
+            self._trim_context(name, report)
             def context_semantics(context):
                 return {source: {"status": value["status"], "errors": value["errors"],
                     "items": [{k: v for k, v in row.items() if k != "fetched_at"} for row in value["items"]]}
