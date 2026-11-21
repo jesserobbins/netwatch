@@ -722,7 +722,7 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["unscanned"], {"wacli": "untrusted_tap"})
         self.assertEqual(coverage["scanned"], ["libheif"])
         self.assertTrue(any("absence of findings" in w for w in warnings))
-        self.assertEqual(self.calls[2][1]["ok"], (0, 1))
+        self.assertEqual(self.calls[1][1]["ok"], (0, 1))
 
     def test_finding_binds_to_version_not_name(self):
         # Two keg versions of the SAME formula, same advisory: one finding each, distinct keys.

@@ -80,6 +80,7 @@ class Store:
             return
         findings = report["findings"]
         cves = set(sources.advisory_references(findings, cves_only=True))
+        references = set(sources.advisory_references(findings))
         for source in ("cve_now", "zero_wire", "pwn_watch"):
             value = context.get(source)
             # Retained or skipped context is history copied forward by design and stays;
@@ -91,9 +92,10 @@ class Store:
                     or not isinstance(value.get("items"), list):
                 continue
             if source == "pwn_watch":
+                # pwn.watch matches on every advisory id, not only CVEs.
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
                                   or item.get("matched_tags")
-                                  or set(item.get("references") or []) & cves]
+                                  or set(item.get("references") or []) & references]
             elif source == "cve_now":
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
                                   or item.get("id") in cves]

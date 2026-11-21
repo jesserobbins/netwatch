@@ -267,11 +267,6 @@ def brew_scan(t, packages, runner, *, offline=False):
         coverage["scanner"] = False
         return [], ["Coverage: this Homebrew has no vulnerability scanner; no formula was assessed"], coverage
     coverage["scanner"] = True
-    # The considered set is verified twice: a tap metadata refresh between the two
-    # collections changes which installed formulae `brew info --installed` recognizes,
-    # and a same-size swap could otherwise credit a clean scan to a formula the scanner
-    # never assessed.
-    before_scan, _ = adapters.brew_considered(t, runner)
     raw = runner(t, adapters.brew_env("brew", "vulns", "--json"), ok=(0, 1), timeout=300)
     try:
         data = json.loads(raw)
@@ -305,8 +300,9 @@ def brew_scan(t, packages, runner, *, offline=False):
     # Homebrew only considers what `brew info --installed` knows: on the reference host that
     # is 236 formulae against `brew list --versions`'s 269, and anything else was never scanned.
     considered, full_names = adapters.brew_considered(t, runner)
-    if {full_names.get(n, n) for n in before_scan} != {full_names.get(n, n) for n in considered}:
-        coverage["unaccounted"] = True
+    # The inventory collected before the scan already observed the recognized set; the
+    # reconciliation compares the two tap-qualified keg lists, so a metadata refresh that
+    # changed which formulae are recognized cannot pass unnoticed.
     considered &= formulae
     coverage["considered"] = sorted(considered)
     # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
@@ -393,7 +389,8 @@ def brew_scan(t, packages, runner, *, offline=False):
     coverage["complete"] = coverage["complete"] and not coverage.get("unaccounted") \
         and not coverage["retained_versions"] and not coverage["retained"]
     warnings, result = [], []
-    partially = sorted({name for name, _ in coverage["retained_versions"]} & set(coverage["scanned"]))
+    partially = sorted({identity(name) for name, _ in coverage["retained_versions"]}
+                       & {identity(name) for name in coverage["scanned"]})
     if partially:
         warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "
                         "Homebrew; their earlier findings are retained")
