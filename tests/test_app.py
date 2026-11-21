@@ -574,6 +574,24 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("brew upgrade --cask", saved["failed_step"])
         self.assertNotIn("nope", json.dumps(saved))  # raw tool text stays out of history
 
+    def test_a_successful_brew_apply_carries_the_verification_into_the_result(self):
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
+        plan = workflow.preview(self.store, self.t,
+                                runner=self.scripted(outputs, formulae="libheif 1.24.0\nlame 3.100\n"))
+        # apply: inventory, three upgrade steps, then the verification check.
+        apply_outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "",
+                         "step\n", "step\n", "step\n",
+                         "Darwin\n", "arm64\n", "15.3.1\n", "501\n", "",
+                         "vulns\n", self.scan([], skipped=["lame"], complete=True, checked=1),
+                         "Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                         EMPTY_OUTDATED, EMPTY_OUTDATED]
+        result = workflow.apply(self.store, plan["id"], yes=True,
+                                runner=self.scripted(apply_outputs, formulae="libheif 1.24.0\nlame 3.100\n"),
+                                request=lambda url, body=None: {})
+        self.assertEqual(result["status"], "applied")
+        self.assertTrue(result["advisory_check_ok"])
+        self.assertEqual(result["coverage"]["retained"], ["lame"])
+
     def test_a_root_flip_at_the_reconciliation_refuses_the_read(self):
         self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n",
@@ -583,8 +601,10 @@ class BrewWorkflowTests(unittest.TestCase):
         with self.assertRaises(Error) as caught:
             workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
                            request=lambda url, body=None: {})
-        # The refusal surfaces as it happened, and no further Homebrew command runs.
+        # The refusal is recorded (status and history see it) and no further Homebrew
+        # command runs.
         self.assertIn("must not run as root", str(caught.exception))
+        self.assertIn("collection_failed", [e["kind"] for e in self.store.events()])
         self.assertEqual(len(self.calls), 13)  # probe x2 + inventory + scan + refused read
 
     def test_stable_host_clears_a_scanned_formula_without_a_change_warning(self):

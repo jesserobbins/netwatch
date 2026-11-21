@@ -27,10 +27,12 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             after = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
                      for p in adapters.brew_formula_inventory(t, runner)]
         except Error as exc:
-            if "must not run as root" in str(exc):
-                # The host can no longer be probed as the invoking user; no further
-                # Homebrew command runs, and the refusal is reported as it happened.
-                raise
+            if str(exc).startswith(adapters.HOST_STATE_ERRORS):
+                # The host can no longer be probed as the invoking user (or is no longer
+                # a macOS host): no further Homebrew command runs, the refusal or
+                # rejection is recorded, and the check fails as it happened.
+                store.event(t["name"], "collection_failed", {"error": str(exc)})
+                raise Error(f"Inventory collection failed: {exc}; previous report retained (see history)") from exc
             after = None
         except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             after = None
