@@ -886,6 +886,25 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(coverage.get("unaccounted"))
 
+    def test_a_cellar_only_keg_of_a_scanned_tap_formula_is_reported(self):
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "acme/tools/foo", "version": "2", "tag": "v2",
+                                        "repo_url": "https://example.com/foo",
+                                        "vulnerabilities": [{"id": "OSV-1", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="foo 2\n", cellar="foo 1 2\n",
+                            aliases={"foo": "acme/tools/foo"})
+        rows = [p for p in adapters.inventory(t, run) if p["ecosystem"] == "Homebrew"]
+        for row in rows:
+            if row["version"] == "2":
+                row["tap"] = "acme/tools/foo"
+        findings, warnings, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(coverage["scanned"], ["acme/tools/foo"])
+        self.assertTrue(any("other installed kegs were not assessed" in w for w in warnings))
+
     def test_an_unloadable_keg_never_receives_a_finding(self):
         t = TARGET
         scan = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",

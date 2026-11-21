@@ -447,7 +447,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     coverage["complete"] = coverage["complete"] and not coverage.get("unaccounted") \
         and not coverage["retained_versions"] and not coverage["retained"]
     warnings, result = [], []
-    scanned_identities = {identity(name) for name in coverage["scanned"]} | set(coverage["scanned"])
+    # Scanned names are tap-qualified identities; an unloadable keg's retained pair uses
+    # the formula's short name, so compare against both forms.
+    scanned_identities = {identity(n) for n in coverage["scanned"]} \
+        | {full_names.get(n, n) for n in coverage["scanned"]}
     partially = sorted({pair[0] for pair in coverage["retained_versions"]} & scanned_identities)
     if partially:
         warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "
