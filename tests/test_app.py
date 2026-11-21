@@ -541,8 +541,8 @@ class BrewWorkflowTests(unittest.TestCase):
         t = adapters.target("laptop", "brew")
         self.assertEqual(adapters.commands(t),
                          [adapters.brew_env("brew", "update"),
-                          adapters.brew_env("brew", "upgrade", "--formula"),
-                          adapters.brew_env("brew", "upgrade", "--cask")])
+                          adapters.brew_env("brew", "upgrade", "--formula", cleanup=False),
+                          adapters.brew_env("brew", "upgrade", "--cask", cleanup=False)])
 
     def test_brew_outdated_keeps_same_named_formula_and_cask_apart(self):
         plain = json.dumps({"formulae": [{"name": "tool", "installed_versions": ["1.0"],

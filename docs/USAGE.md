@@ -168,6 +168,7 @@ Findings have first/last-seen times. History records new or changed findings, fa
 - npm skips scripts; packages needing build scripts may require follow-up.
 - Cask upgrades can need privileges, quit running applications or run installers, and they run as a separate command from formulae so a failure names the right half.
 - `brew update` runs first because netwatch suppresses Homebrew's implicit refresh; without it an upgrade can stop at a version the local metadata knows.
+- The upgrade steps run without Homebrew's cleanup suppression, so the superseded keg is removed and a later check can confirm the new version clean. If you want to keep the old keg for rollback, upgrade by hand instead.
 - The update list marks a pinned formula `[held]` and a cask Homebrew leaves out of `brew outdated` `[not in default upgrade]`. Neither is an update the approved plan will take.
 - Package scripts and builds can run code and affect services.
 

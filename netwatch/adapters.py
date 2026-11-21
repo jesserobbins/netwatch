@@ -19,10 +19,16 @@ KINDS = ("ubuntu", "arch", "cachyos", "conda", "mamba", "uv", "npm", "brew")
 MAC_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
-def brew_env(*args):
-    """Fixed PATH and Homebrew's non-interactive settings, carried in argv."""
+def brew_env(*args, cleanup=True):
+    """Fixed PATH and Homebrew's non-interactive settings, carried in argv.
+
+    `cleanup=False` drops HOMEBREW_NO_INSTALL_CLEANUP so an approved upgrade may
+    remove the superseded keg; read-only commands keep it.
+    """
     pairs = {"PATH": MAC_PATH, "HOMEBREW_NO_AUTO_UPDATE": "1",
              "HOMEBREW_NO_INSTALL_CLEANUP": "1", "NONINTERACTIVE": "1"}
+    if not cleanup:
+        del pairs["HOMEBREW_NO_INSTALL_CLEANUP"]
     return ["env", *[f"{key}={value}" for key, value in pairs.items()], *args]
 
 
@@ -295,7 +301,12 @@ def brew_outdated(t, runner):
     """Pending updates, with held and greedy-only entries marked honestly."""
     def rows(*extra):
         data = json.loads(runner(t, brew_env("brew", "outdated", "--json=v2", *extra), timeout=300))
-        # A formula and a cask can share a name, so the identity is the pair.
+        # A formula and a cask can share a name, so the identity is the pair. An empty
+        # object where an array belongs is malformed, not an empty update list.
+        for field in ("formulae", "casks"):
+            value = data.get(field, [])
+            if not isinstance(value, list):
+                raise Error("Unrecognized Homebrew update output")
         found = {("Homebrew", r["name"]): r for r in data.get("formulae", [])}
         found.update({("Homebrew-cask", r["name"]): r for r in data.get("casks", [])})
         for row in found.values():
@@ -328,8 +339,10 @@ def commands(t):
         "uv": [["uv", "lock", "--upgrade"], ["uv", "sync", "--locked"]],
         "npm": [["npm", "update", "--ignore-scripts"]],
         # HOMEBREW_NO_AUTO_UPDATE=1 suppresses Homebrew's implicit refresh, so the
-        # plan refreshes first, the way apt-get update and pacman -Syu do.
+        # plan refreshes first, the way apt-get update and pacman -Syu do. The upgrades
+        # run without HOMEBREW_NO_INSTALL_CLEANUP so the superseded keg is removed and a
+        # later scan can cover the formula; cleanup stays on for read-only commands.
         "brew": [brew_env("brew", "update"),
-                 brew_env("brew", "upgrade", "--formula"),
-                 brew_env("brew", "upgrade", "--cask")],
+                 brew_env("brew", "upgrade", "--formula", cleanup=False),
+                 brew_env("brew", "upgrade", "--cask", cleanup=False)],
     }[t["kind"]]

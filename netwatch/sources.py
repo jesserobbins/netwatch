@@ -341,8 +341,8 @@ def brew_scan(t, packages, runner, *, offline=False):
     warnings, result = [], []
     partially = sorted({name for name, _ in coverage["retained_versions"]} & set(coverage["scanned"]))
     if partially:
-        warnings.append(f"Coverage: {len(partially)} scanned formulae have other installed kegs Homebrew did "
-                        "not assess; those kegs' earlier findings are retained")
+        warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "
+                        "Homebrew; their earlier findings are retained")
     if unmatched:
         warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
                         "scan; their earlier findings are retained and their scan results are not used — re-run the check")
