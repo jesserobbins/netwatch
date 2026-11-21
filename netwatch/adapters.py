@@ -274,7 +274,13 @@ def brew_formula_package(name, full, version, stale):
 
 def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
-    brew_refuse_root(t, runner, prefix=True)
+    try:
+        brew_refuse_root(t, runner, prefix=True)
+    except Error as exc:
+        if "requires a macOS host" in str(exc):
+            # A successful probe earlier in this check makes this a mid-check change.
+            raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS") from exc
+        raise
     return [brew_formula_package(*row) for row in brew_formula_rows(t, runner)]
 
 
