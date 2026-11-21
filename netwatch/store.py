@@ -96,7 +96,7 @@ class Store:
                                   or item.get("retained") or item.get("matched_tags")
                                   or set(item.get("references") or []) & references]
                 for item in value["items"]:
-                    if isinstance(item, dict):
+                    if isinstance(item, dict) and not item.get("retained"):
                         item["matched_references"] = sorted(set(item.get("references") or []) & references)
             elif source == "cve_now":
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
@@ -105,7 +105,7 @@ class Store:
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
                                   or item.get("retained") or set(item.get("references") or []) & cves]
                 for item in value["items"]:
-                    if isinstance(item, dict):
+                    if isinstance(item, dict) and not item.get("retained"):
                         item["matched_references"] = sorted(set(item.get("references") or []) & cves)
 
     def save_scan(self, name, report):
@@ -133,8 +133,11 @@ class Store:
                     # Retained pairs are tap-qualified; a finding without a tap (recorded
                     # before this field existed) falls back to its short package name.
                     pairs = {tuple(pair) for pair in retained}
+                    unloadable = {pair[:2] for pair in pairs if len(pair) == 3 and pair[2] == "unloadable"}
                     for key in old.keys() - new.keys():
-                        if (old[key].get("tap") or old[key]["package"], old[key]["installed"]) in pairs:
+                        row = old[key]
+                        if (row.get("tap") or row["package"], row["installed"]) in pairs \
+                                or (row["package"], row["installed"]) in unloadable:
                             new[key] = {**old[key], "state": "unknown",
                                         "reason": "Not scanned by this check; previous finding retained"}
                             if new[key] != old[key]:

@@ -582,6 +582,21 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(states.get("ghost"), "unknown")
         self.assertTrue(any("not scanned by Homebrew" in w for w in report["warnings"]))
 
+    def test_an_untapped_formula_keg_keeps_its_prior_finding_unknown(self):
+        # A third-party formula's keg stays installed after its tap is removed: brew info
+        # omits it, brew list still shows it, and the finding recorded under the
+        # tap-qualified identity stays unknown instead of being retired.
+        taps = {"ghost": "acme/x/ghost"}
+        self.check(self.INSTALLED + "ghost 1.0\n",
+                   self.scan([self.finding("acme/x/ghost", "1.0")], complete=True, checked=3),
+                   taps=taps)
+        report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")],
+                                                      complete=True, checked=2),
+                            unloadable=["ghost"])
+        states = {f["package"]: f["state"] for f in report["findings"]}
+        self.assertEqual(states.get("ghost"), "unknown")
+        self.assertNotIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
+
     def test_a_tap_swap_does_not_inherit_the_removed_formula_advisory(self):
         # libheif (strukturag tap) is replaced by another tap's formula of the same short
         # name and version; the scanner skips it, and the swap is caught by comparing the
@@ -613,8 +628,10 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["retained"], ["lame", "libheif"])
 
     def test_offline_skips_the_scan_and_marks_the_check_incomplete(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", self.INSTALLED, ""]
-        report = workflow.check(self.store, self.t, offline=True, runner=self.scripted(outputs),
+        self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", ""]
+        report = workflow.check(self.store, self.t, offline=True,
+                                runner=self.scripted(outputs, formulae=self.INSTALLED),
                                 request=lambda url, body=None: {})
         self.assertFalse(report["advisory_check_ok"])
         self.assertTrue(report["coverage"]["deferred"])

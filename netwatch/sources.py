@@ -268,10 +268,16 @@ def brew_scan(t, packages, runner, *, offline=False):
                 "retained_versions": sorted([name, version] for name, version in pairs)}
     if offline:
         coverage["deferred"] = True
+        # Retention pairs carry the inventory's tap identity so JSON consumers can join
+        # them with the findings in the same report.
+        coverage["retained_versions"] = sorted([p.get("tap") or p["name"], p["version"]]
+                                               for p in packages if p["ecosystem"] == "Homebrew")
         return [], ["Coverage: Homebrew's scan needs the target and was skipped in offline mode; prior findings retained"], coverage
     words = runner(t, adapters.brew_env("brew", "commands")).split()
     if "vulns" not in words:
         coverage["scanner"] = False
+        coverage["retained_versions"] = sorted([p.get("tap") or p["name"], p["version"]]
+                                               for p in packages if p["ecosystem"] == "Homebrew")
         return [], ["Coverage: this Homebrew has no vulnerability scanner; no formula was assessed"], coverage
     coverage["scanner"] = True
     raw = runner(t, adapters.brew_env("brew", "vulns", "--json"), ok=(0, 1), timeout=300)
@@ -415,15 +421,17 @@ def brew_scan(t, packages, runner, *, offline=False):
     # removed formula's advisory.
     covered_versions = {(identity(name), version) for name, version in covered_versions
                         if (identity(name), version) not in ambiguous}
-    coverage["retained_versions"] = sorted([identity(name), version] for name, version in pairs
-                                           if (identity(name), version) not in covered_versions)
+    unloadable = {p["name"] for p in packages if p["ecosystem"] == "Homebrew" and p.get("unloadable")}
+    coverage["retained_versions"] = sorted(
+        [identity(name), version, *(["unloadable"] if name in unloadable else [])]
+        for name, version in pairs if (identity(name), version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
     # of a partially covered formula.
     coverage["reported_complete"] = coverage["complete"]
     coverage["complete"] = coverage["complete"] and not coverage.get("unaccounted") \
         and not coverage["retained_versions"] and not coverage["retained"]
     warnings, result = [], []
-    partially = sorted({identity(name) for name, _ in coverage["retained_versions"]}
+    partially = sorted({pair[0] for pair in coverage["retained_versions"]}
                        & {identity(name) for name in coverage["scanned"]})
     if partially:
         warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "

@@ -70,8 +70,10 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             carried = prior  # the store keeps every prior finding on incomplete evidence
         else:
             pairs = {tuple(pair) for pair in (coverage or {}).get("retained_versions") or []}
+            unloadable = {pair[:2] for pair in pairs if len(pair) == 3 and pair[2] == "unloadable"}
             carried = [row for row in prior
-                       if (row.get("tap") or row["package"], row["installed"]) in pairs]
+                       if (row.get("tap") or row["package"], row["installed"]) in pairs
+                       or (row["package"], row["installed"]) in unloadable]
         linked = [*carried, *findings] if carried else findings
         report["context"] = sources.context(packages, linked, store, offline=offline, refresh=refresh,
                                             refreshed=refreshed, request=request)

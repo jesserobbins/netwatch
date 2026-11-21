@@ -242,9 +242,10 @@ def display(result, json_output=False, show_all=False):
                 # updates the approved plan will take, so say which one it is.
                 state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
                     " [not in default upgrade]" if row.get("greedy_only") else "")
-                if row.get("ecosystem") == "Homebrew-cask" and any(
-                        p["name"] == row["package"] and p["ecosystem"] == "Homebrew"
-                        for p in report["packages"]):
+                if row.get("ecosystem") == "Homebrew-cask" and (
+                        any(p["name"] == row["package"] and p["ecosystem"] == "Homebrew"
+                            for p in report["packages"])
+                        or any(f["package"] == row["package"] for f in report["findings"])):
                     state += " [cask]"
                 installed = safe(', '.join(sorted(installed_for(row))) or '?')
                 candidate = safe(row.get('candidate') or 'unknown')
