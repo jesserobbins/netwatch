@@ -219,7 +219,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # revisions of one formula can both be installed; each gets its own finding.
     by_base = {}
     for name, version in sorted(pairs):
-        by_base.setdefault((name, adapters.brew_base(version)), []).append(version)
+        base = (name, adapters.brew_base(version))
+        by_base.setdefault(base, []).append(version)
+        if version != base[1]:
+            by_base.setdefault((name, version), []).append(version)
     formulae = {name for name, _ in pairs}
     coverage = {"scanner": None, "checked": 0, "complete": False, "deferred": False,
                 "skipped": [], "unscanned": {}, "outdated_without_sbom": [],
@@ -298,6 +301,8 @@ def brew_scan(t, packages, runner, *, offline=False):
     matched_versions, matched_names = set(), set()
     unmatched = set()
     for row in parsed:
+        # A revision-zero keg (`1_2`) and a revised one (`1_2_1`) are both upstream 1_2; the
+        # dual index lets one scan row reach every installed revision of that version.
         installed = by_base.get((row["formula"], row["version"]))
         if installed:
             matched_names.add(row["formula"])
@@ -334,6 +339,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     coverage["complete"] = coverage["complete"] and not coverage["retained_versions"] \
         and not coverage["retained"]
     warnings, result = [], []
+    partially = sorted({name for name, _ in coverage["retained_versions"]} & set(coverage["scanned"]))
+    if partially:
+        warnings.append(f"Coverage: {len(partially)} scanned formulae have other installed kegs Homebrew did "
+                        "not assess; those kegs' earlier findings are retained")
     if unmatched:
         warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
                         "scan; their earlier findings are retained and their scan results are not used — re-run the check")

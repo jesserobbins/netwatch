@@ -455,8 +455,10 @@ class BrewWorkflowTests(unittest.TestCase):
 
     def test_inventory_change_during_the_scan_retains_prior_findings(self):
         self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")], complete=True, checked=2))
-        report = self.check(self.INSTALLED, self.scan([], complete=True),
+        report = self.check(self.INSTALLED, self.scan([], complete=True, checked=2),
                             after="libheif 1.24.0\nlame 3.100\n")
+        self.assertNotIn("unaccounted", report["coverage"])
+        self.assertFalse(report["advisory_check_ok"])
         self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
         self.assertEqual(report["findings"][0]["state"], "unknown")
         self.assertTrue(report["coverage"]["changed_during_scan"])
@@ -772,10 +774,26 @@ class BrewScanTests(unittest.TestCase):
         run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
                              "ffmpeg 8.0\nffmpeg 9.0.2\n", "", "vulns\n", scan])
         rows = adapters.inventory(t, run)
-        findings, _, coverage = sources.brew_scan(t, rows, run)
+        findings, warnings, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual(sorted((f["installed"], f["upstream_version"]) for f in findings),
                          [("9.0.2", "9.0.2")])
         self.assertEqual(coverage["retained_versions"], [["ffmpeg", "8.0"]])
+        self.assertTrue(any("other installed kegs" in w for w in warnings))
+
+    def test_both_revisions_of_an_upstream_version_get_the_finding(self):
+        # A revision-zero keg (1_2) and a revised one (1_2_1) are both upstream 1_2.
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "tool", "version": "1_2", "tag": "v1.2",
+                                        "repo_url": "https://example.com/tool",
+                                        "vulnerabilities": [{"id": "OSV-3", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "tool 1_2 1_2_1\n", "",
+                             "vulns\n", scan])
+        rows = adapters.inventory(t, run)
+        findings, _, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(sorted(f["installed"] for f in findings), ["1_2", "1_2_1"])
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET
