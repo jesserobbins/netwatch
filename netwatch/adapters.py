@@ -352,7 +352,8 @@ def brew_outdated(t, runner):
         # outdated between the two calls (a concurrent `brew update`), and the approved
         # upgrade will take it, so it is listed as an ordinary update.
         if (ecosystem, name) not in plain and ecosystem != "Homebrew":
-            entry.update(greedy_only=True, reason="Excluded from the default outdated list")
+            entry.update(greedy_only=True, reason="Not in the default outdated list: excluded by "
+                                                  "Homebrew, or it became outdated between the two calls")
         result.append(entry)
     return result
 

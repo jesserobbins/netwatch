@@ -415,7 +415,7 @@ def brew_scan(t, packages, runner, *, offline=False):
                                advisory["id"], "affected", advisory["fixed"],
                                "Homebrew OSV scan matched the upstream repository and tag; coverage limited to scanned formulae",
                                "https://osv.dev/vulnerability/" + advisory["id"])
-                item["key"] = digest(["Homebrew", row["formula"], installed, advisory["id"]])
+                item["key"] = digest(["Homebrew", row["full_name"], installed, advisory["id"]])
                 item["upstream_version"] = row["version"]
                 item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
                             summary=advisory["summary"], references=advisory["aliases"],

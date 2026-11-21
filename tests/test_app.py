@@ -661,7 +661,7 @@ class BrewWorkflowTests(unittest.TestCase):
                   "updates": [{"package": "openssl@3", "candidate": "3.5.9", "ecosystem": "Homebrew",
                                "held": True, "held_version": "3.5.8"},
                               {"package": "1password", "candidate": "8.12.46", "ecosystem": "Homebrew-cask",
-                               "greedy_only": True, "reason": "Excluded from the default outdated list"}],
+                               "greedy_only": True, "reason": "Not in the default outdated list: excluded by Homebrew, or it became outdated between the two calls"}],
                   "warnings": [], "advisory_check_ok": True, "evidence": [], "update_error": None,
                   "coverage": {"scanner": True, "checked": 1, "complete": True, "skipped": [],
                                "unscanned": {}, "scanned": ["libheif"], "retained": []},
