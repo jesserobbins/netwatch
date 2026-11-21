@@ -388,8 +388,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # Homebrew scans one keg per formula (`formula.any_installed_prefix`) and reports the
     # upstream version as-is; installed kegs are indexed by base so a revision suffix
     # (`9.0.2_1`) still matches its upstream version (`9.0.2`). Other kegs stay unknown.
-    seen_formulas = [resolve(row["formula"]) for row in parsed]
-    duplicated = {name for name in seen_formulas if seen_formulas.count(name) > 1 and name is not None}
+    # Duplicates are counted on the raw reported name: the scan identifies formulas by
+    # their full name, whatever the inventory's short name is.
+    seen_formulas = [row["full_name"] for row in parsed]
+    duplicated = {name for name in seen_formulas if seen_formulas.count(name) > 1}
     if duplicated:
         # Homebrew scans one keg per formula (`any_installed_prefix`); two rows for one
         # formula contradict the scanner's own model.

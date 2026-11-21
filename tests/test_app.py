@@ -913,6 +913,25 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(coverage.get("unaccounted"))
 
+    def test_two_rows_for_one_tap_formula_contradict_the_scanner(self):
+        t = TARGET
+        scan = json.dumps({"findings": [
+            {"formula": "acme/tools/foo", "version": "1", "tag": "v1",
+             "repo_url": "https://example.com/foo",
+             "vulnerabilities": [{"id": "OSV-1", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]},
+            {"formula": "acme/tools/foo", "version": "2", "tag": "v2",
+             "repo_url": "https://example.com/foo",
+             "vulnerabilities": [{"id": "OSV-1", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]}],
+            "skipped_formulae": [], "checked": 1, "complete": True,
+            "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("acme/tools/foo",),
+                            aliases={"acme/tools/foo": "foo"}, formulae="foo 1 2\n")
+        rows = [adapters.package("foo", "1", "Homebrew", tap="acme/tools/foo"),
+                adapters.package("foo", "2", "Homebrew", tap="acme/tools/foo")]
+        findings, _, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(findings, [])
+        self.assertTrue(coverage.get("unaccounted"))
+
     def test_a_stale_name_shadowed_by_a_tap_claims_no_coverage(self):
         # The stale entry names core `foo`; the inventory knows foo only as
         # acme/tools/foo. The checked slot cannot be credited to the tapped keg.
