@@ -274,19 +274,22 @@ def brew_formula_package(name, full, version, stale):
 
 def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
-    brew_refuse_root(t, runner)
+    brew_refuse_root(t, runner, prefix=True)
     return [brew_formula_package(*row) for row in brew_formula_rows(t, runner)]
 
 
 HOST_STATE_ERRORS = "Homebrew host state changed"
 
 
-def brew_refuse_root(t, runner):
+def brew_refuse_root(t, runner, prefix=False):
     """Homebrew must not run as root and needs a macOS host; every check or apply path
-    collects inventory first, so refusing here covers all of them."""
+    collects inventory first, so refusing here covers all of them. `prefix` marks a read
+    that happens after a successful probe in the same check, where a failure really is a
+    mid-check host-state change rather than a misconfigured target."""
     probe = os_info(t, runner)
     if probe["UID"] == "0":
-        raise Error(HOST_STATE_ERRORS + ": must not run as root; re-run as the invoking user")
+        raise Error((HOST_STATE_ERRORS + ": " if prefix else "")
+                    + "Homebrew must not run as root; re-run as the invoking user")
     if probe["ID"] != "macos":
         raise Error((HOST_STATE_ERRORS + ": " if prefix else "")
                     + "Homebrew adapter requires a macOS host")

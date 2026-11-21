@@ -817,6 +817,33 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(rendered.count("dup:"), 2)
         self.assertIn("dup: 1.0 -> 2.0 [cask]", rendered)
 
+    def test_a_replacement_formula_does_not_inherit_the_old_taps_label(self):
+        report = {"target": self.t,
+                  "packages": [adapters.package("foo", "1.0", "Homebrew")],
+                  "findings": [{"package": "foo", "installed": "1.0", "state": "unknown",
+                                "tap": "acme/x/foo", "advisory": "OSV-1", "key": "k",
+                                "reason": "r", "url": "u", "fix_versions": []}],
+                  "context": {},
+                  "updates": [{"package": "foo", "candidate": "2.0", "ecosystem": "Homebrew"}],
+                  "warnings": [], "advisory_check_ok": False, "evidence": [], "update_error": None,
+                  "coverage": None, "at": 0}
+        result = [{"target": self.t, "report": report, "pending_updates": [],
+                   "last_attempt": {"kind": "checked"}}]
+        import io, contextlib
+        from netwatch.cli import display
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            display(result)
+        rendered = out.getvalue()
+        # The finding names acme/x/foo; the core foo row carries no tap, so no label.
+        self.assertNotIn("[review]", rendered)
+        # The matching tap row keeps its label.
+        report["updates"][0]["tap"] = "acme/x/foo"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            display(result)
+        self.assertIn("[review]", out.getvalue())
+
     def test_text_report_shows_held_and_default_list_markers(self):
         report = {"target": self.t, "packages": [adapters.package("libheif", "1.23.7", "Homebrew")],
                   "findings": [], "context": {},

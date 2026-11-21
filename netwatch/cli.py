@@ -223,11 +223,18 @@ def display(result, json_output=False, show_all=False):
                 if found or row.get("ecosystem") is not None:
                     return found or set()
                 return by_name[row["package"]]
-            affected = {r["package"] for r in report["findings"] if r["state"] == "affected"}
-            review = {r["package"] for r in report["findings"] if r["state"] == "unknown"}
+            # Findings carry the tap-qualified identity; a short name alone must not
+            # join a finding to an update row for a replaced formula.
+            def identities(state):
+                return {r["package"]: {f.get("tap") for f in report["findings"]
+                                       if f["package"] == r["package"] and f["state"] == state}
+                        for r in report["findings"] if r["state"] == state}
+            affected, review = identities("affected"), identities("unknown")
             def has(row, names):
                 # Advisories cover formulae, never casks; sorting must agree with the label.
-                return row.get("ecosystem") in (None, "Homebrew") and row["package"] in names
+                taps = names.get(row["package"])
+                return row.get("ecosystem") in (None, "Homebrew") and taps is not None and (
+                    None in taps or row.get("tap") in taps)
             rows = sorted(report["updates"], key=lambda u: (not has(u, affected), not has(u, review),
                                                             u["package"], u.get("ecosystem") or ""))
             # The same package can be upgradable on several architectures; one row per
@@ -246,8 +253,12 @@ def display(result, json_output=False, show_all=False):
                 # Advisories cover formulae, never casks, so a same-named cask row must not
                 # inherit the formula's marker.
                 advisory_applies = row.get("ecosystem") in (None, "Homebrew")
-                label, style = (" [affected]", "bold red") if advisory_applies and n in affected else (
-                    (" [review]", "yellow") if advisory_applies and n in review else ("", "cyan"))
+                if advisory_applies and has(row, affected):
+                    label, style = " [affected]", "bold red"
+                elif advisory_applies and has(row, review):
+                    label, style = " [review]", "yellow"
+                else:
+                    label, style = "", "cyan"
                 # A held formula and a cask excluded from the default list are not
                 # updates the approved plan will take, so say which one it is.
                 state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
