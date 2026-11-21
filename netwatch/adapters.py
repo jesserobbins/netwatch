@@ -254,7 +254,7 @@ def brew_inventory(t, runner):
         # unapproved command to the apply sequence.
         raise Error("Homebrew must not run as root; re-run as the invoking user")
     result = []
-    for ecosystem, argv in (("Homebrew", ["brew", "list", "--versions"]),
+    for ecosystem, argv in (("Homebrew", ["brew", "list", "--formula", "--versions"]),
                             ("Homebrew-cask", ["brew", "list", "--cask", "--versions"])):
         for line in runner(t, brew_env(*argv)).splitlines():
             parts = line.split()

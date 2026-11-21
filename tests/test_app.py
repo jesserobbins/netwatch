@@ -284,7 +284,7 @@ class AdapterTests(unittest.TestCase):
                           ("claude-code", "2.1.311"), ("python@3.12", "3.12.7"), ("python@3.13", "3.13.1")])
         self.assertEqual({p["ecosystem"] for p in rows if p["name"].startswith("python")}, {"Homebrew"})
         self.assertEqual(next(p for p in rows if p["name"] == "claude-code")["ecosystem"], "Homebrew-cask")
-        self.assertEqual(self.calls[4][0][-3:], ["brew", "list", "--versions"])
+        self.assertEqual(self.calls[4][0][-4:], ["brew", "list", "--formula", "--versions"])
         self.assertEqual(self.calls[5][0][-4:], ["brew", "list", "--cask", "--versions"])
 
     def test_brew_inventory_rejects_unparsable_line(self):
@@ -808,8 +808,8 @@ class BrewScanTests(unittest.TestCase):
 
     def test_a_revision_zero_keg_next_to_a_revised_one_is_not_ambiguous(self):
         # Homebrew's own parse: keg `1_2` IS upstream 1 revision 2, so a scan row for
-        # upstream 1 correctly covers both kegs. Codex's scenario assumed 1_2 could be a
-        # separate upstream release, which contradicts Homebrew's keg naming.
+        # upstream 1 correctly covers both kegs; a keg name with a trailing _<digits>
+        # cannot be a separate upstream release under Homebrew's naming.
         t = TARGET
         scan = json.dumps({"findings": [{"formula": "tool", "version": "1", "tag": "v1",
                                         "repo_url": "https://example.com/tool",

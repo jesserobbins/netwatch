@@ -325,8 +325,13 @@ def brew_scan(t, packages, runner, *, offline=False):
         # dual index lets one scan row reach every installed revision of that version.
         installed = by_base.get((row["formula"], row["version"]))
         if installed:
-            matched_names.add(row["formula"])
-            matched_versions.update((row["formula"], version) for version in installed)
+            if row["vulnerabilities"]:
+                matched_names.add(row["formula"])
+                matched_versions.update((row["formula"], version) for version in installed)
+            else:
+                # A matched row without vulnerabilities is malformed evidence: it
+                # describes nothing, so the kegs stay unknown rather than covered.
+                unmatched.add(row["formula"])
         else:
             unmatched.add(row["formula"])
     # A formula with one matching and one mismatched row is not covered either way: its

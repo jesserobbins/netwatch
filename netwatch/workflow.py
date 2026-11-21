@@ -81,8 +81,10 @@ def preview(store, t, runner=adapters.run):
                      "This is not an exact-version transaction: repository changes can change what is installed. "
                      "Dependencies, scripts and services may be affected. Back up first."
                      + (" Cask upgrades may need privileges, quit running applications or run installers;"
-                        " formulae and casks run as separate commands. Superseded kegs are removed by the"
-                        " upgrade, so an earlier version cannot be rolled back to." if t["kind"] == "brew" else ""),
+                        " formulae and casks run as separate commands. Cleanup may remove superseded"
+                        " kegs, so an earlier version cannot be relied on for rollback"
+                        " (HOMEBREW_NO_CLEANUP_FORMULAE keeps a formula's old kegs)."
+                        if t["kind"] == "brew" else ""),
             "expires_at": int(time.time()) + 3600}
     with store.transaction():
         row = store.db.execute("INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
