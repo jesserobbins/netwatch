@@ -111,7 +111,7 @@ def package(n, v, ecosystem, **extra):
 def os_info(t, runner):
     if t["kind"] == "brew":
         if runner(t, ["uname", "-s"]).strip() != "Darwin":
-            raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS")
+            raise Error("Homebrew adapter requires a macOS host")
         return {"ID": "macos", "PLATFORM": runner(t, ["uname", "-m"]).strip(),
                 "VERSION": runner(t, ["sw_vers", "-productVersion"]).strip(),
                 "UID": runner(t, ["id", "-u"]).strip()}
@@ -288,7 +288,8 @@ def brew_refuse_root(t, runner):
     if probe["UID"] == "0":
         raise Error(HOST_STATE_ERRORS + ": must not run as root; re-run as the invoking user")
     if probe["ID"] != "macos":
-        raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS")  # unreachable via os_info, kept for symmetry
+        raise Error((HOST_STATE_ERRORS + ": " if prefix else "")
+                    + "Homebrew adapter requires a macOS host")
 
 
 def brew_inventory(t, runner):

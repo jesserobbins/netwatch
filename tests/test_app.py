@@ -272,7 +272,7 @@ class AdapterTests(unittest.TestCase):
         t = adapters.target("server", "brew")
         with self.assertRaises(Error) as caught:
             adapters.os_info(t, self.runner(["Linux\n"]))
-        self.assertIn("the host is no longer macOS", str(caught.exception))
+        self.assertIn("requires a macOS host", str(caught.exception))
 
     def test_brew_inventory_formulae_and_casks(self):
         t = adapters.target("laptop", "brew")
@@ -601,7 +601,7 @@ class BrewWorkflowTests(unittest.TestCase):
         with self.assertRaises(Error) as caught:
             workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
                            request=lambda url, body=None: {})
-        self.assertIn("the host is no longer macOS", str(caught.exception))
+        self.assertIn("requires a macOS host", str(caught.exception))
         self.assertIn("collection_failed", [e["kind"] for e in self.store.events()])
 
     def test_a_root_flip_at_the_reconciliation_refuses_the_read(self):
