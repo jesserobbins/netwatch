@@ -321,7 +321,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # scan if anything changed.
     considered = {p["name"] for p in packages
                   if p["ecosystem"] == "Homebrew" and not p.get("unloadable")} & formulae
-    full_names = {p.get("tap") or p["name"]: p["name"] for p in packages if p["ecosystem"] == "Homebrew"}
+    # Only loadable rows define the tap map: a Cellar-only keg's formula is gone, and a
+    # bare self-map would make the bare-name identity depend on sort order.
+    full_names = {p["tap"]: p["name"] for p in packages
+                  if p["ecosystem"] == "Homebrew" and p.get("tap") and not p.get("unloadable")}
     coverage["considered"] = sorted(considered)
     # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
     # the inventory's short names before any comparison.
@@ -431,9 +434,13 @@ def brew_scan(t, packages, runner, *, offline=False):
                         if (identity(name), version) not in ambiguous}
     unloadable = {(p["name"], p["version"]) for p in packages
                   if p["ecosystem"] == "Homebrew" and p.get("unloadable")}
+    # An unloadable keg's retention pair is its bare short name: the tap-qualified
+    # identity its earlier finding recorded no longer exists.
     coverage["retained_versions"] = sorted(
-        [identity(name), version, *(["unloadable"] if (name, version) in unloadable else [])]
-        for name, version in pairs if (identity(name), version) not in covered_versions)
+        [name, version, "unloadable"] if (name, version) in unloadable
+         else [identity(name), version]
+         for name, version in pairs if (name, version) in unloadable
+         or (identity(name), version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
     # of a partially covered formula.
     coverage["reported_complete"] = coverage["complete"]
