@@ -447,14 +447,19 @@ def brew_scan(t, packages, runner, *, offline=False):
     coverage["complete"] = coverage["complete"] and not coverage.get("unaccounted") \
         and not coverage["retained_versions"] and not coverage["retained"]
     warnings, result = [], []
-    partially = sorted({pair[0] for pair in coverage["retained_versions"]}
-                       & {identity(name) for name in coverage["scanned"]})
+    scanned_identities = {identity(name) for name in coverage["scanned"]} | set(coverage["scanned"])
+    partially = sorted({pair[0] for pair in coverage["retained_versions"]} & scanned_identities)
     if partially:
         warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "
                         "Homebrew; their earlier findings are retained")
     if unmatched:
         empty = {row["formula"] for row in parsed if not row["vulnerabilities"]}
-        changed, empty = unmatched - empty, unmatched & empty
+        ambiguous_names = {full_names.get(n, n) for n, _ in ambiguous}
+        changed, empty = unmatched - empty - ambiguous_names, unmatched & empty
+        unresolved = unmatched & ambiguous_names
+        if unresolved:
+            warnings.append(f"Coverage: {', '.join(sorted(unresolved))}: an installed keg's upstream version "
+                            "cannot be determined from Homebrew's naming; earlier findings are retained")
         if changed:
             warnings.append(f"Coverage: {', '.join(sorted(changed))} changed version between collection and "
                             "Homebrew's scan; their earlier findings are retained and their scan results "

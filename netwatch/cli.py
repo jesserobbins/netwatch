@@ -230,6 +230,16 @@ def display(result, json_output=False, show_all=False):
                 return row.get("ecosystem") in (None, "Homebrew") and row["package"] in names
             rows = sorted(report["updates"], key=lambda u: (not has(u, affected), not has(u, review),
                                                             u["package"], u.get("ecosystem") or ""))
+            # The same package can be upgradable on several architectures; one row per
+            # name and ecosystem keeps the ten-row view from spending slots on duplicates.
+            grouped, seen_rows = [], set()
+            for row in rows:
+                marker = (row["package"], row.get("ecosystem"))
+                if marker in seen_rows:
+                    continue
+                seen_rows.add(marker)
+                grouped.append(row)
+            rows = grouped
             grid = table("Package", "Installed", "Available", "Finding") if wide else None
             for row in rows if show_all else rows[:10]:
                 n = row["package"]
