@@ -294,10 +294,18 @@ class AdapterTests(unittest.TestCase):
 
     def test_a_keg_removed_between_the_two_reads_fails_the_inventory(self):
         t = adapters.target("laptop", "brew")
+        # The whole formula gone ...
         run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
                            json.dumps({"formulae": [{"name": "x", "full_name": "x",
                                                      "installed": [{"version": "1"}]}]}),
                            ""])
+        with self.assertRaises(Error):
+            adapters.inventory(t, run)
+        # ... and one keg of a formula that keeps another.
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                           json.dumps({"formulae": [{"name": "x", "full_name": "x",
+                                                     "installed": [{"version": "1"}, {"version": "2"}]}]}),
+                           "x 2\n", ""])
         with self.assertRaises(Error):
             adapters.inventory(t, run)
 

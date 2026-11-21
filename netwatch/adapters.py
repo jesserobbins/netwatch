@@ -248,22 +248,23 @@ def brew_formula_rows(t, runner):
             if not isinstance(version, str) or BREW_VERSION.fullmatch(version) is None:
                 raise Error("Unrecognized Homebrew inventory line")
             yield name, full, version, False
-    cellar_names = set()
+    cellar = {}
     for line in runner(t, brew_env("brew", "list", "--formula", "--versions")).splitlines():
         parts = line.split()
         if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
             raise Error("Unrecognized Homebrew inventory line")
-        cellar_names.add(parts[0])
+        cellar.setdefault(parts[0], []).extend(parts[1:])
         for version in parts[1:]:
             if version not in known.get(parts[0], ()):
                 # The Cellar has a keg the metadata read does not describe: keep it, but
                 # no advisory assessment can reach it and it carries no tap identity.
                 yield parts[0], None, version, True
-    missing = known.keys() - cellar_names
-    if missing:
-        # The Cellar listing ran after the metadata read; a formula it no longer shows
-        # was removed in between, so the two observations cannot be combined.
-        raise Error("Homebrew inventory disagreement: " + ", ".join(sorted(missing)))
+    gone = sorted(f"{name} {version}" for name in known for version in known[name]
+                  if version not in cellar.get(name, []))
+    if gone:
+        # The Cellar listing ran after the metadata read; a keg it no longer shows was
+        # removed in between, so the two observations cannot be combined.
+        raise Error("Homebrew inventory disagreement: " + ", ".join(gone))
 
 
 def brew_formula_inventory(t, runner):
