@@ -416,7 +416,7 @@ class BrewWorkflowTests(unittest.TestCase):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae, "", "vulns\n", scan_json]
         if after is not None:
             # workflow.check re-collects inventory after the scan, before discovering updates.
-            outputs += ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", tail, ""]
+            outputs += ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", tail]
         outputs += ["{}", "{}"]  # brew outdated, then --greedy
         return workflow.check(self.store, self.t, runner=self.scripted(outputs),
                               request=lambda url, body=None: {})
@@ -494,6 +494,7 @@ class BrewWorkflowTests(unittest.TestCase):
         # The scanned formula clears; the skipped one keeps its finding for this version.
         self.assertEqual([f["advisory"] for f in report["findings"]], ["OSV-2020-2308"])
         self.assertEqual(report["findings"][0]["state"], "unknown")
+        self.assertIsNone(report["update_error"])
         self.assertNotIn("changed_during_scan", report["coverage"])
         self.assertFalse(any("changed or could not be re-read" in w for w in report["warnings"]))
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
@@ -754,8 +755,27 @@ class BrewScanTests(unittest.TestCase):
                              "ffmpeg 8.0\nffmpeg 9.0.2\n", "", "vulns\n", scan])
         rows = adapters.inventory(t, run)
         findings, warnings, coverage = sources.brew_scan(t, rows, run)
-        self.assertEqual(coverage["scanned"], ["ffmpeg"])
+        # A clean multi-keg assessment cannot identify the scanned keg, so nothing is covered.
+        self.assertEqual(coverage["scanned"], [])
         self.assertEqual(sorted(coverage["retained_versions"]), [["ffmpeg", "8.0"], ["ffmpeg", "9.0.2"]])
+
+    def test_a_matched_multi_keg_row_covers_only_its_own_keg(self):
+        # ffmpeg 8.0 has an earlier finding; the scan reports only 9.0.2. The 8.0 keg keeps
+        # its finding as unknown even though the formula counts as checked.
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "ffmpeg", "version": "9.0.2", "tag": "v9.0.2",
+                                        "repo_url": "https://github.com/FFmpeg/FFmpeg",
+                                        "vulnerabilities": [{"id": "OSV-9", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                             "ffmpeg 8.0\nffmpeg 9.0.2\n", "", "vulns\n", scan])
+        rows = adapters.inventory(t, run)
+        findings, _, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(sorted((f["installed"], f["upstream_version"]) for f in findings),
+                         [("9.0.2", "9.0.2")])
+        self.assertEqual(coverage["retained_versions"], [["ffmpeg", "8.0"]])
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET

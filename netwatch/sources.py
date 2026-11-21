@@ -284,40 +284,47 @@ def brew_scan(t, packages, runner, *, offline=False):
     # others outright; findings for either are not evidence about this host. Both stay
     # inside `checked`, which is why they are dropped only after the count check.
     unreliable = unscanned.keys() | stale | skipped
+    outside = {resolve(row["formula"]) for row in parsed if resolve(row["formula"]) not in considered}
+    if outside:
+        # A finding for a formula `brew info --installed` does not know contradicts the
+        # scan's own accounting; none of its evidence can be used.
+        coverage["unaccounted"] = True
     parsed = [row for row in parsed if resolve(row["formula"]) not in unreliable]
     for row in parsed:
         row["formula"] = resolve(row["formula"])
+    # Index installed kegs by their base; the scanner's version is used as reported.
     pairs_base = {(name, adapters.brew_base(version)) for name, version in pairs}
     # Homebrew scans one keg per formula (`formula.any_installed_prefix`), so only the
     # installed version its reported base maps to is covered; other kegs stay unknown.
-    covered_versions, matched_names = set(), set()
+    matched_versions, matched_names = set(), set()
     unmatched = set()
     for row in parsed:
         base = adapters.brew_base(row["version"])
         installed = by_base.get((row["formula"], base))
         if installed:
             matched_names.add(row["formula"])
-            covered_versions.update((row["formula"], version) for version in installed)
+            matched_versions.update((row["formula"], version) for version in installed)
         else:
             unmatched.add(row["formula"])
+    # A formula with one matching and one mismatched row is not covered either way.
+    matched_names -= unmatched
     # A clean formula has no row at all; absence of a finding is evidence of assessment.
-    # Only a MISMATCHED row (a version the host does not have) invalidates a formula.
-    # Stale targets were assessed against the wrong version, so they are never covered.
+    # A stale target was assessed against the wrong version, so it is never covered.
     if coverage.get("unaccounted"):
         # The accounting does not balance, so no formula can be claimed as covered.
-        matched_names, clean = set(), set()
-    clean = claimed - unmatched - stale - matched_names  # assessed, no open vulnerability
-    covered_names = matched_names | clean
+        matched_names, matched_versions, clean = set(), set(), set()
+    else:
+        clean = claimed - unmatched - stale - matched_names
+    # A matched row covers only the kegs sharing its base. A clean assessment describes the
+    # keg Homebrew built (`any_installed_prefix`), which is identifiable only when one keg
+    # of the formula is installed.
+    multi_keg = {name for name, count in
+                 ((name, sum(1 for n, _ in pairs if n == name)) for name in formulae) if count > 1}
+    covered_names = matched_names | {name for name in clean if name not in multi_keg}
+    covered_versions = matched_versions | {(name, version) for name, version in pairs
+                                           if name in clean and name not in multi_keg}
     coverage["scanned"] = sorted(covered_names)
     coverage["retained"] = sorted(formulae - covered_names)
-    # A matched row covers only the kegs sharing its base; a clean formula covers its kegs
-    # only when a single one is installed, because `any_installed_prefix` is not identified.
-    multi_keg = {name for name in clean
-                 if sum(1 for n, _ in pairs if n == name) > 1}
-    covered_names = matched_names | {name for name in clean if name not in multi_keg}
-    # Every installed keg of a covered formula is covered; kegs of uncovered ones are not.
-    covered_versions = {(name, version) for name, version in pairs if name in covered_names} \
-        | covered_versions
     coverage["retained_versions"] = sorted([name, version] for name, version in pairs
                                            if (name, version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported.
