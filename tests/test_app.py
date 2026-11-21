@@ -365,6 +365,8 @@ class SourceTests(unittest.TestCase):
                 db.close()
 
 
+EMPTY_OUTDATED = json.dumps({"formulae": [], "casks": []})
+
 SCAN_PARTIAL = json.dumps({
     "findings": [{"formula": "libheif", "version": "1.23.7", "tag": "v1.23.7",
                   "repo_url": "https://github.com/strukturag/libheif",
@@ -421,7 +423,7 @@ class BrewWorkflowTests(unittest.TestCase):
         if after is not None:
             # workflow.check re-collects inventory after the scan, before discovering updates.
             outputs += ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", tail]
-        outputs += ["{}", "{}"]  # brew outdated, then --greedy
+        outputs += [EMPTY_OUTDATED, EMPTY_OUTDATED]  # brew outdated, then --greedy
         return workflow.check(self.store, self.t, runner=self.scripted(outputs),
                               request=lambda url, body=None: {})
 
@@ -480,7 +482,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertFalse(any("changed version" in w for w in report["warnings"]))
 
     def test_failed_step_is_recorded_in_the_plan_result(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
         plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
         probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", ""]
         def failing(t, argv, **kwargs):
@@ -512,7 +514,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
     def test_no_scanner_is_an_incomplete_advisory_check(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", self.INSTALLED, "", "install update\n", "{}", "{}"]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", self.INSTALLED, "", "install update\n", EMPTY_OUTDATED, EMPTY_OUTDATED]
         report = workflow.check(self.store, self.t, runner=self.scripted(outputs),
                                 request=lambda url, body=None: {})
         self.assertFalse(report["advisory_check_ok"])
@@ -599,7 +601,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 4)  # probe only; no inventory, no scan, no update
 
     def test_failed_cask_step_names_the_step_not_env(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
         plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
         # apply re-collects inventory first, then runs the three approved steps.
         probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", ""]
@@ -635,7 +637,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("[not in default upgrade]", plain)
 
     def test_preview_warns_about_casks(self):
-        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", "{}", "{}"]
+        outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "libheif 1.23.7\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
         plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs))
         self.assertIn("Cask upgrades", plan["scope"])
 
