@@ -731,6 +731,15 @@ class BrewWorkflowTests(unittest.TestCase):
         with self.assertRaises(Error):
             adapters.brew_outdated(self.t, self.scripted([bad]))
 
+    def test_a_tap_qualified_outdated_row_joins_its_installed_keg(self):
+        plain = json.dumps({"formulae": [{"name": "kenn-io/tap/agentsview", "installed_versions": ["0.47.0"],
+                                          "current_version": "0.48.0", "pinned": False, "pinned_version": None}],
+                            "casks": []})
+        rows = adapters.brew_outdated(self.t, self.scripted([plain, plain]),
+                                      identities={"kenn-io/tap/agentsview": "agentsview"})
+        self.assertEqual(rows, [{"package": "agentsview", "candidate": "0.48.0",
+                                 "ecosystem": "Homebrew", "tap": "kenn-io/tap/agentsview"}])
+
     def test_brew_outdated_marks_greedy_only_and_held(self):
         plain = json.dumps({"formulae": [{"name": "pydantic", "installed_versions": ["2.14.3"],
                                           "current_version": "2.14.4", "pinned": False, "pinned_version": None},

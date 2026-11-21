@@ -56,7 +56,8 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         update_error = "Update availability not refreshed in offline mode"
     else:
         try:
-            available = adapters.updates(t, runner)
+            available = adapters.updates(t, runner, identities={p["tap"]: p["name"] for p in packages
+                                                                if p["ecosystem"] == "Homebrew" and p.get("tap")})
         except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError) as exc:
             update_error = str(exc) if isinstance(exc, Error) else "Invalid package-manager update output"
     if update_error:
@@ -92,7 +93,8 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
 
 def preview(store, t, runner=adapters.run):
     packages = adapters.inventory(t, runner)
-    available = adapters.updates(t, runner)
+    available = adapters.updates(t, runner, identities={p["tap"]: p["name"] for p in packages
+                                                        if p["ecosystem"] == "Homebrew" and p.get("tap")})
     body = {"target": t, "inventory_digest": digest(packages), "commands": adapters.commands(t),
             "observed_updates": available,
             "scope": "Update the ENTIRE selected environment using configured repositories and project constraints. "

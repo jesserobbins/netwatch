@@ -111,7 +111,7 @@ def package(n, v, ecosystem, **extra):
 def os_info(t, runner):
     if t["kind"] == "brew":
         if runner(t, ["uname", "-s"]).strip() != "Darwin":
-            raise Error("Homebrew adapter requires a macOS host")
+            raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS")
         return {"ID": "macos", "PLATFORM": runner(t, ["uname", "-m"]).strip(),
                 "VERSION": runner(t, ["sw_vers", "-productVersion"]).strip(),
                 "UID": runner(t, ["id", "-u"]).strip()}
@@ -288,7 +288,7 @@ def brew_refuse_root(t, runner):
     if probe["UID"] == "0":
         raise Error(HOST_STATE_ERRORS + ": must not run as root; re-run as the invoking user")
     if probe["ID"] != "macos":
-        raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS")
+        raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS")  # unreachable via os_info, kept for symmetry
 
 
 def brew_inventory(t, runner):
@@ -315,7 +315,7 @@ def inventory(t, runner=run):
     return sorted(rows, key=lambda p: (p["name"], p["version"], p.get("architecture", "")))
 
 
-def updates(t, runner=run):
+def updates(t, runner=run, identities=None):
     kind = t["kind"]
     if kind == "ubuntu":
         output = runner(t, ["apt", "list", "--upgradable"])
@@ -331,7 +331,7 @@ def updates(t, runner=run):
             raise Error("Environment solver could not determine updates")
         return [{"package": r["name"], "candidate": r["version"]} for r in data.get("actions", {}).get("LINK", [])]
     if kind == "brew":
-        return brew_outdated(t, runner)
+        return brew_outdated(t, runner, identities=identities)
     if kind == "uv":
         data = json.loads(runner(t, ["uv", "pip", "list", "--outdated", "--format", "json", "--python",
                                     t["path"].rstrip("/") + "/.venv/bin/python"]))
@@ -341,8 +341,15 @@ def updates(t, runner=run):
 
 
 
-def brew_outdated(t, runner):
-    """Pending updates, with held and greedy-only entries marked honestly."""
+def brew_outdated(t, runner, identities=None):
+    """Pending updates, with held and greedy-only entries marked honestly.
+
+    `brew outdated --json=v2` reports formulae by their full name, which is
+    tap-qualified for third-party taps, while the inventory and findings use the short
+    name. `identities` (full name -> short name, from the collected inventory) maps the
+    row back so every join in the report works, and the tap-qualified name is kept in
+    `tap`."""
+    identities = identities or {}
     def rows(*extra):
         data = json.loads(runner(t, brew_env("brew", "outdated", "--json=v2", *extra), timeout=300))
         # A formula and a cask can share a name, so the identity is the pair. An empty
@@ -351,7 +358,15 @@ def brew_outdated(t, runner):
             value = data.get(field)
             if not isinstance(value, list):
                 raise Error("Unrecognized Homebrew update output")
-        found = {("Homebrew", r["name"]): r for r in data.get("formulae", [])}
+        def short(row, ecosystem):
+            raw = row["name"]
+            if ecosystem == "Homebrew":
+                mapped = identities.get(raw)
+                if mapped is not None:
+                    row = {**row, "name": mapped, "tap": raw}
+                return row
+            return row
+        found = {("Homebrew", short(r, "Homebrew")["name"]): short(r, "Homebrew") for r in data.get("formulae", [])}
         found.update({("Homebrew-cask", r["name"]): r for r in data.get("casks", [])})
         for row in found.values():
             if not isinstance(row.get("name"), str) or not row["name"]:
@@ -365,6 +380,8 @@ def brew_outdated(t, runner):
     result = []
     for (ecosystem, name), row in sorted(greedy.items(), key=lambda item: (item[0][1], item[0][0])):
         entry = {"package": name, "candidate": row.get("current_version"), "ecosystem": ecosystem}
+        if row.get("tap"):
+            entry["tap"] = row["tap"]
         if row.get("pinned"):
             entry.update(held=True, held_version=row.get("pinned_version"))
         # Only a cask is honestly greedy-only: `brew upgrade --cask` without --greedy
