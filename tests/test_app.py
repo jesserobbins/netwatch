@@ -806,9 +806,10 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual([f["installed"] for f in findings], ["1_2_1"])
         self.assertEqual(coverage["retained_versions"], [["tool", "1_2"]])  # ambiguous keg stays unknown
 
-    def test_a_revised_keg_of_an_older_upstream_is_not_claimed_by_a_newer_row(self):
-        # Kegs 1 and 1_2: 1_2 could be upstream 1 rev 2 OR upstream 1_2 rev 0. A scan row
-        # for upstream 1 covers only the bare 1 keg; 1_2 stays unknown.
+    def test_a_revision_zero_keg_next_to_a_revised_one_is_not_ambiguous(self):
+        # Homebrew's own parse: keg `1_2` IS upstream 1 revision 2, so a scan row for
+        # upstream 1 correctly covers both kegs. Codex's scenario assumed 1_2 could be a
+        # separate upstream release, which contradicts Homebrew's keg naming.
         t = TARGET
         scan = json.dumps({"findings": [{"formula": "tool", "version": "1", "tag": "v1",
                                         "repo_url": "https://example.com/tool",
@@ -820,8 +821,8 @@ class BrewScanTests(unittest.TestCase):
                              "vulns\n", scan])
         rows = adapters.inventory(t, run)
         findings, _, coverage = sources.brew_scan(t, rows, run)
-        self.assertEqual([f["installed"] for f in findings], ["1"])
-        self.assertEqual(coverage["retained_versions"], [["tool", "1_2"]])
+        self.assertEqual(sorted(f["installed"] for f in findings), ["1", "1_2"])
+        self.assertEqual(coverage["retained_versions"], [])
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET

@@ -230,11 +230,12 @@ def brew_scan(t, packages, runner, *, offline=False):
         # A bare version (base == itself) is upstream at revision 0: unambiguous.
         if adapters.brew_base(version) == version:
             return False
-        # A revised keg (`1_2` = upstream 1 rev 2) is ambiguous only when another keg
-        # claims the literal as its own upstream version (`1_2_1` = upstream 1_2 rev 1)
-        # AND that other keg is not simply a later revision of the same upstream.
+        # A revised keg (`1_2_1` = upstream 1_2 rev 1) is ambiguous only when another
+        # keg claims its literal as that keg's own upstream version AND that keg is
+        # itself revised (`1_2` = upstream 1 rev 2), so `1_2` is claimed both as an
+        # upstream version and as a revision of `1`.
         return any(other != version and adapters.brew_base(other) == version
-                   and adapters.brew_base(version) != other
+                   and adapters.brew_base(other) != other
                    for other in (v for n, v in pairs if n == name))
     ambiguous = {(name, version) for name, version in pairs if is_ambiguous(name, version)}
     by_base = {}
