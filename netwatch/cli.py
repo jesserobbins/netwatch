@@ -243,8 +243,8 @@ def display(result, json_output=False, show_all=False):
                 state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
                     " [not in default upgrade]" if row.get("greedy_only") else "")
                 if row.get("ecosystem") == "Homebrew-cask" and any(
-                        u["package"] == row["package"] and u.get("ecosystem") == "Homebrew"
-                        for u in report["updates"]):
+                        p["name"] == row["package"] and p["ecosystem"] == "Homebrew"
+                        for p in report["packages"]):
                     state += " [cask]"
                 installed = safe(', '.join(sorted(installed_for(row))) or '?')
                 candidate = safe(row.get('candidate') or 'unknown')

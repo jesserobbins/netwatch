@@ -83,28 +83,27 @@ class Store:
         references = set(sources.advisory_references(findings))
         for source in ("cve_now", "zero_wire", "pwn_watch"):
             value = context.get(source)
-            # Retained or skipped context is history copied forward by design and stays;
-            # only freshly fetched rows whose subject cleared during this check's
-            # lifetime are dropped. cve_now and Zero Wire rows are subject to a finding's
-            # CVE; a pwn.watch row matched by package tag stays regardless, because it is
-            # a lead about an installed package.
-            if not isinstance(value, dict) or value.get("status") != "ok" \
-                    or not isinstance(value.get("items"), list):
+            # Freshly fetched rows whose subject cleared during this check's lifetime are
+            # dropped even when the source is incomplete; rows copied forward as retained
+            # history (flagged below) stay. cve_now and Zero Wire rows are subject to a
+            # finding's CVE; a pwn.watch row matched by package tag stays regardless,
+            # because it is a lead about an installed package.
+            if not isinstance(value, dict) or not isinstance(value.get("items"), list):
                 continue
             if source == "pwn_watch":
                 # pwn.watch matches on every advisory id, not only CVEs.
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
-                                  or item.get("matched_tags")
+                                  or item.get("retained") or item.get("matched_tags")
                                   or set(item.get("references") or []) & references]
                 for item in value["items"]:
                     if isinstance(item, dict):
                         item["matched_references"] = sorted(set(item.get("references") or []) & references)
             elif source == "cve_now":
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
-                                  or item.get("id") in cves]
+                                  or item.get("retained") or item.get("id") in cves]
             else:
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
-                                  or set(item.get("references") or []) & cves]
+                                  or item.get("retained") or set(item.get("references") or []) & cves]
                 for item in value["items"]:
                     if isinstance(item, dict):
                         item["matched_references"] = sorted(set(item.get("references") or []) & cves)

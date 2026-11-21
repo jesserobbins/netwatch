@@ -187,6 +187,8 @@ def strip_credentials(url):
     if parts.username is None and not parts.query:
         return url
     netloc = parts.hostname or ""
+    if ":" in netloc:  # a bracketed IPv6 host must keep its brackets
+        netloc = f"[{netloc}]"
     if parts.port:
         netloc = f"{netloc}:{parts.port}"
     return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", parts.fragment))
@@ -317,9 +319,6 @@ def brew_scan(t, packages, runner, *, offline=False):
     for qualified, short in full_names.items():
         full_names_inverse.setdefault(short, qualified)
     identity = lambda name: full_names_inverse.get(name, name)
-    full_names_inverse = {}
-    for qualified, short in full_names.items():
-        full_names_inverse.setdefault(short, qualified)
     skipped = {resolve(name) for name in coverage["skipped"]}
     unscanned = {resolve(name): reason for name, reason in coverage["unscanned"].items()}
     stale = {resolve(name) for name in coverage["outdated_without_sbom"]}
@@ -336,6 +335,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # inventory knows only under a tap is not evidence about that keg.
     considered_identities = {identity(n) for n in considered}
     outside = {row["formula"] for row in parsed if row["formula"] not in considered_identities}
+    # A stale target consumes one of Homebrew's checked slots; if its identity is not an
+    # installed formula, the slot cannot be credited to any keg that was scanned.
+    if any(identity(n) not in considered_identities for n in stale):
+        outside.add("\x00stale-outside-inventory")
     if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:
         coverage["unaccounted"] = True

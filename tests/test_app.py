@@ -810,6 +810,17 @@ class BrewScanTests(unittest.TestCase):
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
+    def test_a_stale_target_outside_the_inventory_claims_no_coverage(self):
+        # The only checked slot belongs to a stale formula that is not installed; the
+        # installed keg must not be credited clean.
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": ["ghost"], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("real",))
+        findings, _, coverage = sources.brew_scan(t, self.packages(("real", "1")), run)
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(coverage.get("unaccounted"))
+
     def test_a_core_row_is_not_evidence_about_a_tapped_keg(self):
         # The inventory knows foo only as acme/tools/foo; a scanner row for core foo at
         # the same version contradicts the accounting and must not publish or clear.
@@ -999,6 +1010,8 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(findings[0]["repository"], "https://github.com/example/x")
         self.assertEqual(sources.strip_credentials("https://github.com/a/b#frag"), "https://github.com/a/b#frag")
         self.assertEqual(sources.strip_credentials("https://u:p@gitlab.com/a/b"), "https://gitlab.com/a/b")
+        self.assertEqual(sources.strip_credentials("https://u:p@[2001:db8::1]/r?ref=main"),
+                         "https://[2001:db8::1]/r")
 
     def test_dict_findings_field_is_rejected(self):
         bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,
