@@ -194,8 +194,26 @@ BREW_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
 
 
 def brew_base(version):
-    """`9.0.2_1` -> `9.0.2`: `brew vulns` reports the upstream version, not the keg's."""
-    return version.split("_", 1)[0]
+    """`9.0.2_1` -> `9.0.2`: `brew vulns` reports the upstream version.
+
+    Only a trailing `_<digits>` is a revision, matching Homebrew's own parse; an
+    underscore inside the version itself is part of the version.
+    """
+    return re.sub(r"_\d+$", "", version)
+
+
+def brew_considered(t, runner):
+    """The formulae `brew vulns` actually considers.
+
+    `brew list --versions` lists more than this: on the reference host 269 names
+    against `brew info --installed`'s 236, so coverage claimed from the wider list
+    would include formulae Homebrew never looked at.
+    """
+    data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
+    try:
+        return {text(entry["name"], "formula name") for entry in data["formulae"]}
+    except (KeyError, TypeError) as exc:
+        raise Error("Unrecognized Homebrew installed formulae output") from exc
 
 
 def brew_formula_inventory(t, runner):

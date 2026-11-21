@@ -367,7 +367,7 @@ SCAN_PARTIAL = json.dumps({
                   "vulnerabilities": [{"id": "OSV-2020-2308", "severity": "MEDIUM",
                                        "summary": "Heap-buffer-overflow", "aliases": [],
                                        "fixed_versions": []}]}],
-    "skipped_formulae": ["playwright-cli", "lame"], "checked": 2, "complete": False,
+    "skipped_formulae": ["playwright-cli", "lame"], "checked": 1, "complete": False,
     "outdated_without_sbom": [], "unscanned_formulae": {"wacli": "untrusted_tap"}})
 
 
@@ -384,11 +384,18 @@ class BrewWorkflowTests(unittest.TestCase):
     def scripted(self, outputs, calls=None):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
+        seen = set()
         def run(t, argv, **kwargs):
             self.calls.append((argv, kwargs))
+            # `brew info --installed` knows exactly what `brew list` reported.
+            if "--installed" in argv:
+                return json.dumps({"formulae": [{"name": name} for name in sorted(seen)]})
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
-            return outputs.pop(0)
+            value = outputs.pop(0)
+            if "--versions" in argv and "--cask" not in argv:
+                seen.update(line.split()[0] for line in value.splitlines() if line.strip())
+            return value
         return run
 
     def scan(self, findings, skipped=(), unscanned=None, complete=False, checked=1):
@@ -431,7 +438,10 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
     def test_skipped_formula_upgrade_retires_the_old_version_finding(self):
-        self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100", "OSV-1")], skipped=["lame"]))
+        # A finding for a skipped formula is contradictory, so seed while lame is covered
+        # (checked accounts for both formulae), then upgrade lame while Homebrew skips it.
+        self.check(self.INSTALLED, self.scan([self.finding("lame", "3.100", "OSV-1")],
+                                            complete=True, checked=2))
         report = self.check("libheif 1.23.7\nlame 3.101\n", self.scan([], skipped=["lame"]))
         self.assertEqual(report["findings"], [])
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
@@ -627,14 +637,21 @@ TARGET = adapters.target("laptop", "brew")
 
 
 class BrewScanTests(unittest.TestCase):
-    def scripted(self, outputs, calls=None):
+    def scripted(self, outputs, calls=None, seen=()):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
+        seen = set(seen)
         def run(t, argv, **kwargs):
             self.calls.append((argv, kwargs))
+            # `brew info --installed` knows exactly what `brew list` reported.
+            if "--installed" in argv:
+                return json.dumps({"formulae": [{"name": name} for name in sorted(seen)]})
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
-            return outputs.pop(0)
+            value = outputs.pop(0)
+            if "--versions" in argv and "--cask" not in argv:
+                seen.update(line.split()[0] for line in value.splitlines() if line.strip())
+            return value
         return run
 
     def packages(self, *rows):
@@ -642,7 +659,7 @@ class BrewScanTests(unittest.TestCase):
 
     def test_partial_scan_reports_findings_and_coverage(self):
         rows = self.packages(("libheif", "1.23.7"), ("lame", "3.100"))
-        run = self.scripted(["vulns update install\n", SCAN_PARTIAL])
+        run = self.scripted(["vulns update install\n", SCAN_PARTIAL], seen=("libheif", "lame"))
         findings, warnings, coverage = sources.brew_scan(TARGET, rows, run)
         self.assertEqual([f["advisory"] for f in findings], ["OSV-2020-2308"])
         self.assertEqual(findings[0]["installed"], "1.23.7")
@@ -665,9 +682,9 @@ class BrewScanTests(unittest.TestCase):
             {"formula": "python@3.12", "version": "3.12.9", "tag": "v3.12.9",
              "repo_url": "https://github.com/python/cpython",
              "vulnerabilities": [{"id": "GHSA-x", "severity": "HIGH", "summary": "s", "aliases": [], "fixed_versions": []}]}],
-            "skipped_formulae": [], "checked": 2, "complete": True,
+            "skipped_formulae": [], "checked": 1, "complete": True,
             "outdated_without_sbom": [], "unscanned_formulae": {}})
-        findings, _, _ = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", scan]))
+        findings, _, _ = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", scan], seen=("python@3.12",)))
         self.assertEqual(sorted(f["installed"] for f in findings), ["3.12.7", "3.12.9"])
         self.assertEqual(len({f["key"] for f in findings}), 2)
 
@@ -697,7 +714,7 @@ class BrewScanTests(unittest.TestCase):
                           "skipped_formulae": [], "checked": 1, "complete": True,
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
-            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
     def test_string_fixed_versions_is_rejected(self):
         bad = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
@@ -707,47 +724,66 @@ class BrewScanTests(unittest.TestCase):
                           "skipped_formulae": [], "checked": 1, "complete": True,
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
-            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
     def test_brew_inventory_and_scan_agree_across_a_revision_suffix(self):
         t = TARGET
-        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
-                             "ffmpeg 9.0.2_1\nopenssl@3 3.5.8\n", ""])
-        rows = adapters.inventory(t, run)
         scan = json.dumps({"findings": [{"formula": "ffmpeg", "version": "9.0.2", "tag": "9.0.2",
                                         "repo_url": "https://github.com/FFmpeg/FFmpeg",
                                         "vulnerabilities": [{"id": "OSV-9", "severity": "HIGH", "summary": "s",
                                                              "aliases": [], "fixed_versions": []}]}],
                            "skipped_formulae": [], "checked": 2, "complete": True,
                            "outdated_without_sbom": [], "unscanned_formulae": {}})
-        findings, warnings, coverage = sources.brew_scan(t, rows, self.scripted(["vulns\n", scan]))
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                             "ffmpeg 9.0.2_1\nopenssl@3 3.5.8\n", "", "vulns\n", scan])
+        rows = adapters.inventory(t, run)
+        findings, warnings, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual([f["installed"] for f in findings], ["9.0.2_1"])  # the keg's version
         self.assertEqual(findings[0]["upstream_version"], "9.0.2")
         self.assertEqual(coverage["scanned"], ["ffmpeg", "openssl@3"])
         self.assertFalse(any("changed version" in w for w in warnings))
+
+    def test_each_installed_revision_of_one_formula_gets_its_own_finding(self):
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "ffmpeg", "version": "9.0.2", "tag": "9.0.2",
+                                        "repo_url": "https://github.com/FFmpeg/FFmpeg",
+                                        "vulnerabilities": [{"id": "OSV-9", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "ffmpeg 9.0.2 9.0.2_1\n", "",
+                             "vulns\n", scan])
+        rows = adapters.inventory(t, run)
+        findings, _, _ = sources.brew_scan(t, rows, run)
+        self.assertEqual(sorted(f["installed"] for f in findings), ["9.0.2", "9.0.2_1"])
+        self.assertEqual(len({f["key"] for f in findings}), 2)
 
     def test_checked_must_be_a_nonnegative_int(self):
         for value in (True, -1, "1"):
             bad = json.dumps({"findings": [], "skipped_formulae": [], "checked": value, "complete": True,
                               "outdated_without_sbom": [], "unscanned_formulae": {}})
             with self.assertRaises(Error):
-                sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+                sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
-    def test_checked_below_the_results_it_produced_is_malformed(self):
+    def test_scan_count_that_cannot_account_for_the_installed_set_claims_no_coverage(self):
         rows = self.packages(("x", "1"), ("y", "1"))
         two = [{"formula": name, "version": "1", "tag": "v1", "repo_url": "https://example.com/" + name,
                 "vulnerabilities": [{"id": "OSV-" + name, "severity": "LOW", "summary": "s",
                                      "aliases": [], "fixed_versions": []}]} for name in ("x", "y")]
         bad = json.dumps({"findings": two, "skipped_formulae": [], "checked": 1, "complete": True,
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
-        with self.assertRaises(Error):  # two results from one checked formula is not possible
-            sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", bad]))
+        findings, warnings, coverage = sources.brew_scan(TARGET, rows, self.scripted(["vulns\n", bad], seen=("x", "y")))
+        self.assertEqual(findings, [])
+        self.assertTrue(coverage["unaccounted"])
+        self.assertEqual(coverage["scanned"], [])
+        self.assertEqual(coverage["retained"], ["x", "y"])
+        self.assertTrue(any("does not match the installed set" in w for w in warnings))
 
     def test_dict_findings_field_is_rejected(self):
         bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
-            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
     def test_pwn_watch_matches_formulae_but_not_colliding_cask_names(self):
         catalog = {"generatedAt": "2026-11-20T00:00:00Z", "incidents": [
@@ -764,7 +800,7 @@ class BrewScanTests(unittest.TestCase):
 
     def test_malformed_scan_output_fails_loudly(self):
         with self.assertRaises(Error):
-            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", "not json"]))
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", "not json"], seen=("x",)))
 
     def test_withdrawn_or_unknown_shapes_are_rejected(self):
         bad = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
@@ -772,7 +808,7 @@ class BrewScanTests(unittest.TestCase):
                           "skipped_formulae": [], "checked": 1, "complete": True,
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
-            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad]))
+            sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
 
 if __name__ == "__main__":

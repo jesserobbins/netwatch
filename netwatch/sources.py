@@ -215,8 +215,11 @@ def brew_scan(t, packages, runner, *, offline=False):
     offline check collected no evidence at all, so both are incomplete.
     """
     pairs = {(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"}
-    # Scan rows name the upstream version, so the installed keg is found by its base.
-    by_base = {(name, adapters.brew_base(version)): version for name, version in sorted(pairs)}
+    # Scan rows name the upstream version, so installed kegs are found by their base. Two
+    # revisions of one formula can both be installed; each gets its own finding.
+    by_base = {}
+    for name, version in sorted(pairs):
+        by_base.setdefault((name, adapters.brew_base(version)), []).append(version)
     formulae = {name for name, _ in pairs}
     coverage = {"scanner": None, "checked": 0, "complete": False, "deferred": False,
                 "skipped": [], "unscanned": {}, "outdated_without_sbom": [],
@@ -263,48 +266,56 @@ def brew_scan(t, packages, runner, *, offline=False):
     # A formula can be upgraded between inventory and scan. A finding for a version
     # this host does not report installed cannot be trusted either way, so that
     # formula's coverage is unknown and its prior findings are kept.
-    covered_names = formulae - set(coverage["skipped"]) - set(coverage["unscanned"]) \
+    # Homebrew only considers what `brew info --installed` knows: on the reference host that
+    # is 236 formulae against `brew list --versions`'s 269, and anything else was never scanned.
+    considered = adapters.brew_considered(t, runner) & formulae
+    claimed = considered - set(coverage["skipped"]) - set(coverage["unscanned"]) \
         - set(coverage["outdated_without_sbom"])
-    # `checked` counts the formulae Homebrew queried. Zero with anything left over, or fewer
-    # checked than produced results, means it cannot support the coverage it implies.
-    if (coverage["checked"] == 0 and covered_names) or \
+    coverage["considered"] = sorted(considered)
+    # `checked` must account for exactly the formulae claimed as covered, and cannot be
+    # smaller than the number of results it produced.
+    if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:
-        raise Error("Homebrew scan count cannot support the coverage it claims")
-    unreliable = set(coverage["outdated_without_sbom"]) | set(coverage["unscanned"])
-    # A finding for a formula Homebrew assessed against a different version than the
-    # installed one is not evidence about this host.
+        coverage["unaccounted"] = True
+        claimed = set()
+    unreliable = set(coverage["outdated_without_sbom"]) | set(coverage["unscanned"]) | set(coverage["skipped"])
+    # A finding for a formula Homebrew assessed against another version, or refused outright,
+    # is not evidence about this host.
     parsed = [row for row in parsed if row["formula"] not in unreliable]
     pairs_base = {(name, adapters.brew_base(version)) for name, version in pairs}
-    unmatched = {row["formula"] for row in parsed
-                 if (row["formula"], row["version"]) not in pairs_base}
-    uncovered |= unmatched
-    coverage["reported_complete"] = coverage["complete"]
-    coverage["scanned"] = sorted(formulae - uncovered)
-    coverage["retained"] = sorted(formulae & uncovered)
+    unmatched = {row["formula"] for row in parsed if (row["formula"], row["version"]) not in pairs_base}
+    covered_names = claimed - unmatched
+    coverage["scanned"] = sorted(covered_names)
+    coverage["retained"] = sorted(formulae - covered_names)
+    coverage["retained_versions"] = sorted([name, version] for name, version in pairs
+                                           if name not in covered_names)
     # A retained formula is not covered, whatever Homebrew reported.
+    coverage["reported_complete"] = coverage["complete"]
     coverage["complete"] = coverage["complete"] and not coverage["retained"]
-    coverage["retained_versions"] = sorted([name, version] for name, version in pairs if name in uncovered)
     warnings, result = [], []
     if unmatched:
         warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
                         "scan; their earlier findings are retained and their scan results are not used — re-run the check")
     for row in parsed:
-        if row["formula"] in unmatched:
+        if row["formula"] in unmatched or coverage.get("unaccounted"):
             continue
         for advisory in row["vulnerabilities"]:
-            installed = by_base[(row["formula"], adapters.brew_base(row["version"]))]
-            item = finding({"ecosystem": "Homebrew", "name": row["formula"], "version": installed},
-                           advisory["id"], "affected", advisory["fixed"],
-                           "Homebrew OSV scan matched the upstream repository and tag; coverage limited to scanned formulae",
-                           "https://osv.dev/vulnerability/" + advisory["id"])
-            item["key"] = digest(["Homebrew", row["formula"], installed, advisory["id"]])
-            item["upstream_version"] = row["version"]
-            item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
-                        summary=advisory["summary"], references=advisory["aliases"])
-            result.append(item)
+            for installed in by_base[(row["formula"], adapters.brew_base(row["version"]))]:
+                item = finding({"ecosystem": "Homebrew", "name": row["formula"], "version": installed},
+                               advisory["id"], "affected", advisory["fixed"],
+                               "Homebrew OSV scan matched the upstream repository and tag; coverage limited to scanned formulae",
+                               "https://osv.dev/vulnerability/" + advisory["id"])
+                item["key"] = digest(["Homebrew", row["formula"], installed, advisory["id"]])
+                item["upstream_version"] = row["version"]
+                item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
+                            summary=advisory["summary"], references=advisory["aliases"])
+                result.append(item)
     if coverage["retained"]:
         warnings.append(f"Coverage: {len(coverage['retained'])} installed formulae were not scanned by Homebrew; "
                         "their earlier findings are retained and absence of findings is absence of evidence")
+    if coverage.get("unaccounted"):
+        warnings.append("Coverage: Homebrew's scan count does not match the installed set; no formula is "
+                        "claimed as covered and earlier findings are retained")
     if coverage["outdated_without_sbom"]:
         warnings.append(f"Coverage: {len(coverage['outdated_without_sbom'])} formulae were scanned against the current "
                         "formula version, not the installed one; their results are not used")
@@ -538,8 +549,9 @@ def assess(t, packages, store, *, offline=False, refresh=False, refreshed=None, 
             findings, brew_warnings, coverage = brew_scan(t, packages, runner, offline=offline)
             warnings.extend(brew_warnings)
             evidence.append({"source": "Homebrew OSV scan", "coverage": coverage})
-            # No scanner, or a scan skipped in offline mode, collected no evidence.
-            if coverage["scanner"] is not True or coverage["deferred"]:
+            # No scanner, an offline scan, or a scan whose accounting does not balance
+            # collected no usable evidence.
+            if coverage["scanner"] is not True or coverage["deferred"] or coverage.get("unaccounted"):
                 complete = False
         else:
             unknown = sum(p["ecosystem"] == "Conda" for p in packages)
