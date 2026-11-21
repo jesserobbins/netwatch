@@ -26,7 +26,13 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         try:
             after = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
                      for p in adapters.brew_formula_inventory(t, runner)]
-        except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
+        except Error as exc:
+            if "must not run as root" in str(exc):
+                # The host can no longer be probed as the invoking user; no further
+                # Homebrew command runs, and the refusal is reported as it happened.
+                raise
+            after = None
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             after = None
         if after is None or sorted(after) != sorted(formulae):
             findings = []

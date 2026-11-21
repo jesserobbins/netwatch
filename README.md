@@ -67,7 +67,7 @@ netwatch history --name server  # changes and update attempts
 netwatch check server --refresh # fetch fresh advisories
 ```
 
-Advisories are cached for one hour. Failed checks preserve earlier findings and appear in the report. The default report groups findings by package and shows a short update list; add `--all` to `status` or `check` to expand it. Color terminals highlight affected findings in red, review findings in yellow and other updates in cyan. Use `NO_COLOR=1` for plain output.
+Advisories are cached for one hour, except Homebrew's scanner, which runs on the target on every online check. Failed checks preserve earlier findings and appear in the report. The default report groups findings by package and shows a short update list; add `--all` to `status` or `check` to expand it. Color terminals highlight affected findings in red, review findings in yellow and other updates in cyan. Use `NO_COLOR=1` for plain output.
 
 ### Apply updates
 

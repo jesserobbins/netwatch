@@ -580,12 +580,12 @@ class BrewWorkflowTests(unittest.TestCase):
                    self.scan([], complete=True, checked=1),
                    "Darwin\n", "arm64\n", "15.3.1\n", "0\n",
                    EMPTY_OUTDATED, EMPTY_OUTDATED]
-        report = workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
-                                request=lambda url, body=None: {})
-        # The reconciliation could not run, so the scan is discarded and the prior
-        # finding is retained; the check is incomplete.
-        self.assertFalse(report["advisory_check_ok"])
-        self.assertEqual([f["state"] for f in report["findings"]], ["unknown"])
+        with self.assertRaises(Error) as caught:
+            workflow.check(self.store, self.t, runner=self.scripted(outputs, formulae=self.INSTALLED),
+                           request=lambda url, body=None: {})
+        # The refusal surfaces as it happened, and no further Homebrew command runs.
+        self.assertIn("must not run as root", str(caught.exception))
+        self.assertEqual(len(self.calls), 13)  # probe x2 + inventory + scan + refused read
 
     def test_stable_host_clears_a_scanned_formula_without_a_change_warning(self):
         self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7"), self.finding("lame", "3.100")],
