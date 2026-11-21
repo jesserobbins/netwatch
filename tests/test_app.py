@@ -280,6 +280,7 @@ class AdapterTests(unittest.TestCase):
             {"name": "python@3.12", "full_name": "python@3.12", "installed": [{"version": "3.12.7"}]},
             {"name": "python@3.13", "full_name": "python@3.13", "installed": [{"version": "3.13.1"}]}]})
         run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", formulae,
+                           "abseil 20260817.0\npython@3.12 3.12.7\npython@3.13 3.13.1\n",
                            "claude-code 2.1.311\nantigravity-cli 1.5.13,5999302598852608\n"])
         rows = adapters.inventory(t, run)
         self.assertEqual([(p["name"], p["version"]) for p in rows],
@@ -288,7 +289,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual({p["ecosystem"] for p in rows if p["name"].startswith("python")}, {"Homebrew"})
         self.assertEqual(next(p for p in rows if p["name"] == "claude-code")["ecosystem"], "Homebrew-cask")
         self.assertEqual(self.calls[4][0][-3:], ["info", "--installed", "--json=v2"])
-        self.assertEqual(self.calls[5][0][-4:], ["brew", "list", "--cask", "--versions"])
+        self.assertEqual(self.calls[6][0][-4:], ["brew", "list", "--cask", "--versions"])
         self.assertEqual(next(p for p in rows if p["name"] == "python@3.12")["tap"], "python@3.12")
 
     def test_brew_inventory_rejects_unparsable_line(self):
@@ -393,7 +394,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.t = adapters.target("laptop", "brew")
         self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("laptop", canonical(self.t)))
 
-    def scripted(self, outputs, calls=None, formulae="", after=None, taps=None):
+    def scripted(self, outputs, calls=None, formulae="", after=None, taps=None, unloadable=()):
         outputs = list(outputs)
         self.calls = [] if calls is None else calls
         taps = dict(taps or {})
@@ -401,6 +402,7 @@ class BrewWorkflowTests(unittest.TestCase):
         # describes; once the scan has run, the reconciliation sees the `after` state.
         state = {"scanned": False, "initial": self.info_map(formulae)}
         self.info_after = self.info_map(formulae if after is None else after)
+        self.unloadable = list(getattr(self, "unloadable", []))
         def run(t, argv, **kwargs):
             self.calls.append((argv, kwargs))
             if "--installed" in argv:
@@ -408,6 +410,11 @@ class BrewWorkflowTests(unittest.TestCase):
                 return json.dumps({"formulae": [{"name": name, "full_name": taps.get(name, full),
                                                  "installed": [{"version": v} for v in versions]}
                                                 for name, (full, versions) in sorted(source.items())]})
+            if "list" in argv and "--formula" in argv and "--versions" in argv:
+                source = self.info_after if state["scanned"] else state["initial"]
+                lines = [f"{name} {' '.join(versions)}\n" for name, (full, versions) in sorted(source.items())]
+                lines += [f"{name} 1.0\n" for name in self.unloadable]
+                return "".join(lines)
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
             value = outputs.pop(0)
@@ -438,12 +445,13 @@ class BrewWorkflowTests(unittest.TestCase):
                 "vulnerabilities": [{"id": advisory, "severity": "MEDIUM", "summary": "s",
                                      "aliases": [], "fixed_versions": ["9.9"]}]}
 
-    def check(self, formulae, scan_json, *, after="same", taps=None):
+    def check(self, formulae, scan_json, *, after="same", taps=None, unloadable=()):
         """Run a check. `after` is the inventory seen when the scan's own re-collection runs:
         "same" (the host held still), None (no re-collection), or an explicit inventory."""
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan_json,
                    "Darwin\n", "arm64\n", "15.3.1\n", "501\n"]
         outputs += [EMPTY_OUTDATED, EMPTY_OUTDATED]  # brew outdated, then --greedy
+        self.unloadable = list(unloadable)
         runner = self.scripted(outputs, formulae=formulae,
                                after=formulae if after == "same" else after, taps=taps)
         return workflow.check(self.store, self.t, runner=runner,
@@ -561,6 +569,19 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertFalse(any("changed or could not be re-read" in w for w in report["warnings"]))
         self.assertIn("finding_no_longer_detected", [e["kind"] for e in self.store.events()])
 
+    def test_an_unloadable_formula_keg_is_retired_neither_nor_credited_clean(self):
+        # The keg stays in the Cellar but its formula can no longer be loaded (untap):
+        # `brew info --installed` omits it while `brew list` still shows it. The finding
+        # stays unknown; the check must not report the keg as resolved.
+        self.check(self.INSTALLED + "ghost 1.0\n",
+                   self.scan([self.finding("ghost", "1.0")], complete=True, checked=3))
+        report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "1.23.7")],
+                                                      complete=True, checked=2),
+                            unloadable=["ghost"])
+        states = {f["package"]: f["state"] for f in report["findings"]}
+        self.assertEqual(states.get("ghost"), "unknown")
+        self.assertTrue(any("not scanned by Homebrew" in w for w in report["warnings"]))
+
     def test_a_tap_swap_does_not_inherit_the_removed_formula_advisory(self):
         # libheif (strukturag tap) is replaced by another tap's formula of the same short
         # name and version; the scanner skips it, and the swap is caught by comparing the
@@ -598,7 +619,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertFalse(report["advisory_check_ok"])
         self.assertTrue(report["coverage"]["deferred"])
         self.assertTrue(any("offline mode" in w for w in report["warnings"]))
-        self.assertEqual(len(self.calls), 6)  # probe + inventory only; no scan, no outdated
+        self.assertEqual(len(self.calls), 7)  # probe + inventory (info + list + cask); no scan, no outdated
 
     def test_scan_findings_for_uninstalled_versions_are_dropped(self):
         report = self.check(self.INSTALLED, self.scan([self.finding("libheif", "9.9.9")], complete=True, checked=2))
@@ -733,6 +754,9 @@ class BrewScanTests(unittest.TestCase):
                 return json.dumps({"formulae": [{"name": name, "full_name": full.get(name, name),
                                                  "installed": [{"version": v} for v in state["versions"].get(name, ["1"])]}
                                                 for name in sorted(state["seen"])]})
+            if "list" in argv and "--formula" in argv and "--versions" in argv:
+                return "".join(f"{name} {' '.join(state['versions'].get(name, ['1']))}\n"
+                               for name in sorted(state["seen"]))
             if not outputs:
                 raise AssertionError("Unexpected command: " + json.dumps(argv))
             return outputs.pop(0)
@@ -809,6 +833,24 @@ class BrewScanTests(unittest.TestCase):
                           "outdated_without_sbom": [], "unscanned_formulae": {}})
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
+
+    def test_a_stale_name_shadowed_by_a_tap_claims_no_coverage(self):
+        # The stale entry names core `foo`; the inventory knows foo only as
+        # acme/tools/foo. The checked slot cannot be credited to the tapped keg.
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 2, "complete": True,
+                           "outdated_without_sbom": ["foo"], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("foo", "real"),
+                            aliases={"foo": "acme/tools/foo"}, formulae="foo 1\nreal 1\n")
+        rows = []
+        for name, version in (("foo", "1"), ("real", "1")):
+            row = adapters.package(name, version, "Homebrew")
+            if name == "real":
+                row["tap"] = "acme/tools/foo"
+            rows.append(row)
+        findings, _, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(coverage.get("unaccounted"))
 
     def test_a_stale_target_outside_the_inventory_claims_no_coverage(self):
         # The only checked slot belongs to a stale formula that is not installed; the

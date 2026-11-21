@@ -237,11 +237,16 @@ def brew_considered(t, runner):
 
 
 def brew_formula_rows(t, runner):
-    """One (name, full_name, version) triple per installed formula keg.
+    """One (name, full_name, version, unloadable) tuple per installed formula keg.
 
     `brew info --installed --json=v2` is the shared parse: the tap-qualified full_name
     makes a same-name same-version formula from a different tap a different row, which
-    the plain `brew list --versions` cannot express.
+    the plain `brew list --versions` cannot express. `brew list --formula --versions`
+    reads the Cellar racks directly, so a keg whose formula can no longer be loaded
+    (its tap was untapped, or the formula left core) appears there but not in `brew
+    info --installed` — Homebrew's `Formula.installed` silently skips unloadable racks.
+    Such a keg is yielded with `unloadable` set: it is installed and must not be
+    treated as removed, but no advisory assessment can reach it.
     """
     try:
         data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
@@ -250,9 +255,11 @@ def brew_formula_rows(t, runner):
             raise TypeError("formulae must be a list")
     except (ValueError, KeyError, TypeError) as exc:
         raise Error("Unrecognized Homebrew installed formulae output") from exc
+    known = set()
     for entry in formulae:
         name = text(entry["name"], "formula name")
         full = text(entry.get("full_name") or name, "formula full name")
+        known.add(name)
         installed = entry.get("installed")
         if not isinstance(installed, list) or not installed:
             raise Error("Unrecognized Homebrew installed formulae output")
@@ -260,14 +267,22 @@ def brew_formula_rows(t, runner):
             version = keg.get("version") if isinstance(keg, dict) else None
             if not isinstance(version, str) or BREW_VERSION.fullmatch(version) is None:
                 raise Error("Unrecognized Homebrew inventory line")
-            yield name, full, version
+            yield name, full, version, False
+    for line in runner(t, brew_env("brew", "list", "--formula", "--versions")).splitlines():
+        parts = line.split()
+        if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
+            raise Error("Unrecognized Homebrew inventory line")
+        if parts[0] in known:
+            continue
+        for version in parts[1:]:
+            yield parts[0], parts[0], version, True
 
 
 def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
     os_info(t, runner)
-    return [package(name, version, "Homebrew", tap=full)
-            for name, full, version in brew_formula_rows(t, runner)]
+    return [package(name, version, "Homebrew", tap=full, **({"unloadable": True} if stale else {}))
+            for name, full, version, stale in brew_formula_rows(t, runner)]
 
 
 def brew_inventory(t, runner):
@@ -277,8 +292,8 @@ def brew_inventory(t, runner):
         # inventory first, so refusing here covers all of them without adding an
         # unapproved command to the apply sequence.
         raise Error("Homebrew must not run as root; re-run as the invoking user")
-    result = [package(name, version, "Homebrew", tap=full)
-              for name, full, version in brew_formula_rows(t, runner)]
+    result = [package(name, version, "Homebrew", tap=full, **({"unloadable": True} if stale else {}))
+              for name, full, version, stale in brew_formula_rows(t, runner)]
     for line in runner(t, brew_env("brew", "list", "--cask", "--versions")).splitlines():
         parts = line.split()
         if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):

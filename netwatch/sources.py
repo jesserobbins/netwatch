@@ -314,14 +314,26 @@ def brew_scan(t, packages, runner, *, offline=False):
     coverage["considered"] = sorted(considered)
     # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
     # the inventory's short names before any comparison.
-    resolve = lambda name: full_names.get(name, name)
     full_names_inverse = {}
     for qualified, short in full_names.items():
         full_names_inverse.setdefault(short, qualified)
     identity = lambda name: full_names_inverse.get(name, name)
-    skipped = {resolve(name) for name in coverage["skipped"]}
-    unscanned = {resolve(name): reason for name, reason in coverage["unscanned"].items()}
-    stale = {resolve(name) for name in coverage["outdated_without_sbom"]}
+    def resolve(name):
+        # A raw scan name is either tap-qualified (mapped to its short name) or a bare
+        # name that no tap-qualified formula claims. A bare name shadowed by a tap
+        # competitor (`foo` when the inventory only knows `acme/tools/foo`) names a
+        # formula that is not installed here.
+        if name in full_names:
+            return full_names[name]
+        return None if name in full_names_inverse else name
+    skipped = {resolved for name in coverage["skipped"] if (resolved := resolve(name)) is not None}
+    unscanned = {resolved: reason for name, reason in coverage["unscanned"].items()
+                 if (resolved := resolve(name)) is not None}
+    stale = {resolved for name in coverage["outdated_without_sbom"]
+             if (resolved := resolve(name)) is not None}
+    # A stale target that names no installed formula consumed one of Homebrew's checked
+    # slots that cannot be credited to any keg here.
+    stale_unresolved = [name for name in coverage["outdated_without_sbom"] if resolve(name) is None]
     # `checked` is `queryable.size` in Homebrew's scanner, so it counts queryable formulae —
     # skipped and refused ones are excluded, stale ones are included.
     claimed = considered - skipped - unscanned.keys()
@@ -337,7 +349,7 @@ def brew_scan(t, packages, runner, *, offline=False):
     outside = {row["formula"] for row in parsed if row["formula"] not in considered_identities}
     # A stale target consumes one of Homebrew's checked slots; if its identity is not an
     # installed formula, the slot cannot be credited to any keg that was scanned.
-    if any(identity(n) not in considered_identities for n in stale):
+    if any(identity(n) not in considered_identities for n in stale) or stale_unresolved:
         outside.add("\x00stale-outside-inventory")
     if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:
@@ -348,7 +360,9 @@ def brew_scan(t, packages, runner, *, offline=False):
         # scan's own accounting; none of its evidence can be used.
         coverage["unaccounted"] = True
     for row in parsed:
-        row["formula"] = resolve(row["formula"])
+        resolved = resolve(row["full_name"])
+        if resolved is not None:
+            row["formula"] = resolved
     # Homebrew scans one keg per formula (`formula.any_installed_prefix`) and reports the
     # upstream version as-is; installed kegs are indexed by base so a revision suffix
     # (`9.0.2_1`) still matches its upstream version (`9.0.2`). Other kegs stay unknown.
