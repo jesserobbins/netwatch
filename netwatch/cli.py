@@ -241,7 +241,7 @@ def display(result, json_output=False, show_all=False):
                 # A held formula and a cask excluded from the default list are not
                 # updates the approved plan will take, so say which one it is.
                 state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
-                    " [not in default upgrade]" if row.get("greedy_only") else "")
+                    " [not in default upgrade as observed]" if row.get("greedy_only") else "")
                 if row.get("ecosystem") == "Homebrew-cask" and (
                         any(p["name"] == row["package"] and p["ecosystem"] == "Homebrew"
                             for p in report["packages"])

@@ -310,13 +310,14 @@ def brew_scan(t, packages, runner, *, offline=False):
                            "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Error("Homebrew vulnerability scan output is malformed") from exc
-    # Homebrew only considers what `brew info --installed` knows: on the reference host that
-    # is 236 formulae against `brew list --versions`'s 269, and anything else was never scanned.
-    considered, full_names = adapters.brew_considered(t, runner)
-    # The inventory collected before the scan already observed the recognized set; the
-    # reconciliation compares the two tap-qualified keg lists, so a metadata refresh that
-    # changed which formulae are recognized cannot pass unnoticed.
-    considered &= formulae
+    # The scanner considers what `brew info --installed` knows, and the inventory this
+    # check already collected holds exactly that: loadable formulae with their
+    # tap-qualified identity. Unloadable kegs (present in the Cellar, formula gone) are
+    # never scanned. The post-scan reconciliation re-reads the metadata and discards the
+    # scan if anything changed.
+    considered = {p["name"] for p in packages
+                  if p["ecosystem"] == "Homebrew" and not p.get("unloadable")} & formulae
+    full_names = {p.get("tap") or p["name"]: p["name"] for p in packages if p["ecosystem"] == "Homebrew"}
     coverage["considered"] = sorted(considered)
     # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
     # the inventory's short names before any comparison.

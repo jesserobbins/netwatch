@@ -21,9 +21,11 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
         # formula advisories, so reconciliation compares formulae only. If they moved while
         # the scan ran, its version claims cannot be tied to this report: retain the earlier
         # findings and publish none of the new ones.
-        formulae = [(p.get("tap") or p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"]
+        formulae = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
+                    for p in packages if p["ecosystem"] == "Homebrew"]
         try:
-            after = [(p.get("tap") or p["name"], p["version"]) for p in adapters.brew_formula_inventory(t, runner)]
+            after = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
+                     for p in adapters.brew_formula_inventory(t, runner)]
         except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
             after = None
         if after is None or sorted(after) != sorted(formulae):
@@ -33,8 +35,8 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             # read); the store keeps every prior finding as unknown on an incomplete
             # check regardless, and the next complete check re-assesses against the then
             # current tap-qualified identities.
-            coverage.update(scanned=[], retained=sorted({name for name, _ in formulae}),
-                            retained_versions=sorted([name, version] for name, version in formulae),
+            coverage.update(scanned=[], retained=sorted({name for name, _, _ in formulae}),
+                            retained_versions=sorted([name, version] for name, version, _ in formulae),
                             complete=False, changed_during_scan=True)
             # The scan's evidence cannot be tied to this host, so the advisory check is
             # incomplete rather than clean, and check exits 1.

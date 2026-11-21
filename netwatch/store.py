@@ -108,6 +108,29 @@ class Store:
                     if isinstance(item, dict) and not item.get("retained"):
                         item["matched_references"] = sorted(set(item.get("references") or []) & cves)
 
+    def _restore_trimmed(self, name, report):
+        """When a fresh row is trimmed, its retained copy (same id) comes back.
+
+        The retention merge prefers fresh data; if the trim then drops the fresh row
+        because its finding cleared, the previously saved observation must not
+        disappear from an already incomplete source.
+        """
+        context = report.get("context")
+        if not isinstance(context, dict):
+            return
+        old_context = self.latest(name).get("context", {}) if self.latest(name) else {}
+        for source, value in context.items():
+            # Only a source that fetched this check (incomplete) can have lost a retained
+            # row to the trim; a skipped source deliberately clears gone findings'
+            # context, and an ok source has no retained copies.
+            if not isinstance(value, dict) or value.get("status") != "incomplete" \
+                    or not isinstance(value.get("items"), list):
+                continue
+            present = {item.get("id") for item in value["items"] if isinstance(item, dict)}
+            for row in old_context.get(source, {}).get("items", []):
+                if row.get("id") not in present:
+                    value["items"].append({**row, "retained": True})
+
     def save_scan(self, name, report):
         with self.transaction():
             previous = self.latest(name)
@@ -166,6 +189,7 @@ class Store:
                         current.setdefault(row["id"], {**row, "retained": True})
                     value["items"] = list(current.values())
             self._trim_context(name, report)
+            self._restore_trimmed(name, report)
             def context_semantics(context):
                 return {source: {"status": value["status"], "errors": value["errors"],
                     "items": [{k: v for k, v in row.items() if k != "fetched_at"} for row in value["items"]]}

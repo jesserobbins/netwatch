@@ -633,6 +633,7 @@ class BrewWorkflowTests(unittest.TestCase):
         report = workflow.check(self.store, self.t, offline=True,
                                 runner=self.scripted(outputs, formulae=self.INSTALLED),
                                 request=lambda url, body=None: {})
+        self.assertEqual([f["state"] for f in report["findings"]], ["unknown"])
         self.assertFalse(report["advisory_check_ok"])
         self.assertTrue(report["coverage"]["deferred"])
         self.assertTrue(any("offline mode" in w for w in report["warnings"]))
@@ -742,7 +743,7 @@ class BrewWorkflowTests(unittest.TestCase):
                         False, show_all=True)
         plain = buffer.getvalue()
         self.assertIn("[held 3.5.8]", plain)
-        self.assertIn("[not in default upgrade]", plain)
+        self.assertIn("[not in default upgrade as observed]", plain)
 
     def test_preview_warns_about_casks(self):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
@@ -859,12 +860,8 @@ class BrewScanTests(unittest.TestCase):
                            "outdated_without_sbom": ["foo"], "unscanned_formulae": {}})
         run = self.scripted(["vulns\n", scan], seen=("foo", "real"),
                             aliases={"foo": "acme/tools/foo"}, formulae="foo 1\nreal 1\n")
-        rows = []
-        for name, version in (("foo", "1"), ("real", "1")):
-            row = adapters.package(name, version, "Homebrew")
-            if name == "real":
-                row["tap"] = "acme/tools/foo"
-            rows.append(row)
+        rows = [adapters.package("foo", "1", "Homebrew", tap="acme/tools/foo"),
+                adapters.package("real", "1", "Homebrew")]
         findings, _, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(coverage.get("unaccounted"))
