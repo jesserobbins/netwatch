@@ -224,6 +224,8 @@ def brew_considered(t, runner):
     """
     data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
     try:
+        if not isinstance(data["formulae"], list):
+            raise TypeError("formulae must be a list")
         names = {text(entry["name"], "formula name") for entry in data["formulae"]}
         # `brew vulns` reports `full_name`, which is tap-qualified for third-party taps
         # (scouzi1966/afm/afm-next on this host) and plain for core.
@@ -244,6 +246,8 @@ def brew_formula_rows(t, runner):
     try:
         data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
         formulae = data["formulae"]
+        if not isinstance(formulae, list):
+            raise TypeError("formulae must be a list")
     except (ValueError, KeyError, TypeError) as exc:
         raise Error("Unrecognized Homebrew installed formulae output") from exc
     for entry in formulae:

@@ -28,12 +28,13 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
             after = None
         if after is None or sorted(after) != sorted(formulae):
             findings = []
-            # Retention follows the newest observation: a formula replaced between the
-            # two collections (even a same-name same-version tap swap) must not inherit
-            # the removed formula's advisory as an unknown state.
-            newest = after if after is not None else formulae
-            coverage.update(scanned=[], retained=sorted({name for name, _ in newest}),
-                            retained_versions=sorted([name, version] for name, version in newest),
+            # The scan's evidence cannot be tied to this host, so nothing is covered. The
+            # retention metadata describes the inventory this report saves (the pre-scan
+            # read); the store keeps every prior finding as unknown on an incomplete
+            # check regardless, and the next complete check re-assesses against the then
+            # current tap-qualified identities.
+            coverage.update(scanned=[], retained=sorted({name for name, _ in formulae}),
+                            retained_versions=sorted([name, version] for name, version in formulae),
                             complete=False, changed_during_scan=True)
             # The scan's evidence cannot be tied to this host, so the advisory check is
             # incomplete rather than clean, and check exits 1.
@@ -123,12 +124,13 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
     try:
         last_argv = None
         for argv in body["commands"]:
-            last_argv = argv
+            last_argv = argv  # approved command in flight; cleared after the loop
             try:
                 runner(t, argv, timeout=1800)
             except Error as exc:
                 raise Error(f"Update step failed: {adapters.step_label(argv)}; {exc}") from exc
             store.event(t["name"], "command_completed", {"plan": id_, "argv": argv})
+        last_argv = None  # later failures belong to verification, not an approved step
         report = check(store, t, runner=runner, request=request)
         changed = digest(before) != digest(report["packages"])
         result = {"plan": id_, "status": "applied", "package_state_changed": changed,

@@ -248,12 +248,17 @@ def brew_scan(t, packages, runner, *, offline=False):
         return any(other != version and adapters.brew_base(other) == version
                    and adapters.brew_base(other) != other
                    for other in (v for n, v in pairs if n == name))
-    ambiguous = {(name, version) for name, version in pairs if is_ambiguous(name, version)}
+    # Kegs are keyed by their tap-qualified identity; scan rows are looked up by the raw
+    # name Homebrew reported (its `full_name`), so a core row for a name our inventory
+    # knows only under a tap is not evidence about that keg.
+    ambiguous = {(p.get("tap") or p["name"], p["version"])
+                 for p in packages if p["ecosystem"] == "Homebrew" and is_ambiguous(p["name"], p["version"])}
     by_base = {}
-    for name, version in sorted(pairs):
-        if (name, version) in ambiguous:
+    for p in (p for p in packages if p["ecosystem"] == "Homebrew"):
+        key_name = p.get("tap") or p["name"]
+        if (key_name, p["version"]) in ambiguous:
             continue
-        by_base.setdefault((name, adapters.brew_base(version)), []).append(version)
+        by_base.setdefault((key_name, adapters.brew_base(p["version"])), []).append(p["version"])
     formulae = {name for name, _ in pairs}
     coverage = {"scanner": None, "checked": 0, "complete": False, "deferred": False,
                 "skipped": [], "unscanned": {}, "outdated_without_sbom": [],
@@ -311,6 +316,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     full_names_inverse = {}
     for qualified, short in full_names.items():
         full_names_inverse.setdefault(short, qualified)
+    identity = lambda name: full_names_inverse.get(name, name)
+    full_names_inverse = {}
+    for qualified, short in full_names.items():
+        full_names_inverse.setdefault(short, qualified)
     skipped = {resolve(name) for name in coverage["skipped"]}
     unscanned = {resolve(name): reason for name, reason in coverage["unscanned"].items()}
     stale = {resolve(name) for name in coverage["outdated_without_sbom"]}
@@ -323,7 +332,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # counted against its budget.
     unreliable = unscanned.keys() | stale | skipped
     parsed = [row for row in parsed if resolve(row["formula"]) not in unreliable]
-    outside = {resolve(row["formula"]) for row in parsed if resolve(row["formula"]) not in considered}
+    # A row is evidence only about the formula identity it names: a core row for a name our
+    # inventory knows only under a tap is not evidence about that keg.
+    considered_identities = {identity(n) for n in considered}
+    outside = {row["formula"] for row in parsed if row["formula"] not in considered_identities}
     if len(claimed) != coverage["checked"] or \
             len({row["formula"] for row in parsed}) > coverage["checked"]:
         coverage["unaccounted"] = True
@@ -340,9 +352,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     matched_versions, matched_names = set(), set()
     unmatched = set()
     for row in parsed:
-        # The index is base-only: one scan row for upstream 9.0.2 reaches the revised keg
-        # 9.0.2_1. Kegs whose upstream identity is uncertain (`is_ambiguous`) are absent.
-        installed = by_base.get((row["formula"], row["version"]))
+        # The index is keyed by the tap-qualified identity and base-only: one scan row for
+        # upstream 9.0.2 reaches the revised keg 9.0.2_1. Kegs whose upstream identity is
+        # uncertain (`is_ambiguous`) are absent.
+        installed = by_base.get((row["full_name"], row["version"]))
         if installed:
             if row["vulnerabilities"]:
                 matched_names.add(row["formula"])
@@ -358,6 +371,8 @@ def brew_scan(t, packages, runner, *, offline=False):
     matched_names -= unmatched
     matched_versions = {(name, version) for name, version in matched_versions
                         if name not in unmatched}
+    matched_names = {identity(name) for name in matched_names}
+    matched_versions = {(identity(name), version) for name, version in matched_versions}
     # A clean formula has no row at all; absence of a finding is evidence of assessment.
     # A stale target was assessed against the wrong version, so it is never covered.
     if coverage.get("unaccounted"):
@@ -370,19 +385,21 @@ def brew_scan(t, packages, runner, *, offline=False):
     # of the formula is installed.
     multi_keg = {name for name, count in
                  ((name, sum(1 for n, _ in pairs if n == name)) for name in formulae) if count > 1}
-    covered_names = matched_names | {name for name in clean if name not in multi_keg}
-    covered_versions = matched_versions | {(name, version) for name, version in pairs
+    # Coverage names carry the tap-qualified identity; `retained` stays in the inventory's
+    # short names, which is what the report and the store match on.
+    covered_identities = matched_names | {identity(name) for name in clean if name not in multi_keg}
+    covered_versions = matched_versions | {(identity(name), version) for name, version in pairs
                                            if name in clean and name not in multi_keg}
-    coverage["scanned"] = sorted(covered_names)
-    coverage["retained"] = sorted(formulae - covered_names)
-    covered_versions = {(name, version) for name, version in covered_versions
-                        if (name, version) not in ambiguous}
+    coverage["scanned"] = sorted(covered_identities)
+    covered_short_names = {full_names.get(i, i) for i in covered_identities}
+    coverage["retained"] = sorted(formulae - covered_short_names)
     # Retention is keyed by the tap-qualified identity, so a formula replaced by a
     # different tap's formula of the same short name and version cannot inherit the
     # removed formula's advisory.
-    identity = lambda name: full_names_inverse.get(name, name)
+    covered_versions = {(identity(name), version) for name, version in covered_versions
+                        if (identity(name), version) not in ambiguous}
     coverage["retained_versions"] = sorted([identity(name), version] for name, version in pairs
-                                           if (name, version) not in covered_versions)
+                                           if (identity(name), version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
     # of a partially covered formula.
     coverage["reported_complete"] = coverage["complete"]
@@ -410,7 +427,7 @@ def brew_scan(t, packages, runner, *, offline=False):
         if row["formula"] in unmatched or coverage.get("unaccounted"):
             continue
         for advisory in row["vulnerabilities"]:
-            for installed in by_base[(row["formula"], row["version"])]:
+            for installed in by_base[(row["full_name"], row["version"])]:
                 item = finding({"ecosystem": "Homebrew", "name": row["formula"], "version": installed},
                                advisory["id"], "affected", advisory["fixed"],
                                "Homebrew OSV scan matched the upstream repository and tag; coverage limited to scanned formulae",

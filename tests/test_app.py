@@ -503,6 +503,38 @@ class BrewWorkflowTests(unittest.TestCase):
         self.assertTrue(any("current formula version" in w for w in report["warnings"]))
         self.assertFalse(any("changed version" in w for w in report["warnings"]))
 
+    def test_context_trim_drops_rows_whose_subject_cleared(self):
+        # A finding citing CVE-1 is cleared between the context fetch and the save; the
+        # fresh cve_now and zero_wire rows for it must not ship, a pwn.watch lead matched
+        # by a GHSA id must not ship, and a tag-matched pwn.watch lead stays.
+        findings = [{"advisory": "GHSA-abcd-efgh-2345", "package": "x", "installed": "1",
+                     "references": ["GHSA-abcd-efgh-2345"]}]
+        report = {"findings": [],
+                  "context": {"cve_now": {"status": "ok", "items": [{"id": "CVE-1"}], "errors": []},
+                              "zero_wire": {"status": "ok", "items": [{"references": ["CVE-1"]}], "errors": []},
+                              "pwn_watch": {"status": "ok", "items": [
+                                  {"references": ["GHSA-abcd-efgh-2345"], "matched_tags": []},
+                                  {"references": ["CVE-1"], "matched_tags": ["x"]}], "errors": []}}}
+        self.store.save_scan(self.t["name"], dict(report, target=self.t, packages=[], updates=[],
+                                                 warnings=[], advisory_check_ok=True, evidence=[],
+                                                 matcher_revision=1, update_error=None))
+        saved = self.store.latest(self.t["name"])
+        self.assertEqual(saved["context"]["cve_now"]["items"], [])
+        self.assertEqual(saved["context"]["zero_wire"]["items"], [])
+        # The GHSA-matched lead (no tags) goes; the tag-matched lead stays, with its
+        # matched_references recomputed against the surviving findings.
+        self.assertEqual([i["matched_tags"] for i in saved["context"]["pwn_watch"]["items"]], [["x"]])
+
+    def test_retained_context_survives_the_trim(self):
+        report = {"findings": [],
+                  "context": {"cve_now": {"status": "incomplete", "items": [{"id": "CVE-1", "retained": True}],
+                                          "errors": ["down"]}}}
+        self.store.save_scan(self.t["name"], dict(report, target=self.t, packages=[], updates=[],
+                                                  warnings=[], advisory_check_ok=True, evidence=[],
+                                                  matcher_revision=1, update_error=None))
+        saved = self.store.latest(self.t["name"])
+        self.assertEqual(saved["context"]["cve_now"]["items"], [{"id": "CVE-1", "retained": True}])
+
     def test_failed_step_is_recorded_in_the_plan_result(self):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
         plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs, formulae="libheif 1.23.7\n"))
@@ -778,6 +810,25 @@ class BrewScanTests(unittest.TestCase):
         with self.assertRaises(Error):
             sources.brew_scan(TARGET, self.packages(("x", "1")), self.scripted(["vulns\n", bad], seen=("x",)))
 
+    def test_a_core_row_is_not_evidence_about_a_tapped_keg(self):
+        # The inventory knows foo only as acme/tools/foo; a scanner row for core foo at
+        # the same version contradicts the accounting and must not publish or clear.
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "foo", "version": "1", "tag": "v1",
+                                        "repo_url": "https://example.com/foo",
+                                        "vulnerabilities": [{"id": "OSV-1", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["vulns\n", scan], seen=("foo",),
+                            aliases={"foo": "acme/tools/foo"})
+        rows = self.packages(("foo", "1"))
+        rows[0]["tap"] = "acme/tools/foo"
+        findings, warnings, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual(findings, [])
+        self.assertTrue(coverage.get("unaccounted"))
+        self.assertEqual(coverage["retained_versions"], [["acme/tools/foo", "1"]])
+
     def test_tap_qualified_full_name_resolves_to_the_inventory_name(self):
         t = TARGET
         scan = json.dumps({"findings": [{"formula": "kenn-io/tap/agentsview", "version": "0.47.0",
@@ -792,7 +843,10 @@ class BrewScanTests(unittest.TestCase):
         rows = adapters.inventory(t, run)
         findings, warnings, coverage = sources.brew_scan(t, rows, run)
         self.assertEqual([f["package"] for f in findings], ["agentsview"])
-        self.assertEqual(coverage["scanned"], ["agentsview"])
+        self.assertEqual([f["tap"] for f in findings], ["kenn-io/tap/agentsview"])
+        # Coverage names carry the tap-qualified identity.
+        self.assertEqual(coverage["scanned"], ["kenn-io/tap/agentsview"])
+        self.assertEqual(coverage["retained_versions"], [])
         self.assertFalse(any("changed version" in w for w in warnings))
 
     def test_a_multi_keg_formula_covers_only_the_keg_homebrew_scanned(self):
@@ -932,6 +986,19 @@ class BrewScanTests(unittest.TestCase):
                                            self.scripted(["vulns\n", scan], seen=("x",)))
         self.assertEqual(sorted(f["advisory"] for f in findings), ["OSV-1", "OSV-2"])
         self.assertEqual(findings[1]["summary"], "line one line two")
+
+    def test_repository_url_credentials_and_query_are_stripped(self):
+        scan = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
+                                        "repo_url": "https://token@github.com/example/x?secret=hunter2",
+                                        "vulnerabilities": [{"id": "OSV-1", "severity": "LOW", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        findings, _, _ = sources.brew_scan(TARGET, self.packages(("x", "1")),
+                                           self.scripted(["vulns\n", scan], seen=("x",)))
+        self.assertEqual(findings[0]["repository"], "https://github.com/example/x")
+        self.assertEqual(sources.strip_credentials("https://github.com/a/b#frag"), "https://github.com/a/b#frag")
+        self.assertEqual(sources.strip_credentials("https://u:p@gitlab.com/a/b"), "https://gitlab.com/a/b")
 
     def test_dict_findings_field_is_rejected(self):
         bad = json.dumps({"findings": {}, "skipped_formulae": [], "checked": 1, "complete": True,

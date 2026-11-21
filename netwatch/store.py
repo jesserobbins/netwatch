@@ -96,12 +96,18 @@ class Store:
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
                                   or item.get("matched_tags")
                                   or set(item.get("references") or []) & references]
+                for item in value["items"]:
+                    if isinstance(item, dict):
+                        item["matched_references"] = sorted(set(item.get("references") or []) & references)
             elif source == "cve_now":
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
                                   or item.get("id") in cves]
             else:
                 value["items"] = [item for item in value["items"] if not isinstance(item, dict)
                                   or set(item.get("references") or []) & cves]
+                for item in value["items"]:
+                    if isinstance(item, dict):
+                        item["matched_references"] = sorted(set(item.get("references") or []) & cves)
 
     def save_scan(self, name, report):
         with self.transaction():
