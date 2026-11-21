@@ -292,6 +292,15 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.calls[6][0][-4:], ["brew", "list", "--cask", "--versions"])
         self.assertEqual(next(p for p in rows if p["name"] == "python@3.12")["tap"], "python@3.12")
 
+    def test_a_keg_removed_between_the_two_reads_fails_the_inventory(self):
+        t = adapters.target("laptop", "brew")
+        run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n",
+                           json.dumps({"formulae": [{"name": "x", "full_name": "x",
+                                                     "installed": [{"version": "1"}]}]}),
+                           ""])
+        with self.assertRaises(Error):
+            adapters.inventory(t, run)
+
     def test_brew_inventory_rejects_unparsable_line(self):
         t = adapters.target("laptop", "brew")
         run = self.runner(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "not json\n"])
@@ -546,7 +555,7 @@ class BrewWorkflowTests(unittest.TestCase):
     def test_failed_step_is_recorded_in_the_plan_result(self):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
         plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs, formulae="libheif 1.23.7\n"))
-        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", '{"formulae": [{"name": "libheif", "full_name": "libheif", "installed": [{"version": "1.23.7"}]}]}', ""]
+        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", '{"formulae": [{"name": "libheif", "full_name": "libheif", "installed": [{"version": "1.23.7"}]}]}', "libheif 1.23.7\n", ""]
         def failing(t, argv, **kwargs):
             if argv[-2:] == ["upgrade", "--cask"]:
                 raise Error("nope")
@@ -713,7 +722,7 @@ class BrewWorkflowTests(unittest.TestCase):
         outputs = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", EMPTY_OUTDATED, EMPTY_OUTDATED]
         plan = workflow.preview(self.store, self.t, runner=self.scripted(outputs, formulae="libheif 1.23.7\n"))
         # apply re-collects inventory first, then runs the three approved steps.
-        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", '{"formulae": [{"name": "libheif", "full_name": "libheif", "installed": [{"version": "1.23.7"}]}]}', ""]
+        probe = ["Darwin\n", "arm64\n", "15.3.1\n", "501\n", '{"formulae": [{"name": "libheif", "full_name": "libheif", "installed": [{"version": "1.23.7"}]}]}', "libheif 1.23.7\n", ""]
         def failing(t, argv, **kwargs):
             if argv[-2:] == ["upgrade", "--cask"]:  # not `brew list --cask` during inventory
                 raise Error("Command failed: brew upgrade --cask (exit 1)")
