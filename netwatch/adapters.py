@@ -213,29 +213,6 @@ def brew_base(version):
     return re.sub(r"_\d+$", "", version)
 
 
-def brew_considered(t, runner):
-    """The formulae `brew vulns` actually considers.
-
-    `brew list --versions` lists more than this: on the reference host 269 names
-    against `brew info --installed`'s 236, so coverage claimed from the wider list
-    would include formulae Homebrew never looked at.
-
-    Returns (names, aliases): the considered set and the full_name -> name map.
-    """
-    data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
-    try:
-        if not isinstance(data["formulae"], list):
-            raise TypeError("formulae must be a list")
-        names = {text(entry["name"], "formula name") for entry in data["formulae"]}
-        # `brew vulns` reports `full_name`, which is tap-qualified for third-party taps
-        # (scouzi1966/afm/afm-next on this host) and plain for core.
-        aliases = {text(entry["full_name"], "formula full name"): text(entry["name"], "formula name")
-                   for entry in data["formulae"] if entry.get("full_name")}
-    except (KeyError, TypeError) as exc:
-        raise Error("Unrecognized Homebrew installed formulae output") from exc
-    return names, aliases
-
-
 def brew_formula_rows(t, runner):
     """One (name, full_name, version, unloadable) tuple per installed formula keg.
 
@@ -278,14 +255,14 @@ def brew_formula_rows(t, runner):
         for version in parts[1:]:
             if version not in known.get(parts[0], ()):
                 # The Cellar has a keg the metadata read does not describe: keep it, but
-                # no advisory assessment can reach it.
-                yield parts[0], parts[0], version, True
+                # no advisory assessment can reach it and it carries no tap identity.
+                yield parts[0], None, version, True
 
 
 def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
     os_info(t, runner)
-    return [package(name, version, "Homebrew", tap=full, **({"unloadable": True} if stale else {}))
+    return [package(name, version, "Homebrew", **({**({"tap": full} if full else {}), **({"unloadable": True} if stale else {})}))
             for name, full, version, stale in brew_formula_rows(t, runner)]
 
 
@@ -296,7 +273,7 @@ def brew_inventory(t, runner):
         # inventory first, so refusing here covers all of them without adding an
         # unapproved command to the apply sequence.
         raise Error("Homebrew must not run as root; re-run as the invoking user")
-    result = [package(name, version, "Homebrew", tap=full, **({"unloadable": True} if stale else {}))
+    result = [package(name, version, "Homebrew", **({**({"tap": full} if full else {}), **({"unloadable": True} if stale else {})}))
               for name, full, version, stale in brew_formula_rows(t, runner)]
     for line in runner(t, brew_env("brew", "list", "--cask", "--versions")).splitlines():
         parts = line.split()

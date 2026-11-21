@@ -257,6 +257,10 @@ def brew_scan(t, packages, runner, *, offline=False):
                  for p in packages if p["ecosystem"] == "Homebrew" and is_ambiguous(p["name"], p["version"])}
     by_base = {}
     for p in (p for p in packages if p["ecosystem"] == "Homebrew"):
+        if p.get("unloadable"):
+            # A keg the metadata read does not describe is never assessed; a scan row
+            # must not publish a finding for it.
+            continue
         key_name = p.get("tap") or p["name"]
         if (key_name, p["version"]) in ambiguous:
             continue
@@ -343,7 +347,7 @@ def brew_scan(t, packages, runner, *, offline=False):
     stale_unresolved = [name for name in coverage["outdated_without_sbom"] if resolve(name) is None]
     # A formula that is both skipped and stale is a contradictory scan: it cannot be
     # both refused and assessed against a stale target.
-    contradictory = skipped & stale
+    contradictory = skipped & stale | unscanned.keys() & stale
     # `checked` is `queryable.size` in Homebrew's scanner, so it counts queryable formulae —
     # skipped and refused ones are excluded, stale ones are included.
     claimed = considered - skipped - unscanned.keys()
@@ -425,9 +429,10 @@ def brew_scan(t, packages, runner, *, offline=False):
     # removed formula's advisory.
     covered_versions = {(identity(name), version) for name, version in covered_versions
                         if (identity(name), version) not in ambiguous}
-    unloadable = {p["name"] for p in packages if p["ecosystem"] == "Homebrew" and p.get("unloadable")}
+    unloadable = {(p["name"], p["version"]) for p in packages
+                  if p["ecosystem"] == "Homebrew" and p.get("unloadable")}
     coverage["retained_versions"] = sorted(
-        [identity(name), version, *(["unloadable"] if name in unloadable else [])]
+        [identity(name), version, *(["unloadable"] if (name, version) in unloadable else [])]
         for name, version in pairs if (identity(name), version) not in covered_versions)
     # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
     # of a partially covered formula.

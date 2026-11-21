@@ -868,6 +868,15 @@ class BrewScanTests(unittest.TestCase):
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(coverage.get("unaccounted"))
 
+    def test_a_formula_both_refused_and_stale_is_a_contradictory_scan(self):
+        t = TARGET
+        scan = json.dumps({"findings": [], "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": ["x"], "unscanned_formulae": {"x": "untrusted_tap"}})
+        run = self.scripted(["vulns\n", scan], seen=("x",), formulae="x 1\n")
+        findings, _, coverage = sources.brew_scan(t, self.packages(("x", "1")), run)
+        self.assertEqual(coverage["scanned"], [])
+        self.assertTrue(coverage.get("unaccounted"))
+
     def test_a_formula_both_skipped_and_stale_is_a_contradictory_scan(self):
         t = TARGET
         scan = json.dumps({"findings": [], "skipped_formulae": ["x"], "checked": 1, "complete": True,
@@ -876,6 +885,21 @@ class BrewScanTests(unittest.TestCase):
         findings, _, coverage = sources.brew_scan(t, self.packages(("x", "1")), run)
         self.assertEqual(coverage["scanned"], [])
         self.assertTrue(coverage.get("unaccounted"))
+
+    def test_an_unloadable_keg_never_receives_a_finding(self):
+        t = TARGET
+        scan = json.dumps({"findings": [{"formula": "x", "version": "1", "tag": "v1",
+                                        "repo_url": "https://example.com/x",
+                                        "vulnerabilities": [{"id": "OSV-1", "severity": "HIGH", "summary": "s",
+                                                             "aliases": [], "fixed_versions": []}]}],
+                           "skipped_formulae": [], "checked": 1, "complete": True,
+                           "outdated_without_sbom": [], "unscanned_formulae": {}})
+        run = self.scripted(["Darwin\n", "arm64\n", "15.3.1\n", "501\n", "", "vulns\n", scan],
+                            formulae="x 1\n", cellar="x 1 1_1\n")
+        rows = [p for p in adapters.inventory(t, run) if p["ecosystem"] == "Homebrew"]
+        findings, _, coverage = sources.brew_scan(t, rows, run)
+        self.assertEqual([f["installed"] for f in findings], ["1"])
+        self.assertEqual(sorted(coverage["retained_versions"]), [["x", "1_1", "unloadable"]])
 
     def test_a_cellar_keg_the_info_read_misses_stays_in_the_inventory(self):
         t = TARGET
