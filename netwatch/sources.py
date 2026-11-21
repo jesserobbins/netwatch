@@ -371,8 +371,16 @@ def brew_scan(t, packages, runner, *, offline=False):
         warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "
                         "Homebrew; their earlier findings are retained")
     if unmatched:
-        warnings.append(f"Coverage: {len(unmatched)} formula(e) changed version between collection and Homebrew's "
-                        "scan; their earlier findings are retained and their scan results are not used — re-run the check")
+        empty = {row["formula"] for row in parsed if not row["vulnerabilities"]}
+        changed, empty = unmatched - empty, unmatched & empty
+        if changed:
+            warnings.append(f"Coverage: {', '.join(sorted(changed))} changed version between collection and "
+                            "Homebrew's scan; their earlier findings are retained and their scan results "
+                            "are not used — re-run the check")
+        if empty:
+            warnings.append(f"Coverage: {', '.join(sorted(empty))}: Homebrew's scan returned a row without "
+                            "advisory evidence; their earlier findings are retained and their scan results "
+                            "are not used")
 
     for row in parsed:
         if row["formula"] in unmatched or coverage.get("unaccounted"):

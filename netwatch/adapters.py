@@ -238,7 +238,7 @@ def brew_formula_inventory(t, runner):
     """Formulae only. Advisory reconciliation must not pay for a cask listing."""
     os_info(t, runner)
     result = []
-    for line in runner(t, brew_env("brew", "list", "--versions")).splitlines():
+    for line in runner(t, brew_env("brew", "list", "--formula", "--versions")).splitlines():
         parts = line.split()
         if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
             raise Error("Unrecognized Homebrew inventory line")
