@@ -59,6 +59,7 @@ class Store:
             PRAGMA user_version=%d;
         """ % (SCHEMA_VERSION,))
         self.schema_version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        self.db_path = path
 
     def close(self):
         self.db.close()
@@ -179,28 +180,92 @@ class Store:
                  "detail": json.loads(r["detail_json"])}
                 for r in self.db.execute(sql, args)]
 
+    def _constraints_files(self):
+        for row in self.db.execute("SELECT body FROM plans"):
+            try:
+                constraints = json.loads(row["body"]).get("constraints") or {}
+            except ValueError:
+                continue
+            path = constraints.get("path")
+            if path:
+                yield path
+
     def expire(self, now=None):
         """Lazy expiry: a proposal nobody acted on stops being applicable.
 
-        Runs at the start of every store-writing command, in the command's own opening
-        transaction, so a plan that expired overnight is cleaned by the next thing the
-        operator runs rather than by a background daemon that does not exist.
+        Runs in one transaction of its own when a command opens the store, so a plan that
+        expired overnight is cleaned by the next thing the operator runs. The plan's
+        constraints file goes with it: an approval that can no longer be applied must not
+        leave its artifact behind.
         """
         now = int(time.time()) if now is None else int(now)
-        expired = []
-        for row in self.db.execute("SELECT id, target, body FROM plans WHERE status='proposed'"):
+        expired, doomed = [], []
+        with self.transaction():
+            for row in self.db.execute("SELECT id, target, body FROM plans WHERE status='proposed'"):
+                try:
+                    body = json.loads(row["body"])
+                except ValueError:
+                    continue
+                at = body.get("expires_at")
+                if not isinstance(at, (int, float)) or now < int(at):
+                    continue
+                self.db.execute("UPDATE plans SET status='stale' WHERE id=? AND status='proposed'",
+                                (row["id"],))
+                self.event(row["target"], "plan_expired", {"plan": row["id"]})
+                expired.append(row["id"])
+                path = (body.get("constraints") or {}).get("path")
+                if path:
+                    doomed.append(path)
+        for path in doomed:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return len(expired)
+
+    def cleanup(self, now=None):
+        """Remove what a crashed run left behind, in one transaction that holds the lock.
+
+        Selection and unlink share the lock so a plan commit cannot land between "nothing
+        references this file" and its removal.
+        """
+        now = int(time.time()) if now is None else int(now)
+        cutoff = now - 3600
+        removed = 0
+        referenced = set()
+        terminal = set()
+        for row in self.db.execute("SELECT status, body FROM plans"):
             try:
                 body = json.loads(row["body"])
             except ValueError:
                 continue
-            at = body.get("expires_at")
-            if isinstance(at, (int, float)) and now >= int(at):
-                expired.append((row["id"], row["target"]))
-        for plan_id, target in expired:
-            self.db.execute("UPDATE plans SET status='stale' WHERE id=? AND status='proposed'",
-                            (plan_id,))
-            self.event(target, "plan_expired", {"plan": plan_id})
-        return len(expired)
+            path = (body.get("constraints") or {}).get("path")
+            if not path:
+                continue
+            referenced.add(path)
+            if row["status"] in ("stale", "resolved"):
+                terminal.add(path)
+        with self.transaction():
+            directory = Path(self.db_path).parent / "constraints" if getattr(self, "db_path", None) else None
+            if directory is None:
+                directory = Path(".")
+            candidates = list(directory.glob("apply-*.tmp")) + list(directory.glob("preview-*.txt"))
+            for entry in candidates:
+                try:
+                    age_ok = entry.stat().st_mtime < cutoff
+                except OSError:
+                    continue
+                stale = str(entry) in terminal
+                orphan = entry.name.startswith("preview-") and str(entry) not in referenced and age_ok
+                old_temp = entry.name.startswith("apply-") and age_ok
+                if not (stale or orphan or old_temp):
+                    continue
+                try:
+                    entry.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
 
     def stale_siblings(self, name, *, path=None, venv_match=None):
         """Invalidate every other proposal for this target — or for the same venv."""
@@ -227,7 +292,20 @@ class Store:
             return None
         return target.get("path") if isinstance(target, dict) else None
 
+    def generation(self, name):
+        row = self.db.execute("SELECT generation FROM targets WHERE name=?", (name,)).fetchone()
+        return int(row["generation"] or 1) if row else 1
+
     def event(self, target, kind, body):
+        """Every event row carries the generation it was observed at.
+
+        A target that is removed and revived is a different registration with the same
+        name; history from before the revival must not read as current coverage, and the
+        generation is what tells them apart.
+        """
+        body = dict(body)
+        if target is not None:
+            body.setdefault("generation", self.generation(target))
         self.db.execute("INSERT INTO events(target,at,kind,body) VALUES(?,?,?,?)",
                         (target, int(time.time()), kind, canonical(body)))
 
@@ -241,8 +319,17 @@ class Store:
         return json.loads(row[0])
 
     def latest(self, name):
-        row = self.db.execute("SELECT id,at,body FROM scans WHERE target=? ORDER BY id DESC LIMIT 1", (name,)).fetchone()
-        return {"id": row["id"], "at": row["at"], **json.loads(row["body"])} if row else None
+        """The current report: a row from a previous registration is history, not coverage."""
+        current = self.generation(name)
+        row = self.db.execute(
+            "SELECT id,at,body FROM scans WHERE target=? ORDER BY id DESC LIMIT 1",
+            (name,)).fetchone()
+        if row is None:
+            return None
+        body = json.loads(row["body"])
+        if int(body.get("generation", 1)) != current:
+            return None
+        return {"id": row["id"], "at": row["at"], **body}
 
     def _trim_context(self, name, report, previous):
         """Drop context rows whose subject is no longer a finding.
@@ -309,6 +396,8 @@ class Store:
                     value["items"].append({**row, "retained": True})
 
     def save_scan(self, name, report):
+        report = dict(report)
+        report["generation"] = self.generation(name)
         with self.transaction():
             previous = self.latest(name)
             if previous and not report["advisory_check_ok"]:

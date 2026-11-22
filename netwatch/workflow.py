@@ -238,7 +238,15 @@ def resolve(store, id_, note):
         if not row or row["status"] not in ("running", "needs_attention"):
             raise Error("Only interrupted or uncertain updates can be resolved")
         store.db.execute("UPDATE plans SET status='resolved' WHERE id=?", (id_,))
-        store.db.execute("UPDATE plans SET status='stale' WHERE target=? AND status='proposed'", (row["target"],))
+        # A crashed install may have changed a venv another target's plan observed, so the
+        # staling is venv-scoped for the venv-bound kinds (and name-scoped as before for
+        # the rest).
+        try:
+            target = store.target(row["target"])
+        except Error:
+            target = {}
+        store.stale_siblings(row["target"], path=target.get("path"),
+                             venv_match=same_venv if target.get("kind") in ("uvtool", "pipx") else None)
         store.event(row["target"], "operator_resolved", {"plan": id_, "note": note,
                     "warning": "Operator attests no process still runs and recovery is complete; not a verified remediation"})
     return {"plan": id_, "status": "resolved"}

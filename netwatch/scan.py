@@ -322,7 +322,7 @@ def register(store, root, indices, *, run_id=None, runner=None):
                     raise Error("%s already tracks this venv as %s; remove that target first"
                                 % (other["name"], other["kind"]))
             body = {"name": row["name"], "kind": row["kind"], "host": "local",
-                    "path": row["realpath"],
+                    "path": row["realpath"], "realpath": row["realpath"],
                     "bin_dir": row["bin_dir"], "extras": row["extras"],
                     "index_options": row["index_options"],
                     "registered_from_scan": {"run": run, "ordinal": item["ordinal"],

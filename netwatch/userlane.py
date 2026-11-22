@@ -90,6 +90,63 @@ def _uv_tool(venv: Path):
             "index_options": _redact(_receipt_index_options(receipt))}
 
 
+PIP_CONFIG_PATHS = ("pip.conf", "pip/pip.conf", ".pip/pip.conf",
+                    "Library/Application Support/pip/pip.conf")
+PIP_KEYS = (("global.index-url", "--index-url"),
+            ("global.extra-index-url", "--extra-index-url"),
+            ("global.trusted-host", "--trusted-host"))
+
+
+def _pip_conf_files(home=None):
+    """The pip configuration files this machine would read, most specific first."""
+    import sys
+    paths = []
+    explicit = os.environ.get("PIP_CONFIG_FILE")
+    if explicit:
+        paths.append(Path(explicit))
+    base = Path(home or os.path.expanduser("~"))
+    for rel in PIP_CONFIG_PATHS:
+        paths.append(base / rel)
+    if sys.platform == "darwin":
+        paths.append(Path("/Library/Application Support/pip/pip.conf"))
+    paths.append(Path("/etc/pip.conf"))
+    return [p for p in paths if p.is_file()]
+
+
+def pip_config_index_options(home=None):
+    """pip's effective index options, translated to the flags uv understands.
+
+    A pipx tool installed from a private index configured in `pip.conf` has empty
+    `pip_args` — pip reads pip.conf, uv reads neither it nor PIP_* — so replaying only
+    `pip_args` would silently resolve that tool against uv's default index.
+    """
+    import configparser
+    options = []
+    env = (("PIP_INDEX_URL", "--index-url"), ("PIP_EXTRA_INDEX_URL", "--extra-index-url"),
+           ("PIP_TRUSTED_HOST", "--trusted-host"))
+    for variable, flag in env:
+        value = os.environ.get(variable)
+        if value:
+            options.extend([flag, value])
+    if not options:
+        for path in _pip_conf_files(home):
+            parser = configparser.ConfigParser()
+            try:
+                parser.read(path)
+            except (configparser.Error, OSError):
+                continue
+            for key, flag in PIP_KEYS:
+                try:
+                    value = parser.get("global", key.split(".", 1)[1])
+                except (configparser.Error, KeyError):
+                    continue
+                if value:
+                    options.extend([flag, value])
+            if options:
+                break
+    return _redact(options)
+
+
 def _pipx(venv: Path):
     data = json.loads((venv / PIPX_METADATA).read_text())
     main = data.get("main_package") or {}
@@ -101,8 +158,12 @@ def _pipx(venv: Path):
     bin_dir = venv / "bin"
     if apps and isinstance(apps[0], dict) and apps[0].get("__Path__"):
         bin_dir = Path(str(apps[0]["__Path__"]).replace("VENV", str(venv))).parent
+    recorded = _redact(_pip_args_index_options(main.get("pip_args")))
+    # pip_args only carry what pipx itself was told; pip's own configuration is what a
+    # pip.conf-only install resolves against, so it is the fallback.
     return {"kind": PIPX, "name": name, "extras": extras, "bin_dir": str(bin_dir),
-            "index_options": _redact(_pip_args_index_options(main.get("pip_args")))}
+            "index_options": recorded or pip_config_index_options(),
+            "index_source": "pip_args" if recorded else "pip_config"}
 
 
 def describe(path):

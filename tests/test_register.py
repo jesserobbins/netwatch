@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from netwatch import cli, scan, store as store_module, userlane
@@ -275,3 +276,49 @@ class RegistrationUniquenessTests(unittest.TestCase):
             self.assertIn("already tracks this venv", str(caught.exception))
         finally:
             store.close()
+
+
+class PipxIndexTranslationTests(unittest.TestCase):
+    """A pipx tool whose private index lives in pip.conf, not in pip_args."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = venv_with(self.root, "luna", pipx="pipx-metadata.json")
+        meta = json.loads((self.venv / "pipx_metadata.json").read_text())
+        meta["main_package"]["pip_args"] = []          # nothing recorded by pipx itself
+        (self.venv / "pipx_metadata.json").write_text(json.dumps(meta))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_pip_conf_supplies_the_index_when_pip_args_names_none(self):
+        conf = self.root / "pip.conf"
+        conf.write_text("[global]\nindex-url = https://private.example/simple\n")
+        with mock.patch.dict(os.environ, {"PIP_CONFIG_FILE": str(conf)}, clear=False):
+            row = userlane.describe(self.venv)
+        self.assertEqual(row["index_options"], ["--index-url", "https://private.example/simple"])
+        self.assertEqual(row["index_source"], "pip_config")
+
+    def test_pip_environment_variables_are_translated(self):
+        with mock.patch.dict(os.environ, {"PIP_INDEX_URL": "https://env.example/simple"},
+                             clear=False):
+            row = userlane.describe(self.venv)
+        self.assertEqual(row["index_options"], ["--index-url", "https://env.example/simple"])
+
+    def test_pip_args_win_over_the_file(self):
+        meta = json.loads((self.venv / "pipx_metadata.json").read_text())
+        meta["main_package"]["pip_args"] = ["--index-url", "https://args.example/simple"]
+        (self.venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        conf = self.root / "pip.conf"
+        conf.write_text("[global]\nindex-url = https://file.example/simple\n")
+        with mock.patch.dict(os.environ, {"PIP_CONFIG_FILE": str(conf)}, clear=False):
+            row = userlane.describe(self.venv)
+        self.assertEqual(row["index_options"], ["--index-url", "https://args.example/simple"])
+        self.assertEqual(row["index_source"], "pip_args")
+
+    def test_credentials_from_pip_conf_are_redacted(self):
+        conf = self.root / "pip.conf"
+        conf.write_text("[global]\nindex-url = https://user:secret@private.example/simple\n")
+        with mock.patch.dict(os.environ, {"PIP_CONFIG_FILE": str(conf)}, clear=False):
+            row = userlane.describe(self.venv)
+        self.assertNotIn("secret", json.dumps(row))

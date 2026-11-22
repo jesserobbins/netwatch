@@ -65,16 +65,32 @@ def co_claimants(store, t):
     return found
 
 
+def recorded_realpath(t):
+    """The realpath registration stored, or None for a target registered without one.
+
+    Registration always records it now (scan and `add` both write `realpath`), so a target
+    without one predates that: the drift test is skipped rather than faked, and the
+    absence is named instead of being papered over with a tautology.
+    """
+    return t.get("realpath") or (t.get("registered_from_scan") or {}).get("realpath")
+
+
 def _structural(t):
-    """The recorded path, re-resolved, must equal the recorded realpath."""
+    """The recorded path, re-resolved now, must equal the realpath registration recorded.
+
+    A path component that turned symlink after registration re-resolves somewhere else,
+    which is an identity fact about the environment, not a detail of string handling.
+    """
     path = t.get("path")
     if not path:
         return ("absent", "no recorded path")
     venv = Path(path)
     if not (venv / "pyvenv.cfg").is_file():
         return ("absent", "no pyvenv.cfg")
-    if os.path.realpath(path) != os.path.realpath(t.get("path")):
-        return ("absent", "path no longer resolves to itself")
+    recorded = t.get("realpath") or (t.get("registered_from_scan") or {}).get("realpath")
+    live = os.path.realpath(path)
+    if recorded and os.path.normcase(live) != os.path.normcase(recorded):
+        return ("absent", "path now resolves to %s, not the recorded %s" % (live, recorded))
     return ("present", str(venv))
 
 
@@ -161,6 +177,24 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                 before = probe.witness(t["path"])
                 findings, warnings = [], []
                 complete_advisories = _osv(packages, store, request, findings, warnings)
+                updates, update_error = [], None
+                try:
+                    updates = _outdated(t, runner, _index_options(t))
+                except Error as exc:
+                    update_error = str(exc)
+                    warnings.append(update_error)
+                try:
+                    for entry in _consistency(t, runner):
+                        findings.append({"key": digest(["consistency", t["name"], entry]),
+                                         "package": t["name"],
+                                         "installed": _version_of(packages, t["name"]),
+                                         "advisory": "dependency-inconsistent",
+                                         "state": "unknown", "fix_versions": [entry],
+                                         "reason": entry, "url": ""})
+                except Error as exc:
+                    complete_advisories = False
+                    warnings.append(str(exc))
+                launcher_rows = _launchers(t)
                 # (c5) closing read: the venv that is reported is the venv that was read
                 after = probe.witness(t["path"])
                 witness_ok = _witness_equal(before, after)
@@ -177,7 +211,21 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                                     {"detail": "%s is out of service; nothing published" % t["name"]})
                         raise Error("%s is out of service; nothing published. Resolve the "
                                     "duplicate or re-check once the venv returns" % t["name"])
-                    report = _report(t, packages, findings, warnings, complete_advisories, now)
+                    for row in launcher_rows:
+                        if row["status"] == "ok":
+                            continue
+                        warnings.append("launcher %s: %s" % (row["script"], row["detail"]))
+                        if row["status"] == "broken":
+                            findings.append({"key": digest(["launcher", t["name"], row["script"]]),
+                                             "package": t["name"],
+                                             "installed": _version_of(packages, t["name"]),
+                                             "advisory": "launcher:" + row["script"],
+                                             "state": "unknown", "fix_versions": [],
+                                             "reason": row["detail"], "url": ""})
+                    report = _report(
+                        t, packages, findings, warnings, complete_advisories, now,
+                        [{"package": c["name"], "candidate": c["version"]} for c in updates],
+                        update_error)
                     next_state = lifecycle.next_state(row, event, previous=previous_event(store, t),
                                                       co_claimant=bool(twins))
                     _apply_state(store, t, row, next_state, event, recovering)
@@ -222,13 +270,52 @@ def _apply_state(store, t, row, next_state, event, recovering):
                     {**event, "from": row["state"], "to": next_state})
 
 
-def _report(t, packages, findings, warnings, advisories_ok, now):
+def _version_of(packages, name):
+    for package in packages:
+        if package["name"] == name:
+            return package["version"]
+    return None
+
+
+def _index_options(t):
+    """The venv's recorded index options, read live; empty when it records none."""
+    seen = userlane.describe(t["path"]) or {}
+    return seen.get("index_options") or []
+
+
+def _launchers(t):
+    """Check the launchers where the manager exposed them, and in the venv's own bin."""
+    seen = userlane.describe(t["path"]) or {}
+    directories = [seen.get("bin_dir"), str(Path(t["path"]) / "bin")]
+    rows, index = [], {}
+    for directory in [d for d in directories if d]:
+        try:
+            for row in pins.launchers(t["path"], directory, t["name"]):
+                existing = index.get(row["script"])
+                # A real verdict beats "missing" from the other directory: the manager
+                # may expose its scripts somewhere other than the venv's own bin.
+                if existing is not None and not (existing["status"] == "broken"
+                                                 and existing["detail"] == "missing"):
+                    continue
+                if existing is None:
+                    index[row["script"]] = row
+                    rows.append(row)
+                else:
+                    rows[rows.index(existing)] = row
+                    index[row["script"]] = row
+        except (Error, OSError) as exc:
+            rows.append({"script": "*", "status": "lead",
+                         "detail": "launcher check failed: %s" % exc})
+    return rows
+
+
+def _report(t, packages, findings, warnings, advisories_ok, now, updates=(), update_error=None):
     return {"target": t, "at": now, "packages": packages, "findings": findings,
-            "updates": [], "warnings": warnings, "advisory_check_ok": advisories_ok,
+            "updates": list(updates or []), "warnings": warnings, "advisory_check_ok": advisories_ok,
             "evidence": [{"source": sources.OSV, "coverage": {
                 "complete": advisories_ok, "scanner": False,
                 "note": "OSV exact-version queries against the venv's own inventory"}}],
-            "update_error": None, "coverage": None, "matcher_revision": 1}
+            "update_error": update_error, "coverage": None, "matcher_revision": 1}
 
 
 def fingerprint():
@@ -259,9 +346,6 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         raise Error("Target is removed; nothing to preview")
     if row["state"] in lifecycle.OUT_OF_SERVICE:
         raise Error("%s is %s; run a check that clears it first" % (t["name"], row["state"]))
-    if row["state"] == "not_bindable":
-        raise Error("%s has no usable probe token; apply is refused until one is recovered"
-                    % t["name"])
     struct, detail = _structural(t)
     if struct != "present":
         raise Error("Recorded path is missing (%s); nothing to preview" % detail)
@@ -271,12 +355,13 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     published, token = probe.publish(t["path"])
     if published == "failed":
         raise Error("Could not write a probe token into %s" % t["path"])
+    seen = userlane.describe(t["path"]) or {}
+    index_options = seen.get("index_options") or []
     first = fingerprint()
-    outdated = _outdated(t, runner)
+    outdated = _outdated(t, runner, index_options)
     second = fingerprint()
     if first != second:
         raise Error("Configuration changed while candidates were resolved; nothing saved")
-    seen = userlane.describe(t["path"]) or {}
     result = pins.derive(t["path"], packages, outdated,
                          extras=seen.get("extras") or [], tool=t["name"])
     if not result["pins"]:
@@ -294,7 +379,10 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
             "index_options": seen.get("index_options") or [],
             "token": token, "fingerprint": first,
             "consistency_baseline": baseline, "origins": approved_origins,
-            "constraints": constraints, "inventory_digest": digest(packages),
+            "constraints": constraints,
+            "inventory_digest": inventory_digest(t["path"], packages),
+            "marker_env": marker_env(t),
+            "index_digest": digest(index_options),
             "expires_at": now + 3600, "leads": result["leads"]}
     body["commands_redacted"] = [pins.redacted(argv) for argv in body["commands"]]
     with store.transaction():
@@ -312,9 +400,10 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     return {"id": plan_id, "status": "proposed", **body}
 
 
-def _outdated(t, runner):
+def _outdated(t, runner, index_options=None):
     argv = ["uv", "pip", "list", "--outdated", "--format", "json",
             "--python", str(Path(t["path"]) / "bin" / "python")]
+    argv.extend(index_options or ())
     try:
         data = json.loads(runner(argv))
     except (Error, ValueError) as exc:
@@ -338,6 +427,51 @@ def _write_constraints(state_dir, plan_pins, index_options):
     body = "\n".join(pins.pin_text(pin) for pin in plan_pins) + "\n"
     path.write_text(body)
     return {"path": str(path), "digest": digest(body), "bytes": body}
+
+
+def inventory_digest(venv, packages):
+    """Versions plus the bytes that describe them: a same-version reinstall still differs.
+
+    A version-only digest misses a same-version reinstall with different dependency
+    metadata or a changed origin, which is exactly the swap an approval must not survive.
+    """
+    import hashlib
+    rows = []
+    for package in sorted(packages, key=lambda p: p["name"]):
+        entry = [package["name"], package["version"]]
+        for name, filename in (("metadata", "METADATA"), ("origin", "direct_url.json")):
+            path = _dist_file(venv, package["name"], filename)
+            if path is None:
+                entry.append([name, None])
+                continue
+            try:
+                entry.append([name, hashlib.sha256(path.read_bytes()).hexdigest()])
+            except OSError:
+                entry.append([name, "unreadable"])
+        rows.append(entry)
+    return digest(rows)
+
+
+def _dist_file(venv, name, filename):
+    wanted = name.lower().replace("_", "-").replace(".", "-")
+    for site in sorted(Path(venv).glob("lib/python*/site-packages")):
+        for dist in site.glob("*.dist-info"):
+            if dist.name.lower().replace("_", "-").split("-")[0] == wanted:
+                path = dist / filename
+                return path if path.is_file() else None
+    return None
+
+
+def marker_env(t):
+    """The interpreter's own marker values, read with `-I -S` so no site code runs."""
+    argv = [str(Path(t["path"]) / "bin" / "python"), "-I", "-S", "-c",
+            "import json,sys;print(json.dumps({'prefix':sys.prefix,"
+            "'base_prefix':sys.base_prefix,'version':sys.version.split()[0],"
+            "'implementation':sys.implementation.name}))"]
+    try:
+        return json.loads(adapters.run(LOCAL, argv, timeout=60))
+    except (Error, ValueError, KeyError) as exc:
+        raise Error("Could not read the interpreter's marker values: %s" % exc) from exc
 
 
 def _consistency(t, runner):
@@ -443,8 +577,17 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     status, token = probe.read(t["path"])
     if status != "usable" or token != body["token"]:
         raise Error("The environment's probe changed since this preview; approval is stale")
-    if digest(packages) != body["inventory_digest"]:
-        raise Error("Installed versions changed since this preview; approval is stale")
+    if inventory_digest(t["path"], packages) != body["inventory_digest"]:
+        raise Error("Installed versions or metadata changed since this preview; "
+                    "approval is stale")
+    if marker_env(t) != body.get("marker_env"):
+        raise Error("The interpreter changed since this preview (a Python update is a "
+                    "stale approval); create a new one")
+    if (userlane.describe(t["path"]) or {}).get("extras") != body.get("extras"):
+        raise Error("The requested extras changed since this preview; create a new one")
+    if digest(_index_options(t)) != body.get("index_digest"):
+        raise Error("The recorded index options changed since this preview; "
+                    "approval is stale")
     if probe.read(t["path"]) != (status, token):
         raise Error("The environment changed while it was being verified; nothing applied")
 
@@ -457,12 +600,24 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     # (5) verified temp copy, so what runs is the bytes that were approved
     state_dir = constraints_path.parent
     temp = state_dir / ("apply-%s-%s.tmp" % (now, secrets.token_hex(4)))
-    temp.write_text(body["constraints"]["bytes"])
+    handle = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(handle, "w") as stream:
+        stream.write(body["constraints"]["bytes"])
 
     # claim: everything above re-checked once more, under the write lock
+    before_records = _record_mismatches(t["path"])
     with store.transaction():
         if stored_state(store, t) != state:
             raise Error("Target changed under us; nothing applied")
+        if fingerprint() != body["fingerprint"]:
+            raise Error("Configuration changed during preflight; approval is stale")
+        if _structural(t)[0] != "present":
+            raise Error("The recorded path stopped resolving to the recorded realpath; "
+                        "nothing applied")
+        if co_claimants(store, t):
+            raise Error("Another target began tracking this venv; nothing applied")
+        if probe.read(t["path"]) != (status, token):
+            raise Error("The probe changed during preflight; nothing applied")
         updated = store.db.execute(
             "UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (plan_id,))
         if updated.rowcount != 1:
@@ -527,9 +682,12 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     else:
         unchanged = (after_token == (status, token)
                      and after_packages is not None
-                     and digest(after_packages) == body["inventory_digest"]
+                     and inventory_digest(t["path"], after_packages) == body["inventory_digest"]
                      and after_consistency == body["consistency_baseline"])
-        damage = _record_mismatches(t["path"]) if unchanged else []
+        # Only damage this install introduced counts: a venv that already disagreed with
+        # its RECORD is baseline evidence, exactly as a pre-existing consistency conflict is.
+        damage = ([row for row in _record_mismatches(t["path"]) if row not in before_records]
+                  if unchanged else [])
         if unchanged and not damage:
             outcome = "failed_no_change"
         else:

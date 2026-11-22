@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -26,8 +27,11 @@ def write_record(site: Path, dist: Path, name: str):
 
 
 def build(root: Path, name="tool"):
+    import sys
     venv = root / "tools" / name
-    venv.mkdir(parents=True)
+    (venv / "bin").mkdir(parents=True)
+    # A real interpreter symlink: preview and apply read its `-I -S` marker values.
+    (venv / "bin" / "python").symlink_to(sys.executable)
     (venv / "pyvenv.cfg").write_text("")
     (venv / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
     dist = venv / "lib" / "python3.12" / "site-packages" / ("%s-1.0.dist-info" % name)
@@ -150,12 +154,13 @@ class PreviewTests(VenvCase):
                              request=self.no_network, state_dir=self.root / "state")
         self.assertIn("unresolved_path", str(caught.exception))
 
-    def test_preview_refuses_a_not_bindable_target(self):
+    def test_preview_recovers_a_not_bindable_target(self):
+        """Recovering the token is what preview is for: it must not gate on not_bindable."""
         self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
-        with self.assertRaises(Exception) as caught:
-            venvflow.preview(self.store, self.t, runner=runner_for("tool"),
-                             request=self.no_network, state_dir=self.root / "state")
-        self.assertIn("probe token", str(caught.exception))
+        result = venvflow.preview(self.store, self.t, runner=runner_for("tool"),
+                                  request=self.no_network, state_dir=self.root / "state")
+        self.assertEqual(result["status"], "proposed")
+        self.assertEqual(probe.read(self.venv)[0], "usable")
 
     def test_preview_refuses_when_no_upgrade_respects_the_bounds(self):
         with self.assertRaises(Exception) as caught:
@@ -320,3 +325,64 @@ class ApplyClassificationTests(ApplyCase):
         self.apply()
         status = self.store.db.execute("SELECT status FROM plans WHERE id=?", (sibling,)).fetchone()[0]
         self.assertEqual(status, "stale")
+
+
+class CheckShowsDriftTests(VenvCase):
+    """The headline complaint: check must show that an upgrade exists."""
+
+    def test_check_reports_available_updates(self):
+        report = venvflow.check(self.store, self.t, runner=runner_for("tool"),
+                                request=self.no_network)
+        self.assertEqual([u["package"] for u in report["updates"]], ["tool"])
+        self.assertEqual(report["updates"][0]["candidate"], "2.0")
+
+    def test_check_records_an_update_error_instead_of_pretending_there_is_none(self):
+        def broken(argv, **kw):
+            if "--outdated" in argv:
+                raise venvflow.Error("Command failed: uv pip list --outdated (exit 1)")
+            return json.dumps([{"name": "tool", "version": "1.0"}])
+        report = venvflow.check(self.store, self.t, runner=broken, request=self.no_network)
+        self.assertEqual(report["updates"], [])
+        self.assertIn("outdated", (report["update_error"] or "").lower())
+
+    def test_check_reports_a_broken_launcher(self):
+        import sys
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        dist = next(site.glob("tool-*.dist-info"))
+        (dist / "entry_points.txt").write_text("[console_scripts]\ntool = tool.cli:main\n")
+        script = self.venv / "bin" / "tool"
+        script.write_text("#!/bin/sh\n'''exec' /usr/bin/python3 \"$0\" \"$@\"\n' '''\n")
+        report = venvflow.check(self.store, self.t, runner=runner_for("tool"),
+                                request=self.no_network)
+        reasons = [f["reason"] for f in report["findings"] if f["advisory"].startswith("launcher")]
+        self.assertTrue(reasons, report["findings"])
+        self.assertIn("outside", reasons[0])
+
+
+class StructuralDriftTests(VenvCase):
+    def test_a_path_component_that_turned_symlink_is_caught(self):
+        real = self.root / "elsewhere"
+        real.mkdir()
+        (real / "pyvenv.cfg").write_text("")
+        self.store.add_target("uvtool", {"name": "drifted", "kind": "uvtool", "host": "local",
+                                         "path": str(self.venv), "realpath": str(self.venv)})
+        drifted = self.root / "alias"
+        os.symlink(real, drifted)
+        target = self.store.target("drifted")
+        target["path"] = str(drifted)
+        self.store.db.execute("UPDATE targets SET body=? WHERE name='drifted'",
+                              (json.dumps(target),))
+        with self.assertRaises(Exception) as caught:
+            venvflow.check(self.store, self.store.target("drifted"),
+                           runner=runner_for("drifted"), request=self.no_network)
+        self.assertIn("resolves to", str(caught.exception))
+
+
+class PreExistingDamageTests(ApplyCase):
+    def test_a_pre_existing_record_mismatch_does_not_block_a_retry(self):
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        (site / "tool.py").write_text("VERSION = 'patched-by-hand'\n")
+        self.fail_install = "Command failed: uv pip install (exit 1)"
+        result = self.apply()
+        self.assertEqual(result["status"], "failed_no_change", result)
+        self.assertEqual(self.plan_status(), "proposed")

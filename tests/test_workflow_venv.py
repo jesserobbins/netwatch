@@ -181,3 +181,46 @@ class ApplyRefusesASharedVenvTests(unittest.TestCase):
             ("ruff", int(time.time()), "proposed", canonical(body))).lastrowid
         with self.assertRaises(Exception):
             workflow.apply(self.store, plan_id, yes=True)
+
+
+class ResolveStalingTests(unittest.TestCase):
+    """A crashed venv install may have changed what a twin target's plan observed."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.store = store_module.Store(self.root / "state.db")
+        self.a, self.b = two_spellings(self.root)
+        self.store.add_target("uvtool", {"name": "ruff", "kind": "uvtool", "host": "local",
+                                         "path": self.a, "realpath": self.a})
+        self.store.add_target("uvtool", {"name": "twin", "kind": "uvtool", "host": "local",
+                                         "path": self.b, "realpath": self.b})
+
+    def tearDown(self):
+        self.store.close()
+
+    def plan(self, target, status="proposed", path=None):
+        body = {"target": {"name": target, "path": path or self.a}, "commands": [["true"]],
+                "expires_at": int(time.time()) + 3600}
+        return self.store.db.execute(
+            "INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
+            (target, int(time.time()), status, canonical(body))).lastrowid
+
+    def status(self, plan_id):
+        return self.store.db.execute("SELECT status FROM plans WHERE id=?", (plan_id,)).fetchone()[0]
+
+    def test_resolve_stales_a_sibling_plan_on_the_same_venv(self):
+        crashed = self.plan("ruff", status="needs_attention")
+        twin = self.plan("twin")
+        workflow.resolve(self.store, crashed, "inspected; no process running")
+        self.assertEqual(self.status(crashed), "resolved")
+        self.assertEqual(self.status(twin), "stale")
+
+    def test_resolve_leaves_an_unrelated_targets_plan_alone(self):
+        other = self.root / "elsewhere"
+        other.mkdir()
+        self.store.add_target("uvtool", {"name": "other", "kind": "uvtool", "host": "local",
+                                         "path": str(other), "realpath": str(other)})
+        crashed = self.plan("ruff", status="needs_attention")
+        unrelated = self.plan("other", path=str(other))
+        workflow.resolve(self.store, crashed, "inspected")
+        self.assertEqual(self.status(unrelated), "proposed")
