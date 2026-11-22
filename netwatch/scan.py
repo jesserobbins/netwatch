@@ -326,6 +326,20 @@ def register(store, root, indices, *, run_id=None, runner=None):
                 if other["name"] != row["name"] and workflow.same_venv(other["path"], row["realpath"]):
                     raise Error("%s already tracks this venv as %s; remove that target first"
                                 % (other["name"], other["kind"]))
+            # A live target already holding this name is a different registration: suffix
+            # rather than rebind it. A removed row is revived in place, which add_target does.
+            live = {r["name"]: r for r in store.target_rows() if not r["removed"]}
+            wanted, suffix = row["name"], 2
+            while wanted in live and not workflow.same_venv(live[wanted].get("path"),
+                                                           row["realpath"]):
+                wanted = "%s-%d" % (row["name"], suffix)
+                suffix += 1
+            if wanted != row["name"]:
+                taken = row["name"]
+                row["name"] = wanted
+                registered_note = "suffixed: %s is already tracked by another target" % taken
+            else:
+                registered_note = None
             body = {"name": row["name"], "kind": row["kind"], "host": "local",
                     "path": row["realpath"], "realpath": row["realpath"],
                     "bin_dir": row["bin_dir"], "extras": row["extras"],
@@ -335,7 +349,8 @@ def register(store, root, indices, *, run_id=None, runner=None):
                                             "st_dev": row["st_dev"], "st_ino": row["st_ino"]}}
             store.add_target(row["kind"], body)
             store.event(row["name"], "registered", body)
-            registered.append({"name": row["name"], "kind": row["kind"],
+            registered.append({"note": registered_note,
+                               "name": row["name"], "kind": row["kind"],
                                "path": row["realpath"], "extras": row["extras"]})
     return {"run": run, "registered": registered,
             "summary": "registered %d target%s from scan run %d"

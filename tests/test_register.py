@@ -343,3 +343,54 @@ class PipxIndexTranslationTests(unittest.TestCase):
                     self.assertNotIn("secret", value, table)
         finally:
             store.close()
+
+
+class RegisterNameCollisionTests(unittest.TestCase):
+    """A live target keeps its name: a second, different venv of the same tool is suffixed."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.state = self.root / "state.db"
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        self.runner = listing([("ruff", "1.0")])
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def run_scan(self):
+        store = store_module.Store(self.state)
+        try:
+            return scan.run(store, self.root, handles=set(),
+                            request=lambda u, b=None: {"vulns": []})
+        finally:
+            store.close()
+
+    def register(self, indices, run_id=None):
+        store = store_module.Store(self.state)
+        try:
+            return scan.register(store, self.root, indices, run_id=run_id,
+                                 runner=self.runner)
+        finally:
+            store.close()
+
+    def test_a_taken_name_is_suffixed_rather_than_rebinding_the_live_target(self):
+        venv_with(self.tools, "ruff-a", receipt="uv-receipt.toml")
+        first = self.run_scan()
+        self.assertEqual(self.register([1], run_id=first["run"])["registered"][0]["name"], "ruff")
+
+        # a second, different venv whose receipt also names "ruff"
+        venv_with(self.tools, "ruff-b", receipt="uv-receipt.toml")
+        second = self.run_scan()
+        result = self.register([2], run_id=second["run"])
+        self.assertEqual(result["registered"][0]["name"], "ruff-2")
+        self.assertIn("already tracked", result["registered"][0]["note"] or "")
+
+        store = store_module.Store(self.state)
+        try:
+            paths = {t["name"]: os.path.realpath(t["path"]) for t in store.targets()}
+            self.assertIn("ruff", paths)
+            self.assertIn("ruff-2", paths)
+            self.assertNotEqual(paths["ruff"], paths["ruff-2"])
+        finally:
+            store.close()
