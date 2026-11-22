@@ -77,7 +77,14 @@ def status(store, t):
                             (t["name"],)).fetchone()
     report = store.latest(t["name"])
     pending = [dict(r) for r in store.db.execute("SELECT id,status,at FROM plans WHERE target=? AND status IN ('proposed','running','needs_attention') ORDER BY id", (t["name"],))]
-    return {"target": t, "last_attempt": dict(last) if last else None, "report": report, "pending_updates": pending}
+    lifecycle = store.db.execute(
+        "SELECT state, generation, state_seq, removed FROM targets WHERE name=?",
+        (t["name"],)).fetchone()
+    return {"target": t, "last_attempt": dict(last) if last else None, "report": report,
+            "pending_updates": pending,
+            "state": lifecycle["state"] if lifecycle else None,
+            "generation": int(lifecycle["generation"] or 1) if lifecycle else None,
+            "removed": int(lifecycle["removed"] or 0) if lifecycle else 0}
 
 
 WRITE_COMMANDS = {"add", "check", "preview", "apply", "resolve", "scan", "report", "targets"}
@@ -238,6 +245,18 @@ def display(result, json_output=False, show_all=False):
             emit("  Error: " + safe(item["error"]), "bold red")
         if (item.get("last_attempt") or {}).get("kind") == "collection_failed":
             emit("  Collection failed; showing the previous report.", "bold red")
+        if item.get("removed"):
+            emit("  Retired; history retained. Re-register to track it again.", "yellow")
+        state = item.get("state")
+        if state and state != "live":
+            detail = {"not_bindable": "no usable probe token: delete "
+                                      + safe(str(Path(t.get('path') or '') / ".netwatch-probe"))
+                                      + " and re-run check (it is safe)",
+                      "unresolved_path": "the recorded path is gone; restore it or "
+                                         "netwatch targets remove " + safe(t["name"]),
+                      "identity_mismatch": "the venv no longer names this tool; inspect it, "
+                                           "then re-register or remove the target"}.get(state, "")
+            emit("  State: " + safe(state) + (" — " + detail if detail else ""), "bold yellow")
         if not report:
             emit("  No inventory collected. Run netwatch check " + safe(t["name"]), "yellow")
             continue
