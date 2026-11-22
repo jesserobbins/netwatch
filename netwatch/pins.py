@@ -156,8 +156,11 @@ def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None, envi
                         environment_for() if requirement.marker is not None else None):
                     continue
                 constraints.setdefault(requirement.name.lower(), []).append(requirement)
-                if name not in selected:
-                    in_force[_constraint_line(requirement)] = name
+                # Keep who imposed the bound: a bound from a distribution that is itself
+                # being replaced describes the version being left behind, so it must not
+                # reach the installer.
+                in_force[_constraint_line(requirement)] = {"requirer": name,
+                                                           "package": requirement.name.lower()}
         chosen, blocked = {}, set()
         for candidate in supplied:
             name = candidate["name"]
@@ -198,9 +201,9 @@ def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None, envi
             "blocked": sorted(blocked),
             # The same bounds the selection used: an install that is only *selected* under
             # them is not constrained by them, and uv would resolve past them.
-            "constraints": sorted(line for line in in_force
-                                  if not any(pin["name"].lower() == in_force[line].lower()
-                                             for pin in pins))}
+            "constraints": sorted(line for line, source in in_force.items()
+                                  if source["requirer"].lower()
+                                  not in {pin["name"].lower() for pin in pins})}
 
 
 def _constraint_line(requirement):

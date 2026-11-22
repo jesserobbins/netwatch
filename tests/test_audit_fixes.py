@@ -287,3 +287,25 @@ class DefaultStateDirTests(unittest.TestCase):
         finally:
             store.close()
             shutil.rmtree(root, ignore_errors=True)
+
+
+class ConstraintSourceTests(Base):
+    def test_a_bound_from_a_distribution_being_replaced_is_not_written(self):
+        """Its bound describes the version being left behind, not the one being installed."""
+        requiring = dist_dir(self.venv, "tool")          # the tool is itself the requirer
+        (requiring / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: tool\nVersion: 1.0\nRequires-Dist: other<2\n")
+        listing = [{"name": "tool", "version": "1.0"}]
+
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0", "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps(listing)
+
+        result = venvflow.preview(self.store, self.t, runner=run,
+                                  request=self.no_network, state_dir=self.state)
+        body = Path(result["constraints"]["path"]).read_text()
+        self.assertIn("tool==2.0", body)
+        self.assertNotIn("other<2", body)
