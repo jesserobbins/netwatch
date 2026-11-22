@@ -901,3 +901,30 @@ class MalformedProbePreviewTests(Base):
                                  request=self.no_network, state_dir=self.state)
         after = set((self.state / "constraints").glob("preview-*.txt"))
         self.assertEqual(after - before, set(), "a failed save must delete its artifact")
+
+
+class IdentityReportTests(Base):
+    def test_an_identity_failure_names_what_the_metadata_says(self):
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "somethingelse" }]\nentrypoints = []\n')
+        with self.assertRaises(Exception) as caught:
+            venvflow.check(self.store, self.t, runner=self.runner(),
+                           request=self.no_network)
+        self.assertIn("somethingelse", str(caught.exception))
+        events = [json.loads(r[0]) for r in self.store.db.execute(
+            "SELECT body FROM events WHERE target='tool' ORDER BY id DESC LIMIT 1")]
+        self.assertIn("somethingelse", json.dumps(events))
+
+
+class ApplyNotBindableTests(Base):
+    def test_apply_refuses_a_stored_not_bindable_target(self):
+        probe.publish(self.venv)
+        plan = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                request=self.no_network, state_dir=self.state)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, plan["id"], yes=True, runner=self.runner(),
+                           request=self.no_network)
+        self.assertIn("not_bindable", str(caught.exception))
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0], "proposed")

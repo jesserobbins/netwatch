@@ -186,11 +186,16 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
         event["token"] = status
         identity, source, payload = _identity(t, runner)
         event["identity"], event["identity_input"] = identity, source
+        # What the metadata actually says, so the operator is told the fact and not just the
+        # verdict; the (c3) re-read below updates it too.
+        identity_detail = str(payload) if identity == "failed" else ""
         if identity != "ok":
             # An unreadable input is recorded, counted and reported: the check ran to its
             # end and found nothing readable, so this event is complete. Marking it
             # incomplete would forbid the two-in-a-row rule from ever firing.
             event["complete"] = True
+            if identity == "failed" and payload:
+                detail = str(payload)
         if identity == "ok":
             recovering = lifecycle.recovery_candidate(row) and not twins
             # (c2) publication, then (c3) the re-read, only when identity passed. A
@@ -204,6 +209,8 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
             again, source2, payload2 = _identity(t, runner)
             if again != "ok":
                 event["identity"], event["identity_input"] = again, source2
+                if again == "failed":
+                    identity_detail = str(payload2)
                 event["complete"] = False
             else:
                 # (c4) inventory and the rest of the observation
@@ -262,6 +269,8 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                                 "advisory": "launcher:" + launcher["script"],
                                 "state": "unknown", "fix_versions": [],
                                 "reason": launcher["detail"], "url": ""})
+                    if event.get("identity") == "failed":
+                        warnings.append("%s: %s" % (t["name"], identity_detail))
                     if event.get("token") in ("malformed", "write_failed") or (
                             row["state"] == "not_bindable" and event.get("token") != "usable"):
                         warnings.append(
@@ -339,14 +348,24 @@ def _launchers(t):
     """Verify the launchers the *manager* recorded as exposed.
 
     uv's receipt and pipx's metadata name the scripts a tool exposes and where they were
-    installed; that is the list that must be present, because a native binary tool has no
+    installed; that is the list that must be present, because a native-binary tool has no
     `entry_points.txt` at all and would otherwise silently pass with nothing checked.
+
+    The entry-point verification runs **once**; the exposed list only decides which scripts
+    are expected and where. Looping it would verify the whole set once per script.
     """
     seen = userlane.describe(t["path"]) or {}
-    # The check uses the bin directory registration recorded: a later environment change
-    # does not re-point what this target is expected to expose.
+    # The check uses the bin directory registration recorded, and the path as the operator
+    # wrote it, so a launcher naming the alias is not called "outside".
     bin_dir = t.get("bin_dir") or seen.get("bin_dir") or str(Path(t["path"]) / "bin")
+    written = (t.get("registered_from_scan") or {}).get("path_as_written")
     exposed = seen.get("exposed") or []
+    try:
+        checked = {row["script"]: row for row in
+                   pins.launchers(t["path"], str(bin_dir), t["name"], as_written=written)}
+    except (Error, OSError) as exc:
+        return [{"script": "*", "status": "lead",
+                 "detail": "launcher check failed: %s" % exc}]
     rows = []
     for item in exposed:
         script = item.get("script")
@@ -355,21 +374,24 @@ def _launchers(t):
             rows.append({"script": script, "status": "broken",
                          "detail": "exposed launcher is missing at %s" % path})
             continue
+        row = checked.get(script)
+        if row is not None:
+            rows.append(row)
+            continue
         try:
-            head = path.open("rb").read(2)
-            text = path.read_text(errors="replace") if head == b"#!" else None
+            is_script = path.open("rb").read(2) == b"#!"
         except OSError as exc:
             rows.append({"script": script, "status": "broken",
                          "detail": "unreadable: %s" % exc})
             continue
-        if text is None:
-            # A native binary: present and executable is all that can be verified without
-            # running it, and the report says so rather than implying it was checked.
+        if is_script:
+            rows.append({"script": script, "status": "lead",
+                         "detail": "script at %s declares no entry point in the "
+                                   "distribution's metadata" % path})
+        else:
             rows.append({"script": script, "status": "not-verifiable",
                          "detail": "native binary in %s; presence checked, entry point not "
                                    "verifiable" % path.parent})
-            continue
-        rows.extend(pins.launchers(t["path"], str(path.parent), t["name"]))
     return rows
 
 

@@ -277,7 +277,7 @@ def _inside(path, roots):
     return False
 
 
-def launchers(venv, bin_dir, name):
+def launchers(venv, bin_dir, name, as_written=None):
     """Check the console scripts: still there, still ours, still inside this venv.
 
     A wrapper written by uv or pip may be a plain script or a `#!/bin/sh` trampoline; the
@@ -285,7 +285,11 @@ def launchers(venv, bin_dir, name):
     """
     # Containment is checked against both spellings registration records: the realpath
     # targets and locks use, and the path as the operator wrote it.
+    # Both spellings registration records: the realpath, and the path as the operator wrote
+    # it (a launcher may legitimately name the home-directory alias).
     roots = [os.path.realpath(venv), str(venv)]
+    if as_written and str(as_written) not in roots:
+        roots.append(str(as_written))
     reported = []
     for script, target in sorted(entry_points(venv, name).items()):
         path = Path(bin_dir) / script

@@ -191,8 +191,11 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
     """
     from . import sources
     request = request or sources.fetch
-    root = Path(root).expanduser().resolve()
-    items = list(walk(root, depth=depth, excludes=excludes))
+    spelling = Path(root).expanduser()
+    root = spelling.resolve()          # run identity is normalized
+    # the walk keeps the operator's spelling, so a launcher naming an alias of the same
+    # directory can be recognised as inside the venv
+    items = list(walk(spelling, depth=depth, excludes=excludes))
     ordinals = {USER: 0, REPO: 0, UNCLASSIFIED: 0}
     rows, written, skipped, incomplete = [], [], [], []
     for item in items:
@@ -231,7 +234,7 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
                     incomplete.append({"path": str(item.path), "reasons": why})
             else:
                 skipped.append({"path": str(item.path), "reason": "not an owned repo"})
-        rows.append((item.lane, ordinals[item.lane], str(item.path), detail))
+        rows.append((item.lane, ordinals[item.lane], str(Path(item.path).absolute()), detail))
     counts = {lane: n for lane, n in ordinals.items() if n}
     run_id = store.scan_run(str(root), counts)
     for lane, ordinal, path, detail in rows:
