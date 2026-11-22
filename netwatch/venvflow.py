@@ -618,6 +618,15 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
             raise Error("Another target began tracking this venv; nothing applied")
         if probe.read(t["path"]) != (status, token):
             raise Error("The probe changed during preflight; nothing applied")
+        # The last check before any command starts: the inputs the approval named must
+        # still be the inputs this run would use.
+        if digest(_index_options(t)) != body.get("index_digest"):
+            raise Error("The recorded index options changed during preflight; "
+                        "approval is stale")
+        if marker_env(t) != body.get("marker_env"):
+            raise Error("The interpreter changed during preflight; approval is stale")
+        if (userlane.describe(t["path"]) or {}).get("extras") != body.get("extras"):
+            raise Error("The requested extras changed during preflight; approval is stale")
         updated = store.db.execute(
             "UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (plan_id,))
         if updated.rowcount != 1:
