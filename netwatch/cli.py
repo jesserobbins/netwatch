@@ -26,7 +26,7 @@ def parser():
     commands = p.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="register one OS, environment or project; does not connect")
     add.add_argument("name")
-    add.add_argument("kind", choices=adapters.KINDS)
+    add.add_argument("kind", choices=adapters.KINDS + adapters.VENV_KINDS)
     add.add_argument("--host", default="local", help="local or a configured SSH alias/user@host")
     add.add_argument("--path", help="absolute conda prefix or uv/npm project directory")
     commands.add_parser("list", help="list explicitly registered environments")

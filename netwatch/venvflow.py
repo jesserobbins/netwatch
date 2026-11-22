@@ -243,6 +243,10 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                     for launcher in launcher_rows:
                         if launcher["status"] == "ok":
                             continue
+                        if launcher["status"] == "not-verifiable":
+                            warnings.append("launcher not entry-point-verifiable: %s (%s)"
+                                            % (launcher["script"], launcher["detail"]))
+                            continue
                         warnings.append("launcher %s: %s"
                                         % (launcher["script"], launcher["detail"]))
                         if launcher["status"] == "broken":
@@ -253,6 +257,12 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                                 "advisory": "launcher:" + launcher["script"],
                                 "state": "unknown", "fix_versions": [],
                                 "reason": launcher["detail"], "url": ""})
+                    if event.get("token") in ("malformed", "write_failed") or (
+                            row["state"] == "not_bindable" and event.get("token") != "usable"):
+                        warnings.append(
+                            "no usable probe token in %s: delete %s and re-run check "
+                            "(it is safe; netwatch writes a fresh one)"
+                            % (t["path"], Path(t["path"]) / ".netwatch-probe"))
                     report = _report(
                         t, packages, findings, warnings, complete_advisories, now,
                         [{"package": c["name"], "candidate": c["version"]} for c in updates],
@@ -321,28 +331,40 @@ def _index_options_redacted(t):
 
 
 def _launchers(t):
-    """Check the launchers where the manager exposed them, and in the venv's own bin."""
+    """Verify the launchers the *manager* recorded as exposed.
+
+    uv's receipt and pipx's metadata name the scripts a tool exposes and where they were
+    installed; that is the list that must be present, because a native binary tool has no
+    `entry_points.txt` at all and would otherwise silently pass with nothing checked.
+    """
     seen = userlane.describe(t["path"]) or {}
-    directories = [seen.get("bin_dir"), str(Path(t["path"]) / "bin")]
-    rows, index = [], {}
-    for directory in [d for d in directories if d]:
+    # The check uses the bin directory registration recorded: a later environment change
+    # does not re-point what this target is expected to expose.
+    bin_dir = t.get("bin_dir") or seen.get("bin_dir") or str(Path(t["path"]) / "bin")
+    exposed = seen.get("exposed") or []
+    rows = []
+    for item in exposed:
+        script = item.get("script")
+        path = Path(item.get("path") or (Path(bin_dir) / script))
+        if not path.exists():
+            rows.append({"script": script, "status": "broken",
+                         "detail": "exposed launcher is missing at %s" % path})
+            continue
         try:
-            for row in pins.launchers(t["path"], directory, t["name"]):
-                existing = index.get(row["script"])
-                # A real verdict beats "missing" from the other directory: the manager
-                # may expose its scripts somewhere other than the venv's own bin.
-                if existing is not None and not (existing["status"] == "broken"
-                                                 and existing["detail"] == "missing"):
-                    continue
-                if existing is None:
-                    index[row["script"]] = row
-                    rows.append(row)
-                else:
-                    rows[rows.index(existing)] = row
-                    index[row["script"]] = row
-        except (Error, OSError) as exc:
-            rows.append({"script": "*", "status": "lead",
-                         "detail": "launcher check failed: %s" % exc})
+            head = path.open("rb").read(2)
+            text = path.read_text(errors="replace") if head == b"#!" else None
+        except OSError as exc:
+            rows.append({"script": script, "status": "broken",
+                         "detail": "unreadable: %s" % exc})
+            continue
+        if text is None:
+            # A native binary: present and executable is all that can be verified without
+            # running it, and the report says so rather than implying it was checked.
+            rows.append({"script": script, "status": "not-verifiable",
+                         "detail": "native binary in %s; presence checked, entry point not "
+                                   "verifiable" % path.parent})
+            continue
+        rows.extend(pins.launchers(t["path"], str(path.parent), t["name"]))
     return rows
 
 

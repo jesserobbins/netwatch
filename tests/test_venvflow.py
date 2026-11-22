@@ -353,6 +353,9 @@ class CheckShowsDriftTests(VenvCase):
         dist = next(site.glob("tool-*.dist-info"))
         (dist / "entry_points.txt").write_text("[console_scripts]\ntool = tool.cli:main\n")
         script = self.venv / "bin" / "tool"
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "tool" }]\nentrypoints = [\n'
+            '  { name = "tool", install-path = "%s", from = "tool" },\n]\n' % script)
         script.write_text("#!/bin/sh\n'''exec' /usr/bin/python3 \"$0\" \"$@\"\n' '''\n")
         report = venvflow.check(self.store, self.t, runner=runner_for("tool"),
                                 request=self.no_network)

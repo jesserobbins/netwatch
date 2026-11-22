@@ -82,13 +82,15 @@ def _uv_tool(venv: Path):
         raise Error("uv receipt names no requirement")
     main = requirements[0]
     extras = [e for e in (main.get("extras") or []) if isinstance(e, str)]
-    entry = (tool.get("entrypoints") or [{}])[0]
-    install_path = entry.get("install-path") if isinstance(entry, dict) else None
+    entries = [e for e in (tool.get("entrypoints") or []) if isinstance(e, dict)]
+    install_path = entries[0].get("install-path") if entries else None
     bin_dir = Path(install_path).parent if install_path else venv / "bin"
+    exposed = [{"script": e.get("name"), "path": e.get("install-path")}
+               for e in entries if e.get("name")]
     raw = _receipt_index_options(receipt)
     return {"kind": UVTOOL, "name": main.get("name"), "extras": extras,
-            "bin_dir": str(bin_dir), "index_options": raw,
-            "index_options_redacted": _redact(raw)}
+            "bin_dir": str(bin_dir), "exposed": exposed,
+            "index_options": raw, "index_options_redacted": _redact(raw)}
 
 
 PIP_CONFIG_PATHS = ("pip.conf", "pip/pip.conf", ".pip/pip.conf",
@@ -161,19 +163,18 @@ def _pipx(venv: Path):
     if "[" in spec and spec.rstrip().endswith("]"):
         extras = [e.strip() for e in spec[spec.index("[") + 1:spec.rindex("]")].split(",") if e.strip()]
     apps = main.get("app_paths") or []
-    # pipx exposes the apps it installed into its own bin directory and symlinks them
-    # there; the venv's bin is where the generated script lives, not where the operator's
-    # launcher does.
+    # pipx exposes the apps it installed into its own bin directory; the venv's bin holds
+    # the generated script, the operator's launcher is elsewhere.
     bin_dir = Path(os.environ.get("PIPX_BIN_DIR") or Path(os.path.expanduser("~/.local/bin")))
-    if apps and isinstance(apps[0], dict) and apps[0].get("__Path__"):
-        inside = Path(str(apps[0]["__Path__"]).replace("VENV", str(venv)))
-        if inside.parent != venv / "bin":
-            bin_dir = inside.parent
+    exposed = [{"script": Path(str(a["__Path__"])).name,
+                "path": str(bin_dir / Path(str(a["__Path__"])).name)}
+               for a in apps if isinstance(a, dict) and a.get("__Path__")]
     recorded = _pip_args_index_options(main.get("pip_args"))
     # pip_args only carry what pipx itself was told; pip's own configuration is what a
     # pip.conf-only install resolves against, so it is the fallback.
     raw = recorded or _pip_config_raw()
     return {"kind": PIPX, "name": name, "extras": extras, "bin_dir": str(bin_dir),
+            "exposed": exposed,
             "index_options": raw, "index_options_redacted": _redact(raw),
             "index_source": "pip_args" if recorded else "pip_config"}
 
