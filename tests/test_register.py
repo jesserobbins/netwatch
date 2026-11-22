@@ -221,19 +221,20 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(tuple(row), (0, 3))
         store.close()
 
-    def test_check_on_a_registered_but_unsupported_kind_reports_per_target(self):
-        """A stage-2 build holds targets whose kind lands later: say so, do not crash."""
+    def test_check_on_a_registered_venv_target_runs_the_venv_sequence(self):
+        """A registered uvtool target is now observable: check routes to the venv path."""
         self.scan()
         self.register([1])
         store = store_module.Store(self.state)
         try:
             args = cli.parser().parse_args(["check", "mlx-lm"])
-            result = cli.dispatch(args, store, None, None)
+            result = cli.dispatch(args, store, lambda t, argv, **kw: self.runner(argv),
+                                  None)
         finally:
             store.close()
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["error"], "kind not yet supported in this build")
-        self.assertIsNone(result[0]["report"])
+        self.assertIsNone(result[0].get("error"))
+        self.assertIn("mlx-lm", [p["name"] for p in result[0]["report"]["packages"]])
 
     def test_register_reports_the_tool_it_registered_by_name(self):
         self.scan()

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 import sqlite3
 
-from . import adapters, scan, sources, workflow
+from . import adapters, scan, sources, userlane, venvflow, workflow
 from .core import Error, text
 from .store import Store
 
@@ -82,6 +82,14 @@ def status(store, t):
 WRITE_COMMANDS = {"add", "check", "preview", "apply", "resolve", "scan", "report", "targets"}
 
 
+VENV_KINDS = (userlane.UVTOOL, userlane.PIPX)
+
+
+def one_argv(runner, t):
+    """The venv kinds take a listing runner: one argv, no SSH, always local."""
+    return lambda argv, **kw: runner({"name": t["name"], "kind": "uv", "host": "local"}, argv, **kw)
+
+
 def dispatch(args, store, runner, request):
     if args.command in WRITE_COMMANDS:
         # Lazy expiry runs in the command's own opening transaction: the next thing the
@@ -111,7 +119,10 @@ def dispatch(args, store, runner, request):
         for t in targets:
             if args.command == "check":
                 try:
-                    workflow.check(store, t, offline=args.offline, refresh=args.refresh, refreshed=refreshed, context=args.context, runner=runner, request=request)
+                    if t["kind"] in VENV_KINDS:
+                        venvflow.check(store, t, runner=one_argv(runner, t), request=request)
+                    else:
+                        workflow.check(store, t, offline=args.offline, refresh=args.refresh, refreshed=refreshed, context=args.context, runner=runner, request=request)
                 except Error as exc:
                     results.append({**status(store, t), "error": str(exc)})
                     continue
@@ -123,8 +134,17 @@ def dispatch(args, store, runner, request):
         rows = store.events(args.since, args.name)
         return {"events": rows, "next_cursor": rows[-1]["id"] if rows else args.since}
     if args.command == "preview":
-        return workflow.preview(store, store.target(args.name), runner)
+        t = store.target(args.name)
+        if t["kind"] in VENV_KINDS:
+            return venvflow.preview(store, t, runner=one_argv(runner, t), request=request)
+        return workflow.preview(store, t, runner)
     if args.command == "apply":
+        plan = store.db.execute("SELECT target FROM plans WHERE id=?", (args.plan,)).fetchone()
+        kind = store.target(plan["target"])["kind"] if plan else None
+        if kind in VENV_KINDS:
+            t = store.target(plan["target"])
+            return venvflow.apply(store, args.plan, yes=args.yes,
+                                  runner=one_argv(runner, t), request=request)
         return workflow.apply(store, args.plan, yes=args.yes, runner=runner, request=request)
     if args.command == "resolve":
         return workflow.resolve(store, args.plan, text(args.note, "recovery note"))

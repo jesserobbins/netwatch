@@ -11,6 +11,20 @@ from netwatch import probe, store as store_module, venvflow, workflow
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def write_record(site: Path, dist: Path, name: str):
+    """A RECORD with real hashes, so the classifier's integrity pass has something to read."""
+    import hashlib
+    lines = []
+    module = site / ("%s.py" % name)
+    module.write_text("VERSION = 'x'\n")
+    for path in (module, dist / "METADATA"):
+        rel = path.relative_to(site)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append("%s,sha256=%s,%d" % (rel, digest, path.stat().st_size))
+    lines.append("%s,," % (dist / "RECORD").relative_to(site))
+    (dist / "RECORD").write_text("\n".join(lines) + "\n")
+
+
 def build(root: Path, name="tool"):
     venv = root / "tools" / name
     venv.mkdir(parents=True)
@@ -19,6 +33,7 @@ def build(root: Path, name="tool"):
     dist = venv / "lib" / "python3.12" / "site-packages" / ("%s-1.0.dist-info" % name)
     dist.mkdir()
     (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: %s\nVersion: 1.0\n" % name)
+    write_record(dist.parent, dist, name)
     receipt = (FIXTURES / "uv-receipt.toml").read_text().replace('"ruff"', '"%s"' % name)
     (venv / "uv-receipt.toml").write_text(receipt)
     return venv
@@ -176,3 +191,132 @@ class FingerprintTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplyCase(VenvCase):
+    def setUp(self):
+        super().setUp()
+        self.installed = {"tool": "1.0"}
+        self.consistency = []
+        self.fail_install = None
+        self.after_install = None
+        plan = venvflow.preview(self.store, self.t, runner=self.runner_fn, request=self.no_network,
+                                state_dir=self.root / "state")
+        self.plan = plan
+
+    def runner_fn(self, argv, **kw):
+        if "--outdated" in argv:
+            return json.dumps([{"name": "tool", "version": self.installed["tool"],
+                                "latest_version": "2.0"}])
+        if "check" in argv:
+            return "\n".join(self.consistency) or "No broken requirements found."
+        if "install" in argv:
+            # The command runs — possibly damaging the venv — and only then may fail.
+            if self.after_install:
+                self.after_install()
+            if self.fail_install:
+                raise Exception(self.fail_install)
+            self.installed["tool"] = "2.0"
+            return ""
+        return json.dumps([{"name": n, "version": v} for n, v in self.installed.items()])
+
+    def apply(self, **kw):
+        return venvflow.apply(self.store, self.plan["id"], yes=True, runner=self.runner_fn,
+                              request=self.no_network, **kw)
+
+    def plan_status(self):
+        return self.store.db.execute("SELECT status FROM plans WHERE id=?", (self.plan["id"],)).fetchone()[0]
+
+
+class ApplyGateTests(ApplyCase):
+    def test_a_clean_install_is_applied(self):
+        result = self.apply()
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(self.plan_status(), "applied")
+
+    def test_apply_requires_yes(self):
+        with self.assertRaises(Exception):
+            venvflow.apply(self.store, self.plan["id"], yes=False, runner=self.runner_fn)
+        self.assertEqual(self.plan_status(), "proposed")
+
+    def test_a_changed_probe_token_is_a_stale_approval(self):
+        (self.venv / probe.NAME).write_text("netwatch-probe: 11111111-2222-3333-4444-555555555555\n")
+        with self.assertRaises(Exception) as caught:
+            self.apply()
+        self.assertIn("probe", str(caught.exception))
+        self.assertEqual(self.plan_status(), "proposed")
+
+    def test_a_revived_generation_is_a_stale_approval(self):
+        self.store.remove_target("tool")
+        self.store.add_target("uvtool", {"name": "tool", "kind": "uvtool", "host": "local",
+                                         "path": str(self.venv)})
+        with self.assertRaises(Exception) as caught:
+            self.apply()
+        self.assertIn("revived", str(caught.exception))
+
+    def test_a_changed_configuration_is_a_stale_approval(self):
+        with mock.patch.object(venvflow, "fingerprint", return_value="different"):
+            with self.assertRaises(Exception) as caught:
+                self.apply()
+        self.assertIn("Configuration changed", str(caught.exception))
+
+    def test_a_changed_inventory_is_a_stale_approval(self):
+        self.installed["tool"] = "1.5"
+        with self.assertRaises(Exception) as caught:
+            self.apply()
+        self.assertIn("changed", str(caught.exception))
+
+    def test_a_missing_constraints_file_is_a_stale_approval(self):
+        Path(self.plan["constraints"]["path"]).unlink()
+        with self.assertRaises(Exception) as caught:
+            self.apply()
+        self.assertIn("constraints file", str(caught.exception))
+
+
+class ApplyClassificationTests(ApplyCase):
+    def test_a_failure_that_changed_nothing_returns_the_plan_to_proposed(self):
+        self.fail_install = "Command failed: uv pip install (exit 1)"
+        result = self.apply()
+        self.assertEqual(result["status"], "failed_no_change")
+        self.assertEqual(self.plan_status(), "proposed")
+        self.assertIn("install_output", result)
+
+    def test_a_failure_that_rewrote_a_file_needs_attention(self):
+        def damage():
+            site = self.venv / "lib" / "python3.12" / "site-packages"
+            (site / "tool.py").write_text("VERSION = 'tampered'\n")
+        self.after_install = damage
+        self.fail_install = "Command failed: uv pip install (exit 1)"
+        result = self.apply()
+        self.assertEqual(result["status"], "needs_attention")
+        self.assertTrue(result["record_mismatches"])
+        self.assertEqual(self.plan_status(), "needs_attention")
+
+    def test_a_new_consistency_entry_after_the_install_needs_attention(self):
+        def worse():
+            self.consistency = ["tool 2.0 requires dep>=3 which is not installed"]
+        self.after_install = worse
+        result = self.apply()
+        self.assertEqual(result["status"], "needs_attention")
+        self.assertIn("consistency", " ".join(result["problems"]))
+
+    def test_a_changed_origin_after_the_install_needs_attention(self):
+        def swap():
+            site = self.venv / "lib" / "python3.12" / "site-packages"
+            dist = next(site.glob("tool-*.dist-info"))
+            (dist / "direct_url.json").write_text(json.dumps(
+                {"url": "https://example.invalid/x", "vcs_info": {"vcs": "git"}}))
+        self.after_install = swap
+        result = self.apply()
+        self.assertEqual(result["status"], "needs_attention")
+        self.assertIn("origin", " ".join(result["problems"]))
+
+    def test_a_terminal_write_stales_sibling_plans_for_the_same_venv(self):
+        sibling = self.store.db.execute(
+            "INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
+            ("tool", int(time.time()), "proposed",
+             json.dumps({"target": self.t, "commands": [["true"]],
+                         "expires_at": int(time.time()) + 3600}))).lastrowid
+        self.apply()
+        status = self.store.db.execute("SELECT status FROM plans WHERE id=?", (sibling,)).fetchone()[0]
+        self.assertEqual(status, "stale")

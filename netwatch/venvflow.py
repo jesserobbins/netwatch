@@ -283,6 +283,8 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         raise Error("No upgrade is available that respects this environment's bounds")
     if fingerprint() != first:
         raise Error("Configuration changed while the pins were derived; nothing saved")
+    baseline = _consistency(t, runner)
+    approved_origins = _origins(t["path"])
     constraints = _write_constraints(state_dir, result["pins"], seen.get("index_options") or [])
     plan_pins = result["pins"]
     body = {"target": t, "generation": row["generation"],
@@ -291,6 +293,7 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
             "pins": plan_pins, "extras": seen.get("extras") or [],
             "index_options": seen.get("index_options") or [],
             "token": token, "fingerprint": first,
+            "consistency_baseline": baseline, "origins": approved_origins,
             "constraints": constraints, "inventory_digest": digest(packages),
             "expires_at": now + 3600, "leads": result["leads"]}
     body["commands_redacted"] = [pins.redacted(argv) for argv in body["commands"]]
@@ -335,3 +338,214 @@ def _write_constraints(state_dir, plan_pins, index_options):
     body = "\n".join(pins.pin_text(pin) for pin in plan_pins) + "\n"
     path.write_text(body)
     return {"path": str(path), "digest": digest(body), "bytes": body}
+
+
+def _consistency(t, runner):
+    """`uv pip check` entries, as a baseline: what was already inconsistent."""
+    argv = ["uv", "pip", "check", "--python", str(Path(t["path"]) / "bin" / "python")]
+    try:
+        output = runner(argv, ok=(0, 1))
+    except Error as exc:
+        raise Error("Could not read the dependency-consistency baseline: %s" % exc) from exc
+    entries = []
+    for line in str(output).splitlines():
+        line = line.strip()
+        if not line or line.startswith("No broken requirements"):
+            continue
+        entries.append(line)
+    return sorted(entries)
+
+
+def _origins(venv):
+    """Every installed distribution's provenance, keyed by normalized name."""
+    found = {}
+    for site in sorted(Path(venv).glob("lib/python*/site-packages")):
+        for dist in site.glob("*.dist-info"):
+            name = dist.name.lower().replace("_", "-").split("-")[0]
+            kind, data = pins.origin(dist)
+            found[name] = [kind, sorted(data) if isinstance(data, dict) else data]
+    return found
+
+
+def _record_mismatches(venv):
+    """Files that do not match their own RECORD — the damage metadata cannot show."""
+    import hashlib
+    broken = []
+    for site in sorted(Path(venv).glob("lib/python*/site-packages")):
+        for dist in site.glob("*.dist-info"):
+            record = dist / "RECORD"
+            if not record.is_file():
+                broken.append({"dist": dist.name, "reason": "no RECORD"})
+                continue
+            for line in record.read_text(errors="replace").splitlines():
+                parts = line.rsplit(",", 2)
+                if len(parts) < 3 or not parts[1]:
+                    continue          # no hash recorded (.pyc, direct_url.json, RECORD itself)
+                rel, want = parts[0], parts[1].split("=")[-1]
+                path = (site / rel).resolve()
+                if not str(path).startswith(str(Path(venv).resolve().parent)) and \
+                        not str(path).startswith(str(Path(venv).resolve())):
+                    broken.append({"dist": dist.name, "file": rel, "reason": "outside the venv"})
+                    continue
+                try:
+                    got = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    broken.append({"dist": dist.name, "file": rel, "reason": "missing"})
+                    continue
+                if got != want:
+                    broken.append({"dist": dist.name, "file": rel, "reason": "changed"})
+    return broken
+
+
+def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fetch, now=None):
+    """Run the approved install, then say what actually happened."""
+    import secrets
+    now = int(time.time()) if now is None else int(now)
+    if not yes:
+        raise Error("Read preview first; apply requires --yes to approve the upgrade")
+    row = store.db.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+    if not row or row["status"] != "proposed":
+        raise Error("Plan missing or already attempted; never replay an interrupted update")
+    body = json.loads(row["body"])
+    t = store.target(row["target"])
+    state = stored_state(store, t)
+
+    # (0) workflow gates
+    if body.get("target") != t:
+        raise Error("Target changed; create a new preview")
+    if state["removed"]:
+        raise Error("Target is removed")
+    if state["generation"] != body["generation"]:
+        raise Error("Target was removed and revived since this preview; create a new one")
+    if state["state"] in lifecycle.OUT_OF_SERVICE or state["state"] == "not_bindable":
+        raise Error("%s is %s; apply is refused" % (t["name"], state["state"]))
+    busy = workflow.busy_plan(store, t)
+    if busy and busy != plan_id:
+        raise Error("Another update for this venv is running or needs attention")
+    if now >= body["expires_at"]:
+        raise Error("Preview expired; create a new one")
+    if fingerprint() != body["fingerprint"]:
+        raise Error("Configuration changed since this preview; approval is stale")
+
+    # (1) recorded path
+    struct, detail = _structural(t)
+    if struct != "present":
+        raise Error("Recorded path is missing (%s); nothing to apply" % detail)
+
+    # (2) runtime identity, and no second registration on this venv
+    identity, source, packages = _identity(t, runner)
+    if identity != "ok":
+        raise Error("Identity check failed (%s: %s); nothing to apply" % (source, identity))
+    if co_claimants(store, t):
+        raise Error("Another target tracks this venv; remove it first")
+
+    # (3) binding bracket
+    status, token = probe.read(t["path"])
+    if status != "usable" or token != body["token"]:
+        raise Error("The environment's probe changed since this preview; approval is stale")
+    if digest(packages) != body["inventory_digest"]:
+        raise Error("Installed versions changed since this preview; approval is stale")
+    if probe.read(t["path"]) != (status, token):
+        raise Error("The environment changed while it was being verified; nothing applied")
+
+    # (4) constraints digest
+    constraints_path = Path(body["constraints"]["path"])
+    if not constraints_path.is_file() or \
+            digest(constraints_path.read_text()) != body["constraints"]["digest"]:
+        raise Error("The plan's constraints file is missing or changed; create a new preview")
+
+    # (5) verified temp copy, so what runs is the bytes that were approved
+    state_dir = constraints_path.parent
+    temp = state_dir / ("apply-%s-%s.tmp" % (now, secrets.token_hex(4)))
+    temp.write_text(body["constraints"]["bytes"])
+
+    # claim: everything above re-checked once more, under the write lock
+    with store.transaction():
+        if stored_state(store, t) != state:
+            raise Error("Target changed under us; nothing applied")
+        updated = store.db.execute(
+            "UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (plan_id,))
+        if updated.rowcount != 1:
+            raise Error("Plan was already claimed")
+        store.event(t["name"], "approved_and_started",
+                    {"plan": plan_id, "operator_uid": os.getuid(),
+                     "commands": body.get("commands_redacted") or body["commands"]})
+    try:
+        outcome, failure = "applied", None
+        try:
+            runner(body["commands"][0], timeout=1800)
+        except Exception as exc:
+            # Any failure of the install command is a failure to classify. What matters is
+            # the state it left behind, never the exception's type.
+            failure = str(exc) or type(exc).__name__
+    finally:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+    after_token = probe.read(t["path"])
+    try:
+        after_packages = userlane.inventory(t["path"], runner)
+    except Error:
+        after_packages = None
+    after_consistency = None
+    after_origins = None
+    if after_packages is not None:
+        try:
+            after_consistency = _consistency(t, runner)
+        except Error:
+            after_consistency = None
+        after_origins = _origins(t["path"])
+
+    result = {"plan": plan_id, "failure": failure}
+    if failure is None:
+        # The five-condition gate: the install's own exit code is only the first of them.
+        problems = []
+        if after_token != (status, token):
+            problems.append("the probe token changed; the venv was replaced")
+        if after_packages is None:
+            problems.append("the inventory could not be read after the install")
+        else:
+            installed = {p["name"]: p["version"] for p in after_packages}
+            for pin in body["pins"]:
+                if installed.get(pin["name"]) != pin["version"]:
+                    problems.append("%s is installed at %s, not the approved %s"
+                                    % (pin["name"], installed.get(pin["name"]), pin["version"]))
+            new_entries = sorted(set(after_consistency or []) - set(body["consistency_baseline"]))
+            if new_entries:
+                problems.append("dependency consistency got worse: " + new_entries[0])
+            changed_origins = [name for name, value in (after_origins or {}).items()
+                               if body["origins"].get(name) not in (None, value)]
+            if changed_origins:
+                problems.append("origin changed for " + changed_origins[0])
+        if problems:
+            outcome = "needs_attention"
+            result["problems"] = problems
+        result.update(pins=[p["name"] + "==" + p["version"] for p in body["pins"]],
+                      token=after_token[1], inventory_digest=digest(after_packages or []))
+    else:
+        unchanged = (after_token == (status, token)
+                     and after_packages is not None
+                     and digest(after_packages) == body["inventory_digest"]
+                     and after_consistency == body["consistency_baseline"])
+        damage = _record_mismatches(t["path"]) if unchanged else []
+        if unchanged and not damage:
+            outcome = "failed_no_change"
+        else:
+            outcome = "needs_attention"
+            result["record_mismatches"] = damage[:5]
+        result["install_output"] = failure
+
+    with store.transaction():
+        if outcome == "failed_no_change":
+            store.db.execute("UPDATE plans SET status='proposed' WHERE id=?", (plan_id,))
+        else:
+            store.db.execute("UPDATE plans SET status=?, result=? WHERE id=?",
+                             (outcome, canonical(result), plan_id))
+            # The terminal write and the sibling staling are one transaction: the gap
+            # between them is exactly where a stale preflight could claim and downgrade.
+            store.stale_siblings(t["name"], path=t.get("path"), venv_match=workflow.same_venv)
+        store.event(t["name"], outcome if outcome != "failed_no_change" else "failed_no_change",
+                    {"plan": plan_id, "result": result})
+    return {"id": plan_id, "status": outcome, **result}
