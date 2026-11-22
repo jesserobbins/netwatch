@@ -685,10 +685,15 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
 
     # (5) verified temp copy, so what runs is the bytes that were approved
     state_dir = constraints_path.parent
+    approved_bytes = body["constraints"]["bytes"]
+    if digest(approved_bytes) != body["constraints"]["digest"]:
+        # The plan carries the bytes and their digest; if they disagree, what would run is
+        # not what was approved, whoever wrote it.
+        raise Error("The plan's stored constraints do not match their digest; nothing applied")
     temp = state_dir / ("apply-%s-%s.tmp" % (now, secrets.token_hex(4)))
     handle = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(handle, "w") as stream:
-        stream.write(body["constraints"]["bytes"])
+        stream.write(approved_bytes)
 
     # claim: everything above re-checked once more, under the write lock
     before_records = _record_mismatches(t["path"])

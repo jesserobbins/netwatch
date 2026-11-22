@@ -376,3 +376,18 @@ class RemoveRefusalTests(Base):
         self.assertIn("running", str(caught.exception))
         self.assertEqual(
             self.store.db.execute("SELECT removed FROM targets WHERE name='tool'").fetchone()[0], 0)
+
+
+class PlanByteIntegrityTests(ApplyCase if False else Base):
+    def test_tampered_plan_bytes_are_refused(self):
+        preview = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                   request=self.no_network, state_dir=self.state)
+        body = json.loads(self.store.db.execute(
+            "SELECT body FROM plans WHERE id=?", (preview["id"],)).fetchone()[0])
+        body["constraints"]["bytes"] = "tool==9.9\n"
+        self.store.db.execute("UPDATE plans SET body=? WHERE id=?",
+                              (json.dumps(body), preview["id"]))
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, preview["id"], yes=True, runner=self.runner(),
+                           request=self.no_network)
+        self.assertIn("do not match their digest", str(caught.exception))
