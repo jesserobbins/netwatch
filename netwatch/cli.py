@@ -62,6 +62,10 @@ def parser():
     sc.add_argument("--run", type=int, help="scan run id (needed when the root has more than one)")
     sc.add_argument("--handle", action="append", default=[], metavar="NAME",
                     help="accept this GitHub owner as yours (repeatable; the gh login is always accepted)")
+    tg = commands.add_parser("targets", help="retire a tracked target")
+    tsub = tg.add_subparsers(dest="action", required=True)
+    trem = tsub.add_parser("remove", help="retire a target; history and name are kept")
+    trem.add_argument("name")
     rp = commands.add_parser("report", help="write the .netwatch ticket for one checkout, whatever its owner")
     rp.add_argument("path")
     return p
@@ -75,7 +79,14 @@ def status(store, t):
     return {"target": t, "last_attempt": dict(last) if last else None, "report": report, "pending_updates": pending}
 
 
+WRITE_COMMANDS = {"add", "check", "preview", "apply", "resolve", "scan", "report", "targets"}
+
+
 def dispatch(args, store, runner, request):
+    if args.command in WRITE_COMMANDS:
+        # Lazy expiry runs in the command's own opening transaction: the next thing the
+        # operator runs is the cleaner. status/list/history stay read-only.
+        store.expire()
     if args.command == "add":
         t = adapters.target(args.name, args.kind, args.host, args.path)
         with store.transaction():
@@ -86,6 +97,14 @@ def dispatch(args, store, runner, request):
         return t
     if args.command == "list":
         return store.targets()
+    if args.command == "targets" and args.action == "remove":
+        t = store.target(args.name)
+        with store.transaction():
+            staled = store.stale_siblings(args.name, path=t.get("path"),
+                                           venv_match=workflow.same_venv)
+            removed = store.remove_target(args.name)
+            store.event(args.name, "removed", {"plans_staled": staled})
+        return {"name": args.name, "removed": bool(removed), "plans_staled": len(staled)}
     if args.command in ("check", "status"):
         targets = [store.target(args.name)] if args.name else store.targets()
         results, refreshed = [], set()

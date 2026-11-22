@@ -13,7 +13,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import tickets, userlane
+from . import tickets, userlane, workflow
 from .core import Error
 
 SKIP = (".git", "node_modules", ".venv", "__pycache__")
@@ -313,7 +313,14 @@ def register(store, root, indices, *, run_id=None, runner=None):
                     "realpath", "path_as_written", "st_dev", "st_ino")}
             row["name"] = detail.get("tool") or row["name"]
             verified.append((item, row, userlane.identity(row, runner)))
+        blocking = [t for t in store.targets()
+                    if t.get("kind") in (userlane.UVTOOL, userlane.PIPX)
+                    and t.get("path") and t.get("state") not in ("unresolved_path", "identity_mismatch")]
         for item, row, seen in verified:
+            for other in blocking:
+                if other["name"] != row["name"] and workflow.same_venv(other["path"], row["realpath"]):
+                    raise Error("%s already tracks this venv as %s; remove that target first"
+                                % (other["name"], other["kind"]))
             body = {"name": row["name"], "kind": row["kind"], "host": "local",
                     "path": row["realpath"],
                     "bin_dir": row["bin_dir"], "extras": row["extras"],

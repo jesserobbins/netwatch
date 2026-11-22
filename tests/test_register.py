@@ -244,3 +244,33 @@ class RegisterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistrationUniquenessTests(unittest.TestCase):
+    """One venv, one target: the same `same_venv` predicate the busy query uses."""
+
+    def setUp(self):
+        from netwatch import workflow
+        self.workflow = workflow
+        self.root = Path(tempfile.mkdtemp())
+        self.state = self.root / "state.db"
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        self.venv = venv_with(self.tools, "ruff", receipt="uv-receipt.toml")
+        self.runner = listing([("ruff", "0.15.22")])
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_second_target_on_the_same_venv_is_refused(self):
+        store = store_module.Store(self.state)
+        try:
+            scan.run(store, self.root, handles=set(), request=lambda url, body=None: {"vulns": []})
+            scan.register(store, self.root, [1], runner=self.runner)
+            store.add_target("uvtool", {"name": "ruff-copy", "kind": "uvtool", "host": "local",
+                                        "path": str(self.venv / ".")})
+            with self.assertRaises(scan.Error) as caught:
+                scan.register(store, self.root, [1], runner=self.runner)
+            self.assertIn("already tracks this venv", str(caught.exception))
+        finally:
+            store.close()

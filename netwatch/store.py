@@ -179,6 +179,54 @@ class Store:
                  "detail": json.loads(r["detail_json"])}
                 for r in self.db.execute(sql, args)]
 
+    def expire(self, now=None):
+        """Lazy expiry: a proposal nobody acted on stops being applicable.
+
+        Runs at the start of every store-writing command, in the command's own opening
+        transaction, so a plan that expired overnight is cleaned by the next thing the
+        operator runs rather than by a background daemon that does not exist.
+        """
+        now = int(time.time()) if now is None else int(now)
+        expired = []
+        for row in self.db.execute("SELECT id, target, body FROM plans WHERE status='proposed'"):
+            try:
+                body = json.loads(row["body"])
+            except ValueError:
+                continue
+            at = body.get("expires_at")
+            if isinstance(at, (int, float)) and now >= int(at):
+                expired.append((row["id"], row["target"]))
+        for plan_id, target in expired:
+            self.db.execute("UPDATE plans SET status='stale' WHERE id=? AND status='proposed'",
+                            (plan_id,))
+            self.event(target, "plan_expired", {"plan": plan_id})
+        return len(expired)
+
+    def stale_siblings(self, name, *, path=None, venv_match=None):
+        """Invalidate every other proposal for this target — or for the same venv."""
+        staled = []
+        for row in self.db.execute(
+                "SELECT id, target, body FROM plans WHERE status='proposed' AND target<>?",
+                (name,)).fetchall():
+            same = venv_match is not None and path is not None and \
+                venv_match(self._body_path(row["body"]), path)
+            if same:
+                self.db.execute("UPDATE plans SET status='stale' WHERE id=?", (row["id"],))
+                staled.append({"plan": row["id"], "target": row["target"]})
+        for row in self.db.execute(
+                "SELECT id FROM plans WHERE status='proposed' AND target=?", (name,)).fetchall():
+            self.db.execute("UPDATE plans SET status='stale' WHERE id=?", (row["id"],))
+            staled.append({"plan": row["id"], "target": name})
+        return staled
+
+    @staticmethod
+    def _body_path(body):
+        try:
+            target = json.loads(body).get("target") or {}
+        except ValueError:
+            return None
+        return target.get("path") if isinstance(target, dict) else None
+
     def event(self, target, kind, body):
         self.db.execute("INSERT INTO events(target,at,kind,body) VALUES(?,?,?,?)",
                         (target, int(time.time()), kind, canonical(body)))

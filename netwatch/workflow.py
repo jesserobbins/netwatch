@@ -3,8 +3,49 @@ import json
 import os
 import time
 
-from . import adapters, sources
+from . import adapters, lifecycle, sources
 from .core import Error, canonical, digest
+
+
+def same_venv(a, b):
+    """Are these two recorded paths the same installation?
+
+    One predicate, used identically at registration, apply step (2), recovery and the busy
+    query: a venv reached by two spellings is one venv, and a lock or a claim travels with
+    the installation, not with a name.
+    """
+    if not a or not b:
+        return False
+    try:
+        left, right = os.path.realpath(str(a)), os.path.realpath(str(b))
+    except OSError:
+        return False
+    if os.path.normcase(left) == os.path.normcase(right):
+        return True
+    try:
+        one, two = os.stat(left), os.stat(right)
+    except OSError:
+        return False
+    return (one.st_dev, one.st_ino) == (two.st_dev, two.st_ino)
+
+
+def busy_plan(store, t):
+    """The plan blocking this target: its own, or any plan on the same venv."""
+    rows = store.db.execute(
+        "SELECT id, target FROM plans WHERE status IN ('running','needs_attention') ORDER BY id")
+    path = t.get("path")
+    for row in rows:
+        if row["target"] == t["name"]:
+            return row["id"]
+        if not path:
+            continue
+        try:
+            other = store.target(row["target"])
+        except Exception:
+            continue
+        if same_venv(other.get("path"), path):
+            return row["id"]
+    return None
 
 
 def check(store, t, *, offline=False, refresh=False, refreshed=None, context=False, runner=adapters.run, request=sources.fetch):
@@ -134,8 +175,13 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
     before = adapters.inventory(t, runner)
     if body["inventory_digest"] != digest(before) or int(time.time()) >= body["expires_at"]:
         raise Error("Inventory changed or preview expired; create a new preview")
+    if t.get("path"):
+        for other in store.targets():
+            if other["name"] != t["name"] and other.get("removed") == 0 \
+                    and other.get("path") and same_venv(other.get("path"), t["path"]):
+                raise Error("%s already tracks this venv; remove that target first" % other["name"])
     with store.transaction():
-        busy = store.db.execute("SELECT id FROM plans WHERE target=? AND status IN ('running','needs_attention')", (t["name"],)).fetchone()
+        busy = busy_plan(store, t)
         if busy:
             raise Error("Previous update is running or needs attention; inspect history and resolve it first")
         updated = store.db.execute("UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (id_,))
