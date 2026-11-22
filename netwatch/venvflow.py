@@ -362,7 +362,8 @@ def _launchers(t):
     exposed = seen.get("exposed") or []
     try:
         checked = {row["script"]: row for row in
-                   pins.launchers(t["path"], str(bin_dir), t["name"], as_written=written)}
+                   pins.launchers(t["path"], str(bin_dir), t.get("tool") or t["name"],
+                                  as_written=written)}
     except (Error, OSError) as exc:
         return [{"script": "*", "status": "lead",
                  "detail": "launcher check failed: %s" % exc}]

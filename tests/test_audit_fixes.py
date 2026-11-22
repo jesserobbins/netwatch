@@ -928,3 +928,37 @@ class ApplyNotBindableTests(Base):
         self.assertIn("not_bindable", str(caught.exception))
         self.assertEqual(self.store.db.execute(
             "SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0], "proposed")
+
+
+class LabelledLauncherTests(unittest.TestCase):
+    """A labelled target must still be entry-point-verified: the manager knows the tool."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "scripted")
+        dist = dist_dir(self.venv, "scripted")
+        (dist / "entry_points.txt").write_text("[console_scripts]\nscripted = scripted.cli:main\n")
+        script = self.venv / "bin" / "scripted"
+        script.write_text("#!/bin/sh\n'''exec' %s \"$0\"\n' '''\nfrom scripted.cli import main\n"
+                          % (self.venv / "bin" / "python"))
+        script.chmod(0o755)
+        # this venv's own receipt: the exposed launcher is the script just written
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "scripted" }]\nentrypoints = [\n'
+            '  { name = "scripted", install-path = "%s", from = "scripted" },\n]\n' % script)
+        self.db = self.root / "state.db"
+        self.store = store_module.Store(self.db)
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "mylabel", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.t = self.store.target("mylabel")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_labelled_targets_launchers_are_verified_not_reported_as_leads(self):
+        rows = venvflow._launchers(self.t)
+        self.assertEqual([(r["script"], r["status"]) for r in rows],
+                         [("scripted", "ok")], rows)
