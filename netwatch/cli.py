@@ -120,6 +120,12 @@ def dispatch(args, store, runner, request):
         return store.targets()
     if args.command == "targets" and args.action == "remove":
         t = store.target(args.name)
+        # A running or locked update is inspecting this venv right now; retiring the row
+        # would orphan the command in flight. The lock must be honoured, not discarded.
+        busy = workflow.busy_plan(store, t)
+        if busy:
+            raise Error("Update %s is running or needs attention; resolve it before "
+                        "removing this target" % busy)
         with store.transaction():
             staled = store.stale_siblings(args.name, path=t.get("path"),
                                            venv_match=workflow.same_venv)

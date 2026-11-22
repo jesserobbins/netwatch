@@ -309,3 +309,70 @@ class ConstraintSourceTests(Base):
         body = Path(result["constraints"]["path"]).read_text()
         self.assertIn("tool==2.0", body)
         self.assertNotIn("other<2", body)
+
+
+class CredentialedIndexApplyTests(Base):
+    """A private-index tool must be previewable *and* appliable."""
+
+    def setUp(self):
+        super().setUp()
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "tool" }]\n'
+            'index = "https://user:secret@private.example/simple"\n')
+
+    def test_preview_then_apply_with_a_credentialed_index(self):
+        installed = {"version": "1.0"}
+
+        def runner(argv, **kw):
+            if "install" in argv:
+                return seen.setdefault("argv", argv) and ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": installed["version"],
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "tool", "version": installed["version"]}])
+
+        preview = venvflow.preview(self.store, self.t, runner=runner,
+                                   request=self.no_network, state_dir=self.state)
+        seen = {}
+
+        def installer(argv, **kw):
+            if "install" in argv:
+                seen["argv"] = argv
+                installed["version"] = "2.0"     # the install actually happened
+                return ""
+            return runner(argv, **kw)
+
+        result = venvflow.apply(self.store, preview["id"], yes=True, runner=installer,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "applied", result)
+        # the install authenticates with the raw URL, from the verified copy
+        self.assertTrue(any("secret" in token for token in seen["argv"]))
+        self.assertTrue(seen["argv"][6].endswith(".tmp"), seen["argv"][6])
+
+    def test_pipx_pip_args_keep_their_credential_for_use(self):
+        venv = make_venv(self.root, "px", receipt="[tool]\nrequirements = [{ name = \"px\" }]\n")
+        meta = json.loads((FIXTURES / "pipx-metadata.json").read_text())
+        meta["main_package"]["package"] = "px"
+        meta["main_package"]["pip_args"] = ["--index-url",
+                                           "https://user:secret@private.example/simple"]
+        (venv / "uv-receipt.toml").unlink()
+        (venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        row = userlane.describe(venv)
+        self.assertTrue(any("secret" in token for token in row["index_options"]))
+        self.assertFalse(any("secret" in token for token in row["index_options_redacted"]))
+
+
+class RemoveRefusalTests(Base):
+    def test_remove_refuses_while_an_update_is_running(self):
+        from netwatch import cli
+        self.store.db.execute(
+            "INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
+            ("tool", int(time.time()), "running", json.dumps({"target": self.t})))
+        with self.assertRaises(Exception) as caught:
+            cli.dispatch(cli.parser().parse_args(["targets", "remove", "tool"]),
+                         self.store, None, None)
+        self.assertIn("running", str(caught.exception))
+        self.assertEqual(
+            self.store.db.execute("SELECT removed FROM targets WHERE name='tool'").fetchone()[0], 0)

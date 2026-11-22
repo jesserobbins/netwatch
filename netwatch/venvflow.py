@@ -706,7 +706,7 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
             raise Error("The probe changed during preflight; nothing applied")
         # The last check before any command starts: the inputs the approval named must
         # still be the inputs this run would use.
-        if digest(_index_options(t)) != body.get("index_digest"):
+        if digest(_index_options_redacted(t)) != body.get("index_digest"):
             raise Error("The recorded index options changed during preflight; "
                         "approval is stale")
         if marker_env(t) != body.get("marker_env"):
@@ -722,9 +722,13 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
                      "commands": body.get("commands_redacted")})
     try:
         outcome, failure = "applied", None
-        argv = pins.command(t["path"], body["constraints"]["path"], body["pins"],
-                            _index_options(t))
-        if pins.redacted(argv) != (body.get("commands_redacted") or [None])[0]:
+        # Step (5)'s verified copy is what runs: the approved bytes, at a path this apply
+        # owns. The equality gate folds that path back so it still compares like with like.
+        approved_path = body["constraints"]["path"]
+        argv = pins.command(t["path"], str(temp), body["pins"], _index_options(t))
+        folded = [approved_path if token == str(temp) else token
+                  for token in pins.redacted(argv)]
+        if folded != (body.get("commands_redacted") or [None])[0]:
             raise Error("The command no longer matches the approved shape; nothing run")
         try:
             runner(argv, timeout=1800)

@@ -49,12 +49,16 @@ class DescribeTests(unittest.TestCase):
         row = userlane.describe(venv_with(self.root, "mlx", receipt="uv-receipt-extras.toml"))
         self.assertEqual(row["extras"], ["server"])
 
-    def test_pipx_metadata_names_the_tool_and_redacts_index_credentials(self):
+    def test_pipx_metadata_names_the_tool_and_separates_raw_from_stored_options(self):
         row = userlane.describe(venv_with(self.root, "luna", pipx="pipx-metadata.json"))
         self.assertEqual(row["kind"], "pipx")
         self.assertEqual(row["name"], "luna-doctor")
-        self.assertEqual(row["index_options"], ["--index-url", "https://pypi.example/simple"])
-        self.assertNotIn("secret", json.dumps(row))
+        # raw values exist so uv can authenticate; only the redacted form may be stored
+        self.assertEqual(row["index_options"],
+                         ["--index-url", "https://user:secret@pypi.example/simple"])
+        self.assertEqual(row["index_options_redacted"],
+                         ["--index-url", "https://pypi.example/simple"])
+        self.assertNotIn("secret", json.dumps(row["index_options_redacted"]))
 
     def test_a_plain_venv_is_not_claimed_by_any_manager(self):
         path = self.root / "plain"

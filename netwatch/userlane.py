@@ -55,7 +55,7 @@ def _pip_args_index_options(pip_args):
                 i += 1
                 options.append(pip_args[i])
         i += 1
-    return _redact(options)
+    return options
 
 
 def _redact(options):
