@@ -132,14 +132,16 @@ def _identity(t, runner):
         return ("failed", "manager_metadata", "no manager metadata")
     if seen.get("kind") is None:
         return ("unreadable", "manager_metadata", seen.get("error") or "metadata unusable")
-    if seen.get("name") != t["name"] or seen.get("kind") != t.get("kind"):
+    # The target's name is the operator's label; the manager names a tool. They need not
+    # match, so the comparison is against the recorded tool.
+    if seen.get("name") != (t.get("tool") or t["name"]) or seen.get("kind") != t.get("kind"):
         return ("failed", "manager_metadata",
                 "metadata names %s" % seen.get("name"))
     try:
         packages = userlane.inventory(t["path"], runner)
     except Error as exc:
         return ("unreadable", "listing", str(exc))
-    wanted = t["name"].lower().replace("_", "-").replace(".", "-")
+    wanted = (t.get("tool") or t["name"]).lower().replace("_", "-").replace(".", "-")
     present = {p["name"].lower().replace("_", "-").replace(".", "-") for p in packages}
     if wanted not in present:
         return ("failed", "listing", "distribution absent")
@@ -430,11 +432,25 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     token_status, existing_token = probe.read(t["path"])
     if token_status == "unreadable":
         raise Error("The probe token in %s could not be read; nothing to preview" % t["path"])
+    if token_status == "malformed":
+        # Decided at (p0), before anything is written or resolved: the run is incomplete and
+        # the operator gets the safe repair.
+        raise Error("Run incomplete: the probe token in %s is malformed; delete %s and "
+                    "re-run preview" % (t["path"], Path(t["path"]) / ".netwatch-probe"))
     # (p1) stale temp cleanup on every run that reaches this step.
     probe.cleanup(t["path"])
     published, token = probe.publish(t["path"])
     if published == "failed":
-        raise Error("Could not write a probe token into %s" % t["path"])
+        with store.transaction():
+            store.db.execute(
+                "UPDATE targets SET state='not_bindable', state_seq=state_seq+1 "
+                "WHERE name=? AND generation=? AND state_seq=? AND state<>'not_bindable'",
+                (t["name"], row["generation"], row["state_seq"]))
+            store.event(t["name"], "state_changed",
+                        {"from": row["state"], "to": "not_bindable",
+                         "reason": "preview could not write a probe token"})
+        raise Error("Could not write a probe token into %s; the target is not_bindable "
+                    "until one can be written" % t["path"])
     # (p1) the identity read repeats after publication: a venv that took the path between
     # the read and the write would have received this marker.
     after_publish, source2, packages2 = _identity(t, runner)
@@ -525,8 +541,32 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     # (p6) confirmation: the venv being approved is the venv that was read and tokened.
     confirmed, source3, _ = _identity(t, runner)
     if confirmed != "ok":
+        _discard(constraints["path"])
         raise Error("The environment changed while the plan was being built (%s: %s); "
                     "nothing saved" % (source3, confirmed))
+    try:
+        _insert_plan(store, t, row, constraints, body, token, now, plan_pins)
+    except BaseException:
+        # (p11): a failed save deletes the file it wrote, whichever check refused.
+        _discard(constraints["path"])
+        raise
+    return {"id": _last_plan_id(store, t), "status": "proposed", **body}
+
+
+def _discard(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _last_plan_id(store, t):
+    return store.db.execute("SELECT id FROM plans WHERE target=? ORDER BY id DESC LIMIT 1",
+                            (t["name"],)).fetchone()[0]
+
+
+def _insert_plan(store, t, row, constraints, body, token, now, plan_pins):
+    """The save transaction: re-read what it is about to bind the plan to."""
     with store.transaction():
         current = stored_state(store, t)
         if current != row:

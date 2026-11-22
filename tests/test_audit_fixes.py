@@ -814,3 +814,90 @@ class NoUpdateBranchTests(Base):
         self.assertEqual(self.store.db.execute(
             "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "not_bindable",
             "a stale run must not clear a newer diagnosis")
+
+
+class LabelledAddTests(unittest.TestCase):
+    """`add` lets the operator choose the label; the manager names the tool."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "pygments")
+        self.db = self.root / "state.db"
+        self.store = store_module.Store(self.db)
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "mylabel", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.t = self.store.target("mylabel")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_labelled_target_identifies_by_the_manager_tool(self):
+        report = venvflow.check(self.store, self.t,
+                                runner=lambda argv, **kw: json.dumps(
+                                    [{"name": "pygments", "version": "2.17.2"}]),
+                                request=Base.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["pygments"])
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='mylabel'").fetchone()[0], "live")
+
+    def test_an_identity_mismatch_row_does_not_block_re_adding_the_same_venv(self):
+        self.store.db.execute("UPDATE targets SET state='identity_mismatch' WHERE name='mylabel'")
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "pygments", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.assertEqual(self.store.db.execute(
+            "SELECT count(*) FROM targets").fetchone()[0], 2)
+
+
+class PreviewTokenWriteTests(Base):
+    def test_a_failed_token_write_sets_not_bindable(self):
+        os.chmod(self.venv, 0o500)
+        try:
+            with self.assertRaises(Exception) as caught:
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        finally:
+            os.chmod(self.venv, 0o700)
+        self.assertIn("not_bindable", str(caught.exception))
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "not_bindable")
+
+
+class MalformedProbePreviewTests(Base):
+    def test_a_malformed_probe_is_decided_before_resolving(self):
+        (self.venv / probe.NAME).write_text("netwatch-probe: nope\n")
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return self.runner()(argv, **kw)
+
+        with self.assertRaises(Exception) as caught:
+            venvflow.preview(self.store, self.t, runner=runner,
+                             request=self.no_network, state_dir=self.state)
+        self.assertIn("Run incomplete", str(caught.exception))
+        self.assertEqual([c for c in calls if "--outdated" in c], [],
+                         "nothing may be resolved for an incomplete observation")
+
+    def test_a_failed_save_deletes_the_artifact_it_wrote(self):
+        before = set((self.state / "constraints").glob("preview-*.txt")) \
+            if (self.state / "constraints").exists() else set()
+        real = venvflow._identity
+        calls = {"n": 0}
+
+        def fail_on_confirmation(target, runner):
+            calls["n"] += 1
+            if calls["n"] >= 3:          # the (p6) confirmation read
+                return ("failed", "manager_metadata", "changed")
+            return real(target, runner)
+
+        with mock.patch.object(venvflow, "_identity", side_effect=fail_on_confirmation):
+            with self.assertRaises(Exception):
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        after = set((self.state / "constraints").glob("preview-*.txt"))
+        self.assertEqual(after - before, set(), "a failed save must delete its artifact")

@@ -126,13 +126,16 @@ def dispatch(args, store, runner, request):
                 raise Error("%s is not a %s environment (%s)"
                             % (t["path"], t["kind"], (seen or {}).get("error", "no manager metadata")))
             for other in store.target_rows():
-                if other["name"] == t["name"] or other["removed"]:
+                # The blocking set: a row whose venv is gone or foreign does not block.
+                if other["name"] == t["name"] or other["removed"] \
+                        or other["state"] in ("unresolved_path", "identity_mismatch"):
                     continue
                 if other["kind"] in adapters.VENV_KINDS and other.get("path") \
                         and workflow.same_venv(other["path"], seen["realpath"]):
                     raise Error("%s already tracks this venv; remove that target first"
                                 % other["name"])
-            t = {**t, "realpath": seen["realpath"], "bin_dir": seen["bin_dir"],
+            t = {**t, "tool": seen["name"], "realpath": seen["realpath"],
+                 "bin_dir": seen["bin_dir"],
                  "extras": seen.get("extras") or [],
                  "index_options": seen.get("index_options_redacted") or []}
         with store.transaction():
