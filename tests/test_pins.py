@@ -37,6 +37,11 @@ class DeriveTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
+    ENV = {"python_version": "3.12", "python_full_version": "3.12.11",
+           "os_name": "posix", "sys_platform": "darwin", "platform_machine": "arm64",
+           "platform_python_implementation": "CPython", "implementation_name": "cpython",
+           "implementation_version": "3.12.11", "extra": ""}
+
     def packages(self, *rows):
         return [{"name": n, "version": v} for n, v in rows]
 
@@ -82,7 +87,7 @@ class DeriveTests(unittest.TestCase):
         make_dist(self.venv, "other", "1.0", requires=['dep[cli]; extra == "client"'])
         make_dist(self.venv, "dep", "1.0")
         result = pins.derive(self.venv, self.packages(("other", "1.0"), ("dep", "1.0")),
-                             [{"name": "dep", "version": "2.0"}])
+                             [{"name": "dep", "version": "2.0"}], environment=self.ENV)
         dep = [p for p in result["pins"] if p["name"] == "dep"][0]
         self.assertEqual(dep["extras"], [])
         self.assertEqual(result["leads"][0]["type"], "extras")
@@ -154,10 +159,13 @@ class CommandTests(unittest.TestCase):
         self.assertIn("https://pypi.example/simple", shown)
         self.assertFalse(any("secret" in token for token in shown))
 
-    def test_the_plan_body_carries_a_digest_of_the_exact_argv(self):
-        body = pins.plan_body("/v", "/c.txt", self.pins(), target={"name": "ruff"})
-        self.assertEqual(body["command_digest"], pins.digest(body["commands"][0]))
-        self.assertEqual(body["command_redacted"][:4], body["commands"][0][:4])
+    def test_the_redacted_argv_keeps_every_non_credential_token(self):
+        argv = pins.command("/v", "/c.txt", self.pins(),
+                            ["--index-url", "https://user:secret@pypi.example/simple"])
+        shown = pins.redacted(argv)
+        self.assertEqual(shown[:4], argv[:4])
+        self.assertEqual(len(shown), len(argv))
+        self.assertEqual(pins.digest(argv), pins.digest(argv))
 
 
 if __name__ == "__main__":

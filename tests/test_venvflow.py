@@ -131,7 +131,7 @@ class PreviewTests(VenvCase):
         self.assertEqual(result["status"], "proposed")
         self.assertEqual(result["generation"], 1)
         self.assertTrue(Path(result["constraints"]["path"]).is_file())
-        self.assertIn("tool==2.0", result["commands"][0])
+        self.assertIn("tool==2.0", result["commands_redacted"][0])
         self.assertEqual(probe.read(self.venv)[0], "usable")
 
     def test_a_changing_fingerprint_saves_no_plan(self):

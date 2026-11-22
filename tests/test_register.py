@@ -316,9 +316,26 @@ class PipxIndexTranslationTests(unittest.TestCase):
         self.assertEqual(row["index_options"], ["--index-url", "https://args.example/simple"])
         self.assertEqual(row["index_source"], "pip_args")
 
-    def test_credentials_from_pip_conf_are_redacted(self):
+    def test_credentials_from_pip_conf_are_kept_for_use_and_redacted_for_storage(self):
         conf = self.root / "pip.conf"
         conf.write_text("[global]\nindex-url = https://user:secret@private.example/simple\n")
         with mock.patch.dict(os.environ, {"PIP_CONFIG_FILE": str(conf)}, clear=False):
             row = userlane.describe(self.venv)
-        self.assertNotIn("secret", json.dumps(row))
+        # raw values exist in memory so uv can authenticate...
+        self.assertIn("secret", json.dumps(row["index_options"]))
+        # ...and the persisted forms carry none of it
+        self.assertNotIn("secret", json.dumps(row["index_options_redacted"]))
+        store = store_module.Store(self.root / "redact.db")
+        try:
+            with mock.patch.dict(os.environ, {"PIP_CONFIG_FILE": str(conf)}, clear=False):
+                scan.run(store, self.root, handles=set(),
+                         request=lambda u, b=None: {"vulns": []})
+                scan.register(store, self.root, [1],
+                              runner=lambda argv, **kw: json.dumps(
+                                  [{"name": "luna-doctor", "version": "0.4.1"}]))
+            for table, column in (("scan_records", "detail_json"), ("targets", "body")):
+                rows = store.db.execute("SELECT %s FROM %s" % (column, table)).fetchall()
+                for (value,) in rows:
+                    self.assertNotIn("secret", value, table)
+        finally:
+            store.close()

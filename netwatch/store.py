@@ -133,9 +133,11 @@ class Store:
             return
         revived = int(row["removed"] or 0)
         next_generation = int(row["generation"] or 1) + (1 if revived else 0)
+        # A revival is a new registration: the row re-enters service whatever it was
+        # diagnosed with before the removal, and the generation bump refuses old plans.
         self.db.execute(
-            "UPDATE targets SET body=?, kind=?, removed=0, generation=?, state_seq=state_seq+?"
-            " WHERE name=?",
+            "UPDATE targets SET body=?, kind=?, removed=0, state='live', generation=?, "
+            "state_seq=state_seq+? WHERE name=?",
             (canonical(body), kind, next_generation, 1 if revived else 0, name))
 
     def remove_target(self, name):

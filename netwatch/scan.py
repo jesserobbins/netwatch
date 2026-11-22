@@ -207,7 +207,8 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
             else:
                 detail.update(tool=row["name"], kind=row["kind"], realpath=row["realpath"],
                               path_as_written=row["path_as_written"], bin_dir=row["bin_dir"],
-                              extras=row["extras"], index_options=row["index_options"],
+                              extras=row["extras"],
+                              index_options=row.get("index_options_redacted") or [],
                               st_dev=row["st_dev"], st_ino=row["st_ino"])
         if item.lane == REPO:
             is_owned = owned(item.path, handles)
@@ -324,7 +325,7 @@ def register(store, root, indices, *, run_id=None, runner=None):
             body = {"name": row["name"], "kind": row["kind"], "host": "local",
                     "path": row["realpath"], "realpath": row["realpath"],
                     "bin_dir": row["bin_dir"], "extras": row["extras"],
-                    "index_options": row["index_options"],
+                    "index_options": row.get("index_options_redacted") or [],
                     "registered_from_scan": {"run": run, "ordinal": item["ordinal"],
                                             "path_as_written": row["path_as_written"],
                                             "st_dev": row["st_dev"], "st_ino": row["st_ino"]}}

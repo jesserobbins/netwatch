@@ -51,14 +51,50 @@ def _requires(venv, name):
     return out
 
 
-def _marker_true(requirement, extras):
-    """A marker that is true under the recorded environment, or that guards our extra."""
+def marker_environment(t, runner=None):
+    """The PEP 508 environment of the venv's own interpreter.
+
+    Markers like `python_version >= "3.12"` decide whether a bound applies at all; guessing
+    from the host's Python would apply another interpreter's bounds to this venv.
+    """
+    argv = [str(Path(t["path"]) / "bin" / "python"), "-I", "-S", "-c",
+            "import json,platform,sys;"
+            "print(json.dumps({'os_name':__import__('os').name,"
+            "'sys_platform':sys.platform,"
+            "'platform_machine':platform.machine(),"
+            "'platform_python_implementation':platform.python_implementation(),"
+            "'python_version':'.'.join(platform.python_version_tuple()[:2]),"
+            "'python_full_version':platform.python_version(),"
+            "'implementation_name':sys.implementation.name,"
+            "'implementation_version':str(getattr(sys.implementation,'version',None) or ''),"
+            "'platform_release':platform.release(),"
+            "'platform_system':platform.system()}))"]
+    runner = runner or _local_run
+    try:
+        data = json.loads(runner(argv))
+    except Error as exc:
+        raise Error("Cannot evaluate environment markers: the venv's interpreter could "
+                    "not be run (%s)" % exc) from exc
+    data.setdefault("extra", "")
+    return data
+
+
+def _local_run(argv):
+    from . import adapters
+    return adapters.run({"name": "local", "kind": "uv", "host": "local"}, argv, timeout=60)
+
+
+def _marker_true(requirement, extras, environment=None):
+    """PEP 508: does this marker hold for this venv, under any of its extras?"""
     if requirement.marker is None:
         return True
-    text = str(requirement.marker)
-    for extra in extras:
-        if "extra ==" in text and ("'%s'" % extra in text or '"%s"' % extra in text):
-            return True
+    environment = dict(environment or {})
+    for extra in [""] + list(extras or ()):
+        try:
+            if requirement.marker.evaluate({**environment, "extra": extra}):
+                return True
+        except (KeyError, ValueError):
+            continue
     return False
 
 
@@ -78,7 +114,7 @@ def _satisfies(version, requirement):
         return False
 
 
-def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None):
+def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None, environment=None):
     """Choose the pinned set: every eligible upgrade, under the environment's own bounds.
 
     Two passes, then a fixed point. Pass 1 derives bounds from the full inventory and
@@ -92,8 +128,17 @@ def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None):
     supplied_names = [c["name"] for c in supplied]
     if limit is not None:
         supplied = supplied[:limit]
+    # The marker environment costs one subprocess, so it is read only when a requirement
+    # actually carries a marker.
+    def environment_for():
+        nonlocal environment
+        if environment is None:
+            environment = marker_environment({"path": venv})
+        return environment
+
     budget = len(installed) + 1
     retired, selected, blocked = set(), {}, set()
+    in_force = {}
     for _ in range(budget):
         constraints = {}
         for name in installed:
@@ -106,9 +151,13 @@ def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None):
                     requirement = Requirement(raw)
                 except InvalidRequirement:
                     continue
-                if requirement.url or not _marker_true(requirement, extras):
+                if requirement.url or not _marker_true(
+                        requirement, extras,
+                        environment_for() if requirement.marker is not None else None):
                     continue
                 constraints.setdefault(requirement.name.lower(), []).append(requirement)
+                if name not in selected:
+                    in_force[_constraint_line(requirement)] = name
         chosen, blocked = {}, set()
         for candidate in supplied:
             name = candidate["name"]
@@ -141,11 +190,27 @@ def derive(venv, packages, candidates, *, extras=(), tool=None, limit=None):
                     leads.append({"type": "extras", "package": name, "by": other,
                                   "detail": "referenced with extras %s by %s; pinned without them"
                                             % (sorted(requirement.extras), other)})
-                elif _marker_true(requirement, extras):
+                elif _marker_true(requirement, extras,
+                                  environment_for() if requirement.marker is not None else None):
                     pin_extras |= set(requirement.extras)
         pins.append({"name": name, "version": version, "extras": sorted(pin_extras)})
     return {"pins": pins, "leads": leads, "excluded": sorted(set(supplied_names) - set(selected)),
-            "blocked": sorted(blocked)}
+            "blocked": sorted(blocked),
+            # The same bounds the selection used: an install that is only *selected* under
+            # them is not constrained by them, and uv would resolve past them.
+            "constraints": sorted(line for line in in_force
+                                  if not any(pin["name"].lower() == in_force[line].lower()
+                                             for pin in pins))}
+
+
+def _constraint_line(requirement):
+    """A constraint line without its marker: the marker already decided it applies."""
+    line = requirement.name
+    if requirement.extras:
+        line += "[%s]" % ",".join(sorted(requirement.extras))
+    if requirement.specifier:
+        line += str(requirement.specifier)
+    return line
 
 
 def pin_text(pin):
@@ -269,17 +334,3 @@ def command(venv, constraints_path, pins, index_options=()):
 def redacted(argv):
     """The argv with any credential-bearing URL stripped, for display and comparison."""
     return [sources.strip_credentials(token) if "://" in token else token for token in argv]
-
-
-def redacted(argv):
-    """The argv with any credential-bearing URL stripped, for display and comparison."""
-    return [sources.strip_credentials(token) if "://" in token else token for token in argv]
-
-
-def plan_body(venv, constraints, pins, index_options=(), *, target, extras=()):
-    """Everything an approval needs to name exactly what will run."""
-    argv = command(venv, constraints, pins, index_options)
-    return {"target": target, "commands": [argv], "pins": pins,
-            "extras": sorted(extras), "index_options": list(index_options),
-            "command_redacted": redacted(argv),
-            "command_digest": digest(argv)}

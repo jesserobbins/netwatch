@@ -20,11 +20,37 @@ FINGERPRINT_ENV = ("UV_INDEX_URL", "UV_EXTRA_INDEX_URL", "UV_DEFAULT_INDEX", "UV
                    "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST")
 CONSTRAINTS_DIR = "constraints"
 LOCAL = {"name": "local", "kind": "uv", "host": "local"}
+DEFAULT_STATE = os.path.expanduser("~/.local/state/netwatch")
 
 
 def local_runner(argv, **kw):
-    """The default one-argv runner: local, bounded, and the same call the kinds use."""
-    return adapters.run(LOCAL, argv, **kw)
+    """Local, bounded, and run from netwatch's state directory.
+
+    uv reads configuration from the working directory upward, so inheriting the launch
+    directory would let a repo-local `[tool.uv]` shape resolution. Pinning the cwd keeps
+    that out of the decision, and the fingerprint hashes whatever the state dir's own
+    hierarchy still supplies.
+    """
+    return adapters.run({**LOCAL, "path": kw.pop("cwd", DEFAULT_STATE)}, argv, **kw)
+
+
+def uv_config_files(state_dir=None):
+    """Every uv configuration file discovery would read from the state directory up."""
+    base = Path(state_dir or DEFAULT_STATE).expanduser().resolve()
+    found = []
+    for directory in [base, *base.parents]:
+        for name in ("uv.toml", "pyproject.toml"):
+            candidate = directory / name
+            if candidate.is_file():
+                found.append(str(candidate))
+    for path in (Path(os.path.expanduser("~/.config/uv/uv.toml")),
+                 Path("/etc/uv/uv.toml")):
+        if path.is_file():
+            found.append(str(path))
+    explicit = os.environ.get("UV_CONFIG_FILE")
+    if explicit and Path(explicit).is_file():
+        found.append(explicit)
+    return found
 
 
 def stored_state(store, t):
@@ -156,17 +182,20 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
         identity, source, payload = _identity(t, runner)
         event["identity"], event["identity_input"] = identity, source
         if identity != "ok":
-            event["complete"] = (identity != "unreadable")
+            # An unreadable input is recorded, counted and reported: the check ran to its
+            # end and found nothing readable, so this event is complete. Marking it
+            # incomplete would forbid the two-in-a-row rule from ever firing.
+            event["complete"] = True
         if identity == "ok":
             recovering = lifecycle.recovery_candidate(row) and not twins
-            # (c2) publication, then (c3) the re-read, only when identity passed
-            if not lifecycle.recovery_candidate(row):
-                probe.cleanup(t["path"])
-                published, token = probe.publish(t["path"])
-                if published == "failed":
-                    event["token"] = "write_failed"
-                elif published in ("published", "present"):
-                    event["token"] = "usable"
+            # (c2) publication, then (c3) the re-read, only when identity passed. A
+            # recovering venv is published into like any other: its token came back with it.
+            probe.cleanup(t["path"])
+            published, token = probe.publish(t["path"])
+            if published == "failed":
+                event["token"] = "write_failed"
+            elif published in ("published", "present"):
+                event["token"] = "usable"
             again, source2, payload2 = _identity(t, runner)
             if again != "ok":
                 event["identity"], event["identity_input"] = again, source2
@@ -278,9 +307,15 @@ def _version_of(packages, name):
 
 
 def _index_options(t):
-    """The venv's recorded index options, read live; empty when it records none."""
+    """The venv's recorded index options, raw, read live: what uv must authenticate with."""
     seen = userlane.describe(t["path"]) or {}
     return seen.get("index_options") or []
+
+
+def _index_options_redacted(t):
+    """The same list with credentials stripped: what may be stored, shown or compared."""
+    seen = userlane.describe(t["path"]) or {}
+    return seen.get("index_options_redacted") or []
 
 
 def _launchers(t):
@@ -318,7 +353,7 @@ def _report(t, packages, findings, warnings, advisories_ok, now, updates=(), upd
             "update_error": update_error, "coverage": None, "matcher_revision": 1}
 
 
-def fingerprint():
+def fingerprint(state_dir=None):
     """What the resolution would read: the UV/PIP environment plus uv's own bytes.
 
     Credential-bearing values are redacted before hashing, so rotating a token never
@@ -335,6 +370,14 @@ def fingerprint():
                                        int(binary.stat().st_mtime)])
     except OSError:
         env["uv_executable"] = "absent"
+    # The configuration files themselves, not just the variables that point at them.
+    contents = {}
+    for path in uv_config_files(state_dir):
+        try:
+            contents[path] = digest(Path(path).read_text(errors="replace"))
+        except OSError:
+            contents[path] = "unreadable"
+    env["uv_config_files"] = contents
     return digest(env)
 
 
@@ -357,34 +400,47 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         raise Error("Could not write a probe token into %s" % t["path"])
     seen = userlane.describe(t["path"]) or {}
     index_options = seen.get("index_options") or []
-    first = fingerprint()
+    held, undetermined = _origin_policy(t["path"], packages)
+    if undetermined:
+        raise Error("%s has an undetermined origin (%s); netwatch cannot say what its "
+                    "bytes mean, so it will not plan an upgrade"
+                    % (undetermined[0], undetermined[1]))
+    first = fingerprint(state_dir)
     outdated = _outdated(t, runner, index_options)
-    second = fingerprint()
+    second = fingerprint(state_dir)
     if first != second:
         raise Error("Configuration changed while candidates were resolved; nothing saved")
-    result = pins.derive(t["path"], packages, outdated,
+    result = pins.derive(t["path"], [p for p in packages if p["name"] not in held],
+                         [c for c in outdated if c["name"] not in held],
                          extras=seen.get("extras") or [], tool=t["name"])
+    result["leads"] = list(result.get("leads") or []) + [
+        {"type": "origin", "package": name,
+         "detail": "installed from %s; held at its current version" % kind}
+        for name, kind in sorted(held.items())]
+    result["held"] = sorted(held)
     if not result["pins"]:
         raise Error("No upgrade is available that respects this environment's bounds")
-    if fingerprint() != first:
+    if fingerprint(state_dir) != first:
         raise Error("Configuration changed while the pins were derived; nothing saved")
     baseline = _consistency(t, runner)
     approved_origins = _origins(t["path"])
-    constraints = _write_constraints(state_dir, result["pins"], seen.get("index_options") or [])
+    constraints = _write_constraints(state_dir, result["pins"], result.get("constraints") or [])
     plan_pins = result["pins"]
     body = {"target": t, "generation": row["generation"],
-            "commands": [pins.command(t["path"], constraints["path"], plan_pins,
-                                      seen.get("index_options") or [])],
             "pins": plan_pins, "extras": seen.get("extras") or [],
-            "index_options": seen.get("index_options") or [],
+            "index_options": _index_options_redacted(t),
             "token": token, "fingerprint": first,
             "consistency_baseline": baseline, "origins": approved_origins,
             "constraints": constraints,
             "inventory_digest": inventory_digest(t["path"], packages),
             "marker_env": marker_env(t),
-            "index_digest": digest(index_options),
+            "index_digest": digest(_index_options_redacted(t)),
             "expires_at": now + 3600, "leads": result["leads"]}
-    body["commands_redacted"] = [pins.redacted(argv) for argv in body["commands"]]
+    # Only the redacted form is stored: the raw index URL is read from the venv's own
+    # metadata at the moment of use, so no credential ever lands in the database.
+    body["commands_redacted"] = [pins.redacted(
+        pins.command(t["path"], constraints["path"], plan_pins,
+                     seen.get("index_options") or []))]
     with store.transaction():
         current = stored_state(store, t)
         if current != row:
@@ -418,13 +474,18 @@ def _outdated(t, runner, index_options=None):
     return candidates
 
 
-def _write_constraints(state_dir, plan_pins, index_options):
-    """The approval carries its own constraint file, and the plan carries its digest."""
-    base = Path(state_dir or os.path.expanduser("~/.local/state/netwatch"))
+def _write_constraints(state_dir, plan_pins, bounds=()):
+    """The approval carries its own constraint file, and the plan carries its digest.
+
+    The retained bounds go in with the pins: selecting under a bound and then not passing
+    the bound to the installer lets uv resolve a transitive dependency past it.
+    """
+    base = Path(state_dir or DEFAULT_STATE)
     directory = base / CONSTRAINTS_DIR
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / ("preview-%s.txt" % secrets.token_hex(8))
-    body = "\n".join(pins.pin_text(pin) for pin in plan_pins) + "\n"
+    lines = [pins.pin_text(pin) for pin in plan_pins] + list(bounds)
+    body = "\n".join(lines) + "\n"
     path.write_text(body)
     return {"path": str(path), "digest": digest(body), "bytes": body}
 
@@ -472,6 +533,27 @@ def marker_env(t):
         return json.loads(adapters.run(LOCAL, argv, timeout=60))
     except (Error, ValueError, KeyError) as exc:
         raise Error("Could not read the interpreter's marker values: %s" % exc) from exc
+
+
+def _origin_policy(venv, packages):
+    """Which distributions are held at their version, and which make planning impossible.
+
+    An index upgrade replaces an install whose provenance is not the index. A direct, VCS
+    or local install is held (its upgrades come from that source); an origin that cannot be
+    read at all makes the target unplannable, because a plan that silently held it back
+    would be a guess presented as a decision.
+    """
+    held, undetermined = {}, None
+    for package in packages:
+        path = _dist_file(venv, package["name"], "direct_url.json")
+        if path is None:
+            continue
+        kind, data = pins.origin(path.parent)
+        if kind == "undetermined":
+            undetermined = (package["name"], (data or {}).get("error", "unreadable provenance"))
+        elif kind in ("direct", "vcs", "local"):
+            held[package["name"]] = kind
+    return held, undetermined
 
 
 def _consistency(t, runner):
@@ -543,6 +625,7 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     body = json.loads(row["body"])
     t = store.target(row["target"])
     state = stored_state(store, t)
+    state_dir = Path(body.get("constraints", {}).get("path", DEFAULT_STATE)).parent
 
     # (0) workflow gates
     if body.get("target") != t:
@@ -558,7 +641,7 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
         raise Error("Another update for this venv is running or needs attention")
     if now >= body["expires_at"]:
         raise Error("Preview expired; create a new one")
-    if fingerprint() != body["fingerprint"]:
+    if fingerprint(state_dir) != body["fingerprint"]:
         raise Error("Configuration changed since this preview; approval is stale")
 
     # (1) recorded path
@@ -585,7 +668,7 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
                     "stale approval); create a new one")
     if (userlane.describe(t["path"]) or {}).get("extras") != body.get("extras"):
         raise Error("The requested extras changed since this preview; create a new one")
-    if digest(_index_options(t)) != body.get("index_digest"):
+    if digest(_index_options_redacted(t)) != body.get("index_digest"):
         raise Error("The recorded index options changed since this preview; "
                     "approval is stale")
     if probe.read(t["path"]) != (status, token):
@@ -609,7 +692,7 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     with store.transaction():
         if stored_state(store, t) != state:
             raise Error("Target changed under us; nothing applied")
-        if fingerprint() != body["fingerprint"]:
+        if fingerprint(state_dir) != body["fingerprint"]:
             raise Error("Configuration changed during preflight; approval is stale")
         if _structural(t)[0] != "present":
             raise Error("The recorded path stopped resolving to the recorded realpath; "
@@ -633,11 +716,15 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
             raise Error("Plan was already claimed")
         store.event(t["name"], "approved_and_started",
                     {"plan": plan_id, "operator_uid": os.getuid(),
-                     "commands": body.get("commands_redacted") or body["commands"]})
+                     "commands": body.get("commands_redacted")})
     try:
         outcome, failure = "applied", None
+        argv = pins.command(t["path"], body["constraints"]["path"], body["pins"],
+                            _index_options(t))
+        if pins.redacted(argv) != (body.get("commands_redacted") or [None])[0]:
+            raise Error("The command no longer matches the approved shape; nothing run")
         try:
-            runner(body["commands"][0], timeout=1800)
+            runner(argv, timeout=1800)
         except Exception as exc:
             # Any failure of the install command is a failure to classify. What matters is
             # the state it left behind, never the exception's type.

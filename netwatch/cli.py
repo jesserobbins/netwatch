@@ -396,6 +396,8 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
             return 0
         elif args.command == "scan" and args.register:
             store = Store(args.db)
+            store.expire()
+            store.cleanup()
             result = scan.register(store, args.root, args.register, run_id=args.run)
             Console().print(result["summary"])
             for row in result["registered"]:
@@ -403,6 +405,8 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
             return 0
         elif args.command == "scan":
             store = Store(args.db)
+            store.expire()
+            store.cleanup()
             handles = scan.handles_from(args.handle)
             result = scan.run(store, args.root, depth=args.depth,
                               excludes=tuple(args.exclude), handles=handles, request=request)
@@ -414,6 +418,8 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
             return 0
         elif args.command == "report":
             store = Store(args.db)
+            store.expire()
+            store.cleanup()
             outcome = scan.report(store, args.path, request=request)
             if outcome["status"] != "written":
                 Console().print("%s: %s" % (outcome["path"], outcome["status"]))

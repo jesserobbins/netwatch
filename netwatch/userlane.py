@@ -85,9 +85,10 @@ def _uv_tool(venv: Path):
     entry = (tool.get("entrypoints") or [{}])[0]
     install_path = entry.get("install-path") if isinstance(entry, dict) else None
     bin_dir = Path(install_path).parent if install_path else venv / "bin"
+    raw = _receipt_index_options(receipt)
     return {"kind": UVTOOL, "name": main.get("name"), "extras": extras,
-            "bin_dir": str(bin_dir),
-            "index_options": _redact(_receipt_index_options(receipt))}
+            "bin_dir": str(bin_dir), "index_options": raw,
+            "index_options_redacted": _redact(raw)}
 
 
 PIP_CONFIG_PATHS = ("pip.conf", "pip/pip.conf", ".pip/pip.conf",
@@ -113,14 +114,8 @@ def _pip_conf_files(home=None):
     return [p for p in paths if p.is_file()]
 
 
-def pip_config_index_options(home=None):
-    """pip's effective index options, translated to the flags uv understands.
-
-    A pipx tool installed from a private index configured in `pip.conf` has empty
-    `pip_args` — pip reads pip.conf, uv reads neither it nor PIP_* — so replaying only
-    `pip_args` would silently resolve that tool against uv's default index.
-    """
-    import configparser
+def _pip_config_raw(home=None):
+    """The same translation, unredacted: the values uv has to authenticate with."""
     options = []
     env = (("PIP_INDEX_URL", "--index-url"), ("PIP_EXTRA_INDEX_URL", "--extra-index-url"),
            ("PIP_TRUSTED_HOST", "--trusted-host"))
@@ -129,6 +124,7 @@ def pip_config_index_options(home=None):
         if value:
             options.extend([flag, value])
     if not options:
+        import configparser
         for path in _pip_conf_files(home):
             parser = configparser.ConfigParser()
             try:
@@ -144,7 +140,17 @@ def pip_config_index_options(home=None):
                     options.extend([flag, value])
             if options:
                 break
-    return _redact(options)
+    return options
+
+
+def pip_config_index_options(home=None):
+    """pip's effective index options, translated to the flags uv understands.
+
+    A pipx tool installed from a private index configured in `pip.conf` has empty
+    `pip_args` — pip reads pip.conf, uv reads neither it nor PIP_* — so replaying only
+    `pip_args` would silently resolve that tool against uv's default index.
+    """
+    return _redact(_pip_config_raw(home))
 
 
 def _pipx(venv: Path):
@@ -158,11 +164,12 @@ def _pipx(venv: Path):
     bin_dir = venv / "bin"
     if apps and isinstance(apps[0], dict) and apps[0].get("__Path__"):
         bin_dir = Path(str(apps[0]["__Path__"]).replace("VENV", str(venv))).parent
-    recorded = _redact(_pip_args_index_options(main.get("pip_args")))
+    recorded = _pip_args_index_options(main.get("pip_args"))
     # pip_args only carry what pipx itself was told; pip's own configuration is what a
     # pip.conf-only install resolves against, so it is the fallback.
+    raw = recorded or _pip_config_raw()
     return {"kind": PIPX, "name": name, "extras": extras, "bin_dir": str(bin_dir),
-            "index_options": recorded or pip_config_index_options(),
+            "index_options": raw, "index_options_redacted": _redact(raw),
             "index_source": "pip_args" if recorded else "pip_config"}
 
 
