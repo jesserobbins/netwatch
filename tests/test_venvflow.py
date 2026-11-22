@@ -99,15 +99,14 @@ class CheckTests(VenvCase):
         self.assertTrue(venvflow._witness_equal({"kind": "token", "value": "a"},
                                                 {"kind": "inodes", "value": [1, 1, 1]}) is False)
 
-    def test_a_target_with_a_co_claimant_publishes_nothing(self):
-        """Two registrations on one venv: neither reports under both names."""
+    def test_an_in_service_target_still_publishes_beside_a_twin(self):
+        """The twin conflict does not silence the target that is in service."""
         self.store.add_target("uvtool", {"name": "twin", "kind": "uvtool", "host": "local",
                                          "path": str(self.venv / ".")})
-        with self.assertRaises(Exception) as caught:
-            venvflow.check(self.store, self.t, runner=runner_for("tool"),
-                           request=self.no_network)
-        self.assertIn("out of service", str(caught.exception))
-        self.assertIsNone(self.store.latest("tool"))
+        report = venvflow.check(self.store, self.t, runner=runner_for("tool"),
+                                request=self.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["tool"])
+        self.assertIsNotNone(self.store.latest("tool"))
 
     def test_a_missing_path_sets_nothing_on_the_first_observation(self):
         shutil.rmtree(self.venv)

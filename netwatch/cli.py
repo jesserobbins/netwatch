@@ -110,6 +110,24 @@ def dispatch(args, store, runner, request):
         store.cleanup()
     if args.command == "add":
         t = adapters.target(args.name, args.kind, args.host, args.path)
+        if t["kind"] in adapters.VENV_KINDS:
+            # A venv-bound target registered by hand needs the same facts a scan would
+            # record: the realpath the identity check compares against and the directory
+            # the manager exposes its launchers in.
+            seen = userlane.describe(t["path"])
+            if not seen or seen.get("kind") is None:
+                raise Error("%s is not a %s environment (%s)"
+                            % (t["path"], t["kind"], (seen or {}).get("error", "no manager metadata")))
+            for other in store.target_rows():
+                if other["name"] == t["name"] or other["removed"]:
+                    continue
+                if other["kind"] in adapters.VENV_KINDS and other.get("path") \
+                        and workflow.same_venv(other["path"], seen["realpath"]):
+                    raise Error("%s already tracks this venv; remove that target first"
+                                % other["name"])
+            t = {**t, "realpath": seen["realpath"], "bin_dir": seen["bin_dir"],
+                 "extras": seen.get("extras") or [],
+                 "index_options": seen.get("index_options_redacted") or []}
         with store.transaction():
             if store.db.execute("SELECT 1 FROM targets WHERE name=?", (args.name,)).fetchone():
                 raise Error("Environment already exists; use a new name rather than rewriting its history")

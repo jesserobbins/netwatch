@@ -698,3 +698,72 @@ class AddVenvKindTests(unittest.TestCase):
         self.assertEqual(t["kind"], "uvtool")
         with self.assertRaises(Exception):
             adapters.target("bad", "uvtool")          # the path is required
+
+
+class ClaimSetTests(Base):
+    """The Co-claimant set and who publishes, exactly as the Store section defines them."""
+
+    def twin(self, name, state, path, removed=0):
+        self.store.add_target("uvtool", {"name": name, "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(path)})
+        self.store.db.execute("UPDATE targets SET state=?, removed=? WHERE name=?",
+                              (state, removed, name))
+
+    def test_an_unresolved_path_row_is_not_a_co_claimant(self):
+        self.twin("gone", "unresolved_path", self.venv)
+        reports = venvflow.check(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network)
+        self.assertEqual([p["name"] for p in reports["packages"]], ["tool"])
+
+    def test_an_identity_mismatch_twin_does_not_silence_an_in_service_target(self):
+        self.twin("twin", "identity_mismatch", self.venv)
+        report = venvflow.check(self.store, self.t, runner=self.runner(),
+                                request=self.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["tool"])
+
+    def test_a_removed_row_is_not_a_co_claimant(self):
+        self.twin("retired", "live", self.venv, removed=1)
+        report = venvflow.check(self.store, self.t, runner=self.runner(),
+                                request=self.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["tool"])
+
+
+class PreviewStepTests(Base):
+    def test_preview_cleans_a_stale_probe_temp(self):
+        stale = self.venv / (probe.TEMP_PREFIX + "c" * 32)
+        stale.write_text("")
+        os.utime(stale, (time.time() - 7200,) * 2)
+        venvflow.preview(self.store, self.t, runner=self.runner(),
+                         request=self.no_network, state_dir=self.state)
+        self.assertFalse(stale.exists(), "preview must run the (p1) temp cleanup")
+
+    def test_preview_refuses_an_unreadable_probe_before_resolving(self):
+        (self.venv / probe.NAME).mkdir()          # a directory cannot be read as a token
+        with self.assertRaises(Exception) as caught:
+            venvflow.preview(self.store, self.t, runner=self.runner(),
+                             request=self.no_network, state_dir=self.state)
+        self.assertIn("probe token", str(caught.exception))
+
+
+class AddVenvTargetTests(unittest.TestCase):
+    def test_add_records_realpath_and_bin_dir_and_refuses_a_shared_venv(self):
+        import subprocess
+        from netwatch import cli
+        root = Path(tempfile.mkdtemp())
+        venv = make_venv(root, "ruffish")
+        db = root / "state.db"
+        args = cli.parser().parse_args(["--db", str(db), "add", "first", "uvtool",
+                                       "--path", str(venv)])
+        store = store_module.Store(db)
+        try:
+            created = cli.dispatch(args, store, None, None)
+            self.assertEqual(created["realpath"], os.path.realpath(venv))
+            self.assertTrue(created["bin_dir"])
+            second = cli.parser().parse_args(
+                ["--db", str(db), "add", "second", "uvtool", "--path", str(venv / ".")])
+            with self.assertRaises(Exception) as caught:
+                cli.dispatch(second, store, None, None)
+            self.assertIn("already tracks this venv", str(caught.exception))
+        finally:
+            store.close()
+            shutil.rmtree(root, ignore_errors=True)

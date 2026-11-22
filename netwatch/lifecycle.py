@@ -60,10 +60,12 @@ def publishable(row, co_claimants, recovering=False):
     """
     if row.get("removed"):
         return False
-    if co_claimants:
-        return False
     if row.get("state") in OUT_OF_SERVICE:
-        return bool(recovering)
+        # An out-of-service target publishes only when this run recovered it, and recovery
+        # is blocked while another registration still holds the venv.
+        return bool(recovering) and not co_claimants
+    # An in-service target publishes normally even beside a twin: the conflict silences the
+    # demoted twin, never the target that is in service.
     return True
 
 

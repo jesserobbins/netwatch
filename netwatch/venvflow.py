@@ -86,6 +86,9 @@ def co_claimants(store, t):
     for other in store.target_rows():
         if other["name"] == t["name"] or other["removed"]:
             continue
+        if other["state"] == "unresolved_path":
+            # The recorded path is gone for that row, so it cannot be holding the venv.
+            continue
         if other.get("path") and workflow.same_venv(other["path"], path):
             found.append(other)
     return found
@@ -422,6 +425,13 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     identity, source, packages = _identity(t, runner)
     if identity != "ok":
         raise Error("Identity check failed (%s: %s); nothing to preview" % (source, identity))
+    # (p0) the token is read before anything is written, so a malformed or unreadable probe
+    # is decided here rather than after the whole resolution bracket.
+    token_status, existing_token = probe.read(t["path"])
+    if token_status == "unreadable":
+        raise Error("The probe token in %s could not be read; nothing to preview" % t["path"])
+    # (p1) stale temp cleanup on every run that reaches this step.
+    probe.cleanup(t["path"])
     published, token = probe.publish(t["path"])
     if published == "failed":
         raise Error("Could not write a probe token into %s" % t["path"])
@@ -461,7 +471,8 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
                 if status_now == "usable" and token_now == token:
                     store.db.execute(
                         "UPDATE targets SET state='live', state_seq=state_seq+1 "
-                        "WHERE name=? AND state='not_bindable'", (t["name"],))
+                        "WHERE name=? AND state='not_bindable' AND generation=? AND state_seq=?",
+                        (t["name"], row["generation"], row["state_seq"]))
                     store.event(t["name"], "state_changed",
                                 {"from": "not_bindable", "to": "live",
                                  "reason": "token recovered; no eligible update"})
@@ -535,7 +546,8 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
             if status_now == "usable" and token_now == token:
                 store.db.execute(
                     "UPDATE targets SET state='live', state_seq=state_seq+1 "
-                    "WHERE name=? AND state='not_bindable'", (t["name"],))
+                    "WHERE name=? AND state='not_bindable' AND generation=? AND state_seq=?",
+                    (t["name"], row["generation"], row["state_seq"]))
                 store.event(t["name"], "state_changed",
                             {"from": "not_bindable", "to": "live", "reason": "token recovered"})
         cur = store.db.execute(

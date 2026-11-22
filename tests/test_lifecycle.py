@@ -133,8 +133,16 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(lifecycle.publishable(row("live"), []))
         self.assertFalse(lifecycle.publishable(row("identity_mismatch"), []))
         self.assertFalse(lifecycle.publishable(row("unresolved_path"), []))
-        self.assertFalse(lifecycle.publishable(row("live"), [{"name": "twin"}]))
         self.assertTrue(lifecycle.publishable(row("not_bindable"), []))
+
+    def test_an_in_service_target_publishes_even_with_a_co_claimant(self):
+        """The conflict silences the demoted twin, never the target that is in service."""
+        self.assertTrue(lifecycle.publishable(row("live"), [{"name": "twin"}]))
+
+    def test_recovery_is_blocked_while_a_co_claimant_holds_the_venv(self):
+        self.assertFalse(lifecycle.publishable(row("unresolved_path"), [{"name": "twin"}],
+                                               recovering=True))
+        self.assertTrue(lifecycle.publishable(row("unresolved_path"), [], recovering=True))
 
     def test_a_recovering_run_publishes(self):
         self.assertTrue(lifecycle.publishable(row("unresolved_path"), [], recovering=True))
