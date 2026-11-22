@@ -384,6 +384,9 @@ def fingerprint(state_dir=None):
 def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, state_dir=None):
     """Select the upgrade and save the plan, or refuse with the reason."""
     now = int(time.time()) if now is None else int(now)
+    # Approval artifacts live beside the database that records the plan, which is also
+    # where cleanup looks: one directory, wherever --db points.
+    state_dir = state_dir or Path(getattr(store, "db_path", DEFAULT_STATE)).parent
     row = stored_state(store, t)
     if row["removed"]:
         raise Error("Target is removed; nothing to preview")

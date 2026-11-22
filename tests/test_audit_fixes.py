@@ -263,3 +263,27 @@ class FingerprintEnvironmentTests(unittest.TestCase):
         with mock.patch.object(venvflow.adapters, "run", side_effect=fake_run):
             venvflow.local_runner(["uv", "pip", "list"], cwd="/tmp/some-state")
         self.assertEqual(seen["path"], "/tmp/some-state")
+
+
+class DefaultStateDirTests(unittest.TestCase):
+    """Without an explicit state_dir, artifacts go beside the database cleanup reads."""
+
+    def test_preview_defaults_to_the_databases_directory(self):
+        root = Path(tempfile.mkdtemp())
+        state = root / "custom"
+        store = store_module.Store(state / "state.db")
+        try:
+            venv = make_venv(root, "tool")
+            store.add_target("uvtool", {"name": "tool", "kind": "uvtool", "host": "local",
+                                        "path": os.path.realpath(venv),
+                                        "realpath": os.path.realpath(venv)})
+            result = venvflow.preview(store, store.target("tool"), runner=Base.runner(self),
+                                      request=Base.no_network)
+            path = Path(result["constraints"]["path"])
+            self.assertTrue(str(path).startswith(str(state)), path)
+            store.db.execute("UPDATE plans SET status='stale'")
+            store.cleanup()
+            self.assertFalse(path.exists(), "cleanup must find the file preview wrote")
+        finally:
+            store.close()
+            shutil.rmtree(root, ignore_errors=True)
