@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from netwatch import pins, probe, store as store_module, userlane, venvflow
+from netwatch.core import Error
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -468,3 +469,103 @@ class BracketSequenceTests(Base):
                                  request=self.no_network, state_dir=self.state)
         self.assertIn("constraints file", str(caught.exception))
         self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())
+
+
+class PostInstallSequenceTests(Base):
+    """The post-upgrade sequence: probe, identity+inventory, consistency, probe again."""
+
+    def base_runner(self, listing_version="2.0", on_check=None, on_list=None,
+                    on_install=None):
+        installed = {"ran": False}
+
+        def run(argv, **kw):
+            if "install" in argv:
+                installed["ran"] = True
+                if on_install:
+                    on_install()
+                return ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0",
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return on_check() if on_check else "No broken requirements found."
+            if on_list and installed["ran"]:
+                on_list()
+            return json.dumps([{"name": "tool", "version": listing_version}])
+        return run
+
+    def preview_with(self, runner):
+        return venvflow.preview(self.store, self.t, runner=runner,
+                                request=self.no_network, state_dir=self.state)
+
+    def test_an_unreadable_post_install_consistency_check_needs_attention(self):
+        state = {"checks": 0}
+
+        def on_check():
+            state["checks"] += 1
+            if state["checks"] > 1:                      # the post-install run
+                raise Error("Command failed: uv pip check (exit 2)")
+            return "No broken requirements found."
+
+        runner = self.base_runner(on_check=on_check)
+        plan = self.preview_with(runner)
+        result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "needs_attention", result)
+        self.assertIn("unreadable", " ".join(result["problems"]))
+
+    def test_a_probe_change_during_the_post_install_observation_needs_attention(self):
+        after_install = {"n": 0}
+
+        def drift_probe():
+            after_install["n"] = 1
+
+        runner = self.base_runner(on_install=drift_probe)
+        plan = self.preview_with(runner)
+        real = probe.read
+
+        def drifting(venv):
+            status, value = real(venv)
+            if after_install["n"]:
+                after_install["n"] += 1
+                if after_install["n"] > 2:               # the second post-install read
+                    return ("usable", "00000000-0000-4000-8000-000000000000")
+            return (status, value)
+
+        with mock.patch.object(venvflow.probe, "read", side_effect=drifting):
+            result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                    request=self.no_network)
+        self.assertEqual(result["status"], "needs_attention", result)
+        self.assertIn("post-install observation", " ".join(result["problems"]))
+
+    def test_the_venv_stopping_being_this_tool_after_the_install_needs_attention(self):
+        def on_list():
+            (self.venv / "uv-receipt.toml").unlink(missing_ok=True)
+
+        runner = self.base_runner(on_list=on_list)
+        plan = self.preview_with(runner)
+        result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "needs_attention", result)
+        self.assertTrue(any("identity no longer holds" in p for p in result["problems"]), result)
+
+    def test_an_expired_plan_is_staled_and_its_artifact_removed(self):
+        runner = self.base_runner()
+        plan = self.preview_with(runner)
+        artifact = Path(plan["constraints"]["path"])
+        self.store.db.execute("UPDATE plans SET body=? WHERE id=?",
+                              (plan_body_with_expiry(self.store, plan["id"], 0), plan["id"]))
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                           request=self.no_network)
+        self.assertIn("staled", str(caught.exception))
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0], "stale")
+        self.assertFalse(artifact.exists())
+
+
+def plan_body_with_expiry(store, plan_id, expires_at):
+    body = json.loads(store.db.execute("SELECT body FROM plans WHERE id=?",
+                                       (plan_id,)).fetchone()[0])
+    body["expires_at"] = expires_at
+    return json.dumps(body)

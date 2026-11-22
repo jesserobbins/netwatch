@@ -432,6 +432,19 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         raise Error("No upgrade is available that respects this environment's bounds")
     if fingerprint(state_dir) != first:
         raise Error("Configuration changed while the pins were derived; nothing saved")
+    # (p7) the inventory the plan records is a listing inside the bracket, not the identity
+    # read: a change between them means the candidate set and the digest describe different
+    # environments.
+    try:
+        bracket_packages = userlane.inventory(t["path"], runner)
+    except Error as exc:
+        raise Error("Could not read the inventory while selecting: %s" % exc) from exc
+    if bracket_packages != packages:
+        raise Error("The installed set changed while candidates were selected; nothing saved")
+    # (p9) the third fingerprint, at the far end of the bracket
+    if fingerprint(state_dir) != first:
+        raise Error("Configuration changed before the plan was saved; nothing saved")
+    packages = bracket_packages
     baseline = _consistency(t, runner)
     approved_origins = _origins(t["path"])
     constraints = _write_constraints(state_dir, result["pins"], result.get("constraints") or [])
@@ -660,7 +673,18 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     if busy and busy != plan_id:
         raise Error("Another update for this venv is running or needs attention")
     if now >= body["expires_at"]:
-        raise Error("Preview expired; create a new one")
+        # Lazy expiry on this path too: the plan moves to stale and its artifact goes, so a
+        # refusal never leaves an applicable-looking proposal behind.
+        with store.transaction():
+            store.db.execute("UPDATE plans SET status='stale' WHERE id=? AND status='proposed'",
+                             (plan_id,))
+            store.event(t["name"], "plan_expired", {"plan": plan_id})
+        try:
+            Path(body["constraints"]["path"]).unlink()
+        except OSError:
+            pass
+        raise Error("Preview expired; it has been staled and its constraints file removed. "
+                    "Create a new one")
     if fingerprint(state_dir) != body["fingerprint"]:
         raise Error("Configuration changed since this preview; approval is stale")
 
@@ -778,6 +802,8 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
         except OSError:
             pass
 
+    # The post-upgrade sequence, in the spec's order: probe, identity and inventory, the
+    # consistency check, then the probe again.
     after_token = probe.read(t["path"])
     try:
         after_packages = userlane.inventory(t["path"], runner)
@@ -791,6 +817,10 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
         except Error:
             after_consistency = None
         after_origins = _origins(t["path"])
+    # Identity is read after the inventory and consistency check: a venv that stopped being
+    # this tool during those reads must not be reported as a successful upgrade.
+    after_identity = _identity(t, runner)
+    second_token = probe.read(t["path"])
 
     # The result row carries the generation it was produced under, so a plan result from
     # before a remove/revive never reads as current history.
@@ -800,6 +830,11 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
         problems = []
         if after_token != (status, token):
             problems.append("the probe token changed; the venv was replaced")
+        if second_token != after_token:
+            problems.append("the probe changed during the post-install observation")
+        if after_identity[0] != "ok":
+            problems.append("identity no longer holds after the install (%s: %s)"
+                            % (after_identity[1], after_identity[0]))
         if after_packages is None:
             problems.append("the inventory could not be read after the install")
         else:
@@ -808,13 +843,24 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
                 if installed.get(pin["name"]) != pin["version"]:
                     problems.append("%s is installed at %s, not the approved %s"
                                     % (pin["name"], installed.get(pin["name"]), pin["version"]))
-            new_entries = sorted(set(after_consistency or []) - set(body["consistency_baseline"]))
-            if new_entries:
-                problems.append("dependency consistency got worse: " + new_entries[0])
+            if after_consistency is None:
+                problems.append("the post-install consistency check was unreadable")
+            else:
+                new_entries = sorted(set(after_consistency)
+                                     - set(body["consistency_baseline"]))
+                if new_entries:
+                    problems.append("dependency consistency got worse: " + new_entries[0])
             changed_origins = [name for name, value in (after_origins or {}).items()
                                if body["origins"].get(name) not in (None, value)]
             if changed_origins:
                 problems.append("origin changed for " + changed_origins[0])
+            # A distribution the plan held (direct/VCS/local) must still be there: its pin
+            # was supposed to hold it, so its absence means the resolution removed it.
+            held = set(body.get("held") or [])
+            installed_now = {p["name"] for p in after_packages}
+            removed = sorted(name for name in held if name not in installed_now)
+            if removed:
+                problems.append("%s was removed although the plan held it" % removed[0])
         if problems:
             outcome = "needs_attention"
             result["problems"] = problems

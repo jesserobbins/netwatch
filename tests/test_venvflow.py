@@ -135,14 +135,14 @@ class PreviewTests(VenvCase):
         self.assertEqual(probe.read(self.venv)[0], "usable")
 
     def test_a_changing_fingerprint_saves_no_plan(self):
-        with mock.patch.object(venvflow, "fingerprint", side_effect=["a", "b"]):
+        with mock.patch.object(venvflow, "fingerprint", side_effect=["a", "b", "b", "b"]):
             with self.assertRaises(Exception):
                 venvflow.preview(self.store, self.t, runner=runner_for("tool"),
                                  request=self.no_network, state_dir=self.root / "state")
         self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())
 
     def test_stable_fingerprints_save_the_plan(self):
-        with mock.patch.object(venvflow, "fingerprint", side_effect=["a", "a", "a"]):
+        with mock.patch.object(venvflow, "fingerprint", side_effect=["a", "a", "a", "a"]):
             result = venvflow.preview(self.store, self.t, runner=runner_for("tool"),
                                       request=self.no_network, state_dir=self.root / "state")
         self.assertEqual(result["fingerprint"], "a")
