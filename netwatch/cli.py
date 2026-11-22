@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 import sqlite3
 
-from . import adapters, sources, workflow
+from . import adapters, scan, sources, workflow
 from .core import Error, text
 from .store import Store
 
@@ -51,6 +51,12 @@ def parser():
     resolve.add_argument("plan", type=int)
     resolve.add_argument("--note", required=True)
     commands.add_parser("demo", help="run a temporary simulated workflow; no network or package operations")
+    sc = commands.add_parser("scan", help="classify environments under a root; writes tickets into owned repos")
+    sc.add_argument("root")
+    sc.add_argument("--list", action="store_true",
+                    help="classification only: no git, no gh, no tool enumeration, no store")
+    sc.add_argument("--depth", type=int, default=scan.DEFAULT_DEPTH, help="how deep to walk (default 4)")
+    sc.add_argument("--exclude", action="append", default=[], metavar="PAT", help="skip paths matching PAT (repeatable)")
     return p
 
 
@@ -337,6 +343,12 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
         if args.command == "demo":
             from .demo import demo
             result = demo()
+        elif args.command == "scan":
+            if not args.list:
+                raise Error("plain scan lands with ticket writes; use --list to classify first")
+            Console().print(scan.list_only(args.root, depth=args.depth,
+                                           excludes=tuple(args.exclude), db=args.db))
+            return 0
         else:
             store = Store(args.db)
             result = dispatch(args, store, runner, request)
