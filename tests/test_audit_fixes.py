@@ -391,3 +391,80 @@ class PlanByteIntegrityTests(ApplyCase if False else Base):
             venvflow.apply(self.store, preview["id"], yes=True, runner=self.runner(),
                            request=self.no_network)
         self.assertIn("do not match their digest", str(caught.exception))
+
+
+class BracketSequenceTests(Base):
+    """The Task 8-9 bracket guarantees, exercised on the real paths."""
+
+    def runner_seq(self, listings):
+        """Successive `uv pip list` answers, so the bracket's own read can differ."""
+        calls = {"n": 0}
+
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0",
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            index = min(calls["n"], len(listings) - 1)
+            calls["n"] += 1
+            return json.dumps([{"name": "tool", "version": v} for v in [listings[index]]])
+        return run
+
+    def test_a_change_after_the_identity_listing_is_caught_inside_the_bracket(self):
+        """(3)'s digest must come from the bracket's own listing, not step (2)'s."""
+        runner = self.runner_seq(["1.0", "1.0", "1.0", "1.1"])
+        preview = venvflow.preview(self.store, self.t, runner=runner,
+                                   request=self.no_network, state_dir=self.state)
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, preview["id"], yes=True, runner=runner,
+                           request=self.no_network)
+        self.assertIn("approval is stale", str(caught.exception))
+
+    def test_preview_re_reads_identity_after_publication(self):
+        """(p1): a venv that took the path before tokening must not be planned for."""
+        statuses = [("ok", "none", [{"name": "tool", "version": "1.0"}]),
+                    ("failed", "manager_metadata", "metadata names other")]
+        with mock.patch.object(venvflow, "_identity", side_effect=statuses):
+            with self.assertRaises(Exception) as caught:
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        self.assertIn("tokened", str(caught.exception))
+
+    def test_a_refused_claim_leaves_no_verified_copy_behind(self):
+        """A refused claim must delete the copy step (5) wrote."""
+        preview = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                   request=self.no_network, state_dir=self.state)
+        constraints_dir = Path(preview["constraints"]["path"]).parent
+        real = venvflow.stored_state
+        calls = {"n": 0}
+
+        def drifting(store, target):
+            calls["n"] += 1
+            state = real(store, target)
+            if calls["n"] > 1:            # the claim's own re-read sees a moved target
+                return {**state, "state_seq": state["state_seq"] + 1}
+            return state
+
+        with mock.patch.object(venvflow, "stored_state", side_effect=drifting):
+            with self.assertRaises(Exception) as caught:
+                venvflow.apply(self.store, preview["id"], yes=True, runner=self.runner(),
+                               request=self.no_network)
+        self.assertIn("Target changed under us", str(caught.exception))
+        self.assertEqual(list(constraints_dir.glob("apply-*.tmp")), [],
+                         "a refused claim must not leave the verified copy behind")
+
+    def test_a_vanished_constraints_file_saves_no_plan(self):
+        real = venvflow._write_constraints
+
+        def swept(state_dir, plan_pins, bounds=()):
+            result = real(state_dir, plan_pins, bounds)
+            Path(result["path"]).unlink()
+            return result
+
+        with mock.patch.object(venvflow, "_write_constraints", side_effect=swept):
+            with self.assertRaises(Exception) as caught:
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        self.assertIn("constraints file", str(caught.exception))
+        self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())

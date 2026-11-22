@@ -401,6 +401,13 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     published, token = probe.publish(t["path"])
     if published == "failed":
         raise Error("Could not write a probe token into %s" % t["path"])
+    # (p1) the identity read repeats after publication: a venv that took the path between
+    # the read and the write would have received this marker.
+    after_publish, source2, packages2 = _identity(t, runner)
+    if after_publish != "ok":
+        raise Error("The environment changed while it was being tokened (%s: %s); "
+                    "nothing to preview" % (source2, after_publish))
+    packages = packages2 if isinstance(packages2, list) else packages
     seen = userlane.describe(t["path"]) or {}
     index_options = seen.get("index_options") or []
     held, undetermined = _origin_policy(t["path"], packages)
@@ -444,10 +451,20 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
     body["commands_redacted"] = [pins.redacted(
         pins.command(t["path"], constraints["path"], plan_pins,
                      seen.get("index_options") or []))]
+    # (p6) confirmation: the venv being approved is the venv that was read and tokened.
+    confirmed, source3, _ = _identity(t, runner)
+    if confirmed != "ok":
+        raise Error("The environment changed while the plan was being built (%s: %s); "
+                    "nothing saved" % (source3, confirmed))
     with store.transaction():
         current = stored_state(store, t)
         if current != row:
             raise Error("Target changed while previewing; nothing saved")
+        # the artifact the plan names must still be the artifact on disk
+        if not Path(constraints["path"]).is_file() or \
+                digest(Path(constraints["path"]).read_text()) != constraints["digest"]:
+            raise Error("The plan's constraints file changed while the plan was being "
+                        "saved; nothing saved")
         status, current_token = probe.read(t["path"])
         if status != "usable" or current_token != token:
             raise Error("The environment's probe changed while previewing; nothing saved")
@@ -659,11 +676,17 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
     if co_claimants(store, t):
         raise Error("Another target tracks this venv; remove it first")
 
-    # (3) binding bracket
+    # (3) binding bracket — first token read, then the bracket's *own* listing (the
+    # step-(2) listing is an identity observation, not the digest observation), then a
+    # second token read.
     status, token = probe.read(t["path"])
     if status != "usable" or token != body["token"]:
         raise Error("The environment's probe changed since this preview; approval is stale")
-    if inventory_digest(t["path"], packages) != body["inventory_digest"]:
+    try:
+        bracket_packages = userlane.inventory(t["path"], runner)
+    except Error as exc:
+        raise Error("Could not read the inventory inside the binding bracket: %s" % exc) from exc
+    if inventory_digest(t["path"], bracket_packages) != body["inventory_digest"]:
         raise Error("Installed versions or metadata changed since this preview; "
                     "approval is stale")
     if marker_env(t) != body.get("marker_env"):
@@ -697,34 +720,42 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
 
     # claim: everything above re-checked once more, under the write lock
     before_records = _record_mismatches(t["path"])
-    with store.transaction():
-        if stored_state(store, t) != state:
-            raise Error("Target changed under us; nothing applied")
-        if fingerprint(state_dir) != body["fingerprint"]:
-            raise Error("Configuration changed during preflight; approval is stale")
-        if _structural(t)[0] != "present":
-            raise Error("The recorded path stopped resolving to the recorded realpath; "
-                        "nothing applied")
-        if co_claimants(store, t):
-            raise Error("Another target began tracking this venv; nothing applied")
-        if probe.read(t["path"]) != (status, token):
-            raise Error("The probe changed during preflight; nothing applied")
-        # The last check before any command starts: the inputs the approval named must
-        # still be the inputs this run would use.
-        if digest(_index_options_redacted(t)) != body.get("index_digest"):
-            raise Error("The recorded index options changed during preflight; "
-                        "approval is stale")
-        if marker_env(t) != body.get("marker_env"):
-            raise Error("The interpreter changed during preflight; approval is stale")
-        if (userlane.describe(t["path"]) or {}).get("extras") != body.get("extras"):
-            raise Error("The requested extras changed during preflight; approval is stale")
-        updated = store.db.execute(
-            "UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (plan_id,))
-        if updated.rowcount != 1:
-            raise Error("Plan was already claimed")
-        store.event(t["name"], "approved_and_started",
-                    {"plan": plan_id, "operator_uid": os.getuid(),
-                     "commands": body.get("commands_redacted")})
+    try:
+        with store.transaction():
+            if stored_state(store, t) != state:
+                raise Error("Target changed under us; nothing applied")
+            if fingerprint(state_dir) != body["fingerprint"]:
+                raise Error("Configuration changed during preflight; approval is stale")
+            if _structural(t)[0] != "present":
+                raise Error("The recorded path stopped resolving to the recorded realpath; "
+                            "nothing applied")
+            if co_claimants(store, t):
+                raise Error("Another target began tracking this venv; nothing applied")
+            if probe.read(t["path"]) != (status, token):
+                raise Error("The probe changed during preflight; nothing applied")
+            # The last check before any command starts: the inputs the approval named must
+            # still be the inputs this run would use.
+            if digest(_index_options_redacted(t)) != body.get("index_digest"):
+                raise Error("The recorded index options changed during preflight; "
+                            "approval is stale")
+            if marker_env(t) != body.get("marker_env"):
+                raise Error("The interpreter changed during preflight; approval is stale")
+            if (userlane.describe(t["path"]) or {}).get("extras") != body.get("extras"):
+                raise Error("The requested extras changed during preflight; approval is stale")
+            updated = store.db.execute(
+                "UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (plan_id,))
+            if updated.rowcount != 1:
+                raise Error("Plan was already claimed")
+            store.event(t["name"], "approved_and_started",
+                        {"plan": plan_id, "operator_uid": os.getuid(),
+                         "commands": body.get("commands_redacted")})
+    except BaseException:
+        # A refused claim must not leave the verified copy behind.
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
     try:
         outcome, failure = "applied", None
         # Step (5)'s verified copy is what runs: the approved bytes, at a path this apply
