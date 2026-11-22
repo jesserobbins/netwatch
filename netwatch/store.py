@@ -10,6 +10,10 @@ from . import sources
 from .core import Error, canonical
 
 
+SCHEMA_VERSION = 11
+BUSY_TIMEOUT_SECONDS = 60
+
+
 class Store:
     def __init__(self, path):
         path = Path(path).expanduser()
@@ -20,21 +24,41 @@ class Store:
         os.close(fd)
         if path.stat().st_uid != os.geteuid() or path.stat().st_mode & 0o077:
             raise Error("Database must be owned by this user with mode 600")
-        self.db = sqlite3.connect(path, timeout=10, isolation_level=None)
+        # The busy timeout is the waiting side's setting, so it governs how long a
+        # concurrent command queues behind a writer rather than failing outright. One
+        # registration batch holds the write lock across its listings, so the value has
+        # to cover that batch, not just a single statement.
+        self.db = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+        self.db.execute("PRAGMA busy_timeout=%d" % (BUSY_TIMEOUT_SECONDS * 1000,))
         self.db.row_factory = sqlite3.Row
         schema = self.db.execute("PRAGMA user_version").fetchone()[0]
         tables = self.db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        if schema != 10 and (schema or tables):
+        if schema not in (0, 10, SCHEMA_VERSION):
+            self.db.close()
+            raise Error("Incompatible old database; keep it for history and use a new --db path")
+        if schema == 0 and tables:
+            # A database written before versioning carries tables but no user_version;
+            # guessing what version it is would be a guess about history.
             self.db.close()
             raise Error("Incompatible old database; keep it for history and use a new --db path")
         self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS targets(name TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS targets(
+                name TEXT PRIMARY KEY, body TEXT NOT NULL,
+                kind TEXT, state TEXT, removed INTEGER,
+                generation INTEGER, state_seq INTEGER);
             CREATE TABLE IF NOT EXISTS scans(id INTEGER PRIMARY KEY, target TEXT, at INTEGER, body TEXT);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, target TEXT, at INTEGER, kind TEXT, body TEXT);
             CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, at INTEGER, body TEXT);
             CREATE TABLE IF NOT EXISTS plans(id INTEGER PRIMARY KEY, target TEXT, at INTEGER, status TEXT, body TEXT, result TEXT);
-            PRAGMA user_version=10;
         """)
+        if schema == 10:
+            self._migrate_10_to_11()
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS scan_runs(id INTEGER PRIMARY KEY, root TEXT, at INTEGER, counts_json TEXT);
+            CREATE TABLE IF NOT EXISTS scan_records(run_id INTEGER, lane TEXT, ordinal INTEGER, item_path TEXT, detail_json TEXT);
+            PRAGMA user_version=%d;
+        """ % (SCHEMA_VERSION,))
+        self.schema_version = self.db.execute("PRAGMA user_version").fetchone()[0]
 
     def close(self):
         self.db.close()
@@ -49,6 +73,81 @@ class Store:
             raise
         else:
             self.db.commit()
+
+    def _migrate_10_to_11(self):
+        """One transaction, re-checked under the write lock, guarded per column.
+
+        The version gate accepts exactly 10 and exactly 11, so a later stage cannot
+        add a column without inventing version 12: everything the lifecycle needs has
+        to land here or not at all.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if self.db.execute("PRAGMA user_version").fetchone()[0] != 10:
+                self.db.rollback()
+                return
+            present = {row[1] for row in self.db.execute("PRAGMA table_info(targets)")}
+            for name, ddl in (
+                ("kind", "TEXT"),
+                ("state", "TEXT"),
+                ("removed", "INTEGER"),
+                ("generation", "INTEGER"),
+                ("state_seq", "INTEGER"),
+            ):
+                if name not in present:
+                    self.db.execute("ALTER TABLE targets ADD COLUMN %s %s" % (name, ddl))
+            for row in self.db.execute("SELECT name, body FROM targets").fetchall():
+                try:
+                    body = json.loads(row[1])
+                except ValueError:
+                    body = {}
+                self.db.execute(
+                    "UPDATE targets SET kind=?, state=? WHERE name=?",
+                    (body.get("kind"), "live", row[0]))
+            self.db.execute("UPDATE targets SET removed=?, generation=?, state_seq=?", (0, 1, 0))
+            self.db.execute("CREATE TABLE IF NOT EXISTS scan_runs(id INTEGER PRIMARY KEY, root TEXT, at INTEGER, counts_json TEXT)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS scan_records(run_id INTEGER, lane TEXT, ordinal INTEGER, item_path TEXT, detail_json TEXT)")
+            self.db.execute("PRAGMA user_version=%d" % (SCHEMA_VERSION,))
+        except BaseException:
+            self.db.rollback()
+            raise
+        else:
+            self.db.commit()
+
+    def add_target(self, kind, body, *, generation=None):
+        """Register or revive a target; the columns carry what plans are gated on.
+
+        A removed name is reusable: reviving resets the row into service and bumps the
+        generation, so plans approved before the removal are refused as stale rather
+        than applied to a target that was retired in between.
+        """
+        name = body["name"]
+        row = self.db.execute(
+            "SELECT removed, generation FROM targets WHERE name=?", (name,)).fetchone()
+        if row is None:
+            self.db.execute(
+                "INSERT INTO targets(name,body,kind,state,removed,generation,state_seq)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (name, canonical(body), kind, "live", 0, generation or 1, 0))
+            return
+        revived = int(row["removed"] or 0)
+        next_generation = int(row["generation"] or 1) + (1 if revived else 0)
+        self.db.execute(
+            "UPDATE targets SET body=?, kind=?, removed=0, generation=?, state_seq=state_seq+?"
+            " WHERE name=?",
+            (canonical(body), kind, next_generation, 1 if revived else 0, name))
+
+    def remove_target(self, name):
+        """Retire a target: history and name survive, the row leaves service."""
+        row = self.db.execute(
+            "SELECT removed, generation FROM targets WHERE name=?", (name,)).fetchone()
+        if row is None:
+            raise Error("Unknown environment; use add first")
+        if int(row["removed"] or 0):
+            return 0
+        self.db.execute("UPDATE targets SET removed=1, generation=? WHERE name=?",
+                        (int(row["generation"] or 1) + 1, name))
+        return 1
 
     def event(self, target, kind, body):
         self.db.execute("INSERT INTO events(target,at,kind,body) VALUES(?,?,?,?)",

@@ -13,7 +13,7 @@ from collections import defaultdict
 import sqlite3
 
 from . import adapters, sources, workflow
-from .core import Error, canonical, text
+from .core import Error, text
 from .store import Store
 
 
@@ -68,7 +68,7 @@ def dispatch(args, store, runner, request):
         with store.transaction():
             if store.db.execute("SELECT 1 FROM targets WHERE name=?", (args.name,)).fetchone():
                 raise Error("Environment already exists; use a new name rather than rewriting its history")
-            store.db.execute("INSERT INTO targets VALUES(?,?)", (args.name, canonical(t)))
+            store.add_target(t["kind"], t)
             store.event(args.name, "registered", t)
         return t
     if args.command == "list":

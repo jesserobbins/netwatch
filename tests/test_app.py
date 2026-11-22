@@ -22,7 +22,7 @@ class WorkflowTests(unittest.TestCase):
         self.store = Store(self.path)
         self.addCleanup(self.store.close)
         self.t = adapters.target("host", "ubuntu")
-        self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("host", canonical(self.t)))
+        self.store.add_target(self.t["kind"], self.t)
         self.runner = DemoRunner()
         self.request = lambda url, body=None: copy.deepcopy(NOTICE)
 
@@ -73,7 +73,7 @@ class WorkflowTests(unittest.TestCase):
         for kind in adapters.KINDS:
             with self.subTest(kind=kind):
                 t = adapters.target(kind, kind, path="/env" if kind in ("uv", "npm", "conda", "mamba") else None)
-                self.store.db.execute("INSERT INTO targets VALUES(?,?)", (kind, canonical(t)))
+                self.store.add_target(kind, t)
                 calls = []
                 runner = lambda t, argv, **kw: calls.append(argv) or "no\n"
                 packages = [adapters.package("test", "1", "Conda")]
@@ -88,7 +88,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_bad_target_does_not_prevent_other_checks(self):
         bad = adapters.target("offline", "ubuntu")
-        self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("offline", canonical(bad)))
+        self.store.add_target(bad["kind"], bad)
         def runner(t, *args, **kwargs):
             if t["name"] == "offline":
                 raise Error("unavailable")
@@ -410,7 +410,7 @@ class BrewWorkflowTests(unittest.TestCase):
         self.store = Store(Path(self.tmp.name) / "state.db")
         self.addCleanup(self.store.close)
         self.t = adapters.target("laptop", "brew")
-        self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("laptop", canonical(self.t)))
+        self.store.add_target(self.t["kind"], self.t)
 
     def scripted(self, outputs, calls=None, formulae="", after=None, taps=None, unloadable=()):
         outputs = list(outputs)
