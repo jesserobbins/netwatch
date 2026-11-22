@@ -6,9 +6,14 @@ classification uses directory structure and file presence only, so `--list` can 
 root full of unknown checkouts before anything invokes git in them.
 """
 import fnmatch
+import json
 import os
+import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import tickets
 
 SKIP = (".git", "node_modules", ".venv", "__pycache__")
 DEFAULT_DEPTH = 4
@@ -131,3 +136,111 @@ def list_only(root, depth=DEFAULT_DEPTH, excludes=(), db=None) -> str:
         rel, lane, note = _row(item, root)
         lines.append("%-*s  %-11s  %s" % (width, rel, lane, note))
     return "\n".join(lines)
+
+
+def _origin_url(repo: Path) -> str:
+    try:
+        return str(tickets.git(repo, "remote", "get-url", "origin")).strip()
+    except Exception:
+        return ""
+
+
+def owner_of(url: str) -> tuple:
+    """(host, owner) from a git remote URL, without credentials in the answer."""
+    if not url:
+        return ("", "")
+    parsed = urllib.parse.urlsplit(url if "//" in url else "ssh://" + url.replace(":", "/", 1))
+    host = (parsed.hostname or "").lower()
+    parts = [p for p in parsed.path.split("/") if p]
+    owner = parts[0] if parts else ""
+    return (host, owner)
+
+
+def owned(repo, handles) -> bool:
+    """Ownership is the write gate for automatic tickets: github.com and a known owner."""
+    host, owner = owner_of(_origin_url(Path(repo)))
+    return host in ("github.com", "www.github.com") and owner.lower() in {h.lower() for h in handles}
+
+
+def handles_from(names, runner=None) -> set:
+    """The configured handle set: the authenticated `gh` login plus `--handle` names.
+
+    One read-only `gh api user` call, and a failure is not fatal: without `gh` the
+    explicit handles still work, and a scan without handles simply writes no tickets.
+    """
+    handles = {n for n in names if n}
+    runner = runner or tickets.subprocess.run
+    try:
+        result = runner(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True)
+    except (OSError, ValueError):
+        return handles
+    if getattr(result, "returncode", 1) == 0:
+        login = (getattr(result, "stdout", "") or "").strip()
+        if login:
+            handles.add(login)
+    return handles
+
+
+def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=None,
+        home=None) -> dict:
+    """Walk, classify, ticket the owned repos, persist the run.
+
+    The records are what `--register` indexes into later, so the per-lane ordinals here
+    are the numbers the operator will type.
+    """
+    from . import sources
+    request = request or sources.fetch
+    root = Path(root).expanduser().resolve()
+    items = list(walk(root, depth=depth, excludes=excludes))
+    ordinals = {USER: 0, REPO: 0, UNCLASSIFIED: 0}
+    rows, written, skipped, incomplete = [], [], [], []
+    for item in items:
+        ordinals[item.lane] += 1
+        detail = {"evidence": item.evidence}
+        if item.lane == REPO:
+            is_owned = owned(item.path, handles)
+            detail["owned"] = is_owned
+            if is_owned:
+                payload, why = tickets.collect(item.path, request=request,
+                                               cache=store.cached)
+                if tickets.should_write(payload, item.path):
+                    try:
+                        tickets.write(item.path, tickets.render(payload))
+                        written.append({"path": str(item.path), "findings": len(payload["findings"])})
+                        detail["ticket"] = "written"
+                        store.event(None, "ticket_written",
+                                    {"repo": str(item.path), "findings": len(payload["findings"])})
+                    except tickets.Refused as exc:
+                        detail["ticket"] = "refused: " + str(exc)
+                else:
+                    detail["ticket"] = "left alone"
+                if why:
+                    incomplete.append({"path": str(item.path), "reasons": why})
+            else:
+                skipped.append({"path": str(item.path), "reason": "not an owned repo"})
+        rows.append((item.lane, ordinals[item.lane], str(item.path), detail))
+    counts = {lane: n for lane, n in ordinals.items() if n}
+    run_id = store.scan_run(str(root), counts)
+    for lane, ordinal, path, detail in rows:
+        store.scan_record(run_id, lane, ordinal, path, detail)
+    return {"run": run_id, "root": str(root),
+            "summary": "scan run %d: %s" % (run_id, summary(items)),
+            "counts": counts, "tickets": written, "skipped": skipped,
+            "incomplete": incomplete}
+
+
+def report(store, path, *, request=None) -> dict:
+    """One ticket, into any repo, on explicit request."""
+    from . import sources
+    request = request or sources.fetch
+    repo = Path(path).expanduser().resolve()
+    if not (repo / ".git").exists():
+        raise NotADirectoryError(str(repo) + " is not a git checkout")
+    payload, why = tickets.collect(repo, request=request, cache=store.cached)
+    if not tickets.should_write(payload, repo):
+        return {"path": str(repo), "status": "left alone",
+                "reasons": why or ["collection produced nothing"]}
+    status = tickets.write(repo, tickets.render(payload))
+    store.event(None, "ticket_written", {"repo": str(repo), "findings": len(payload["findings"])})
+    return {"path": str(repo), "status": status, "findings": payload["findings"],
+            "leads": payload["leads"], "collection": payload["collection"], "reasons": why}

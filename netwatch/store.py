@@ -149,6 +149,36 @@ class Store:
                         (int(row["generation"] or 1) + 1, name))
         return 1
 
+    def scan_run(self, root, counts) -> int:
+        """One row per scan invocation; the id is what `--register` names."""
+        cur = self.db.execute("INSERT INTO scan_runs(root, at, counts_json) VALUES(?,?,?)",
+                              (root, int(time.time()), canonical(counts)))
+        return int(cur.lastrowid)
+
+    def scan_record(self, run_id, lane, ordinal, path, detail):
+        self.db.execute(
+            "INSERT INTO scan_records(run_id, lane, ordinal, item_path, detail_json) VALUES(?,?,?,?,?)",
+            (run_id, lane, ordinal, path, canonical(detail)))
+
+    def scan_run_row(self, run_id):
+        row = self.db.execute("SELECT id, root, at, counts_json FROM scan_runs WHERE id=?",
+                              (run_id,)).fetchone()
+        if row is None:
+            raise Error("Unknown scan run; run scan first")
+        return {"id": row["id"], "root": row["root"], "at": row["at"],
+                "counts": json.loads(row["counts_json"])}
+
+    def scan_records(self, run_id, lane=None):
+        sql = "SELECT lane, ordinal, item_path, detail_json FROM scan_records WHERE run_id=?"
+        args = [run_id]
+        if lane:
+            sql += " AND lane=?"
+            args.append(lane)
+        sql += " ORDER BY lane, ordinal"
+        return [{"lane": r["lane"], "ordinal": r["ordinal"], "path": r["item_path"],
+                 "detail": json.loads(r["detail_json"])}
+                for r in self.db.execute(sql, args)]
+
     def event(self, target, kind, body):
         self.db.execute("INSERT INTO events(target,at,kind,body) VALUES(?,?,?,?)",
                         (target, int(time.time()), kind, canonical(body)))

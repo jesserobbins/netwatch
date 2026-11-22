@@ -99,13 +99,19 @@ def _npm_lock_packages(path):
     return packages
 
 
-def _advisories(packages, request, incomplete):
+def _advisories(packages, request, incomplete, cache=None):
     findings = []
     for package in packages:
         body = {"package": {"name": package["name"], "ecosystem": package["ecosystem"]},
                 "version": package["version"]}
         try:
-            data = request(sources.OSV, body)
+            if cache is None:
+                data = request(sources.OSV, body)
+            else:
+                key = "osv-repo:" + (body["package"]["ecosystem"] + ":" +
+                                     body["package"]["name"] + ":" + body["version"])
+                load = lambda: request(sources.OSV, body)
+                data = cache(key, load, max_age=3600)
         except Error as exc:
             incomplete.append("%s advisory query failed: %s" % (package["name"], exc))
             continue
@@ -145,7 +151,7 @@ def _advice(package, fixed):
             "lockfile and manifest together" % (package["name"], target))
 
 
-def collect(repo, *, request=sources.fetch, runner=subprocess.run):
+def collect(repo, *, request=sources.fetch, runner=subprocess.run, cache=None):
     """Findings plus leads for one checkout. Never writes anything."""
     repo = Path(repo) if not isinstance(repo, Path) else repo
     findings, leads, incomplete = [], [], []
@@ -180,7 +186,7 @@ def collect(repo, *, request=sources.fetch, runner=subprocess.run):
             continue
         for package in packages:
             package["source"] = lock
-        findings.extend(_advisories(packages, request, incomplete))
+        findings.extend(_advisories(packages, request, incomplete, cache))
 
     payload = {"netwatch": 1,
                "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

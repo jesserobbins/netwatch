@@ -57,6 +57,10 @@ def parser():
                     help="classification only: no git, no gh, no tool enumeration, no store")
     sc.add_argument("--depth", type=int, default=scan.DEFAULT_DEPTH, help="how deep to walk (default 4)")
     sc.add_argument("--exclude", action="append", default=[], metavar="PAT", help="skip paths matching PAT (repeatable)")
+    sc.add_argument("--handle", action="append", default=[], metavar="NAME",
+                    help="accept this GitHub owner as yours (repeatable; the gh login is always accepted)")
+    rp = commands.add_parser("report", help="write the .netwatch ticket for one checkout, whatever its owner")
+    rp.add_argument("path")
     return p
 
 
@@ -343,11 +347,29 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
         if args.command == "demo":
             from .demo import demo
             result = demo()
-        elif args.command == "scan":
-            if not args.list:
-                raise Error("plain scan lands with ticket writes; use --list to classify first")
+        elif args.command == "scan" and args.list:
             Console().print(scan.list_only(args.root, depth=args.depth,
                                            excludes=tuple(args.exclude), db=args.db))
+            return 0
+        elif args.command == "scan":
+            store = Store(args.db)
+            handles = scan.handles_from(args.handle)
+            result = scan.run(store, args.root, depth=args.depth,
+                              excludes=tuple(args.exclude), handles=handles, request=request)
+            Console().print(result["summary"])
+            for row in result["tickets"]:
+                Console().print("ticket: %s (%d findings)" % (row["path"], row["findings"]))
+            for row in result["skipped"]:
+                Console().print("skipped: %s (%s)" % (row["path"], row["reason"]))
+            return 0
+        elif args.command == "report":
+            store = Store(args.db)
+            outcome = scan.report(store, args.path, request=request)
+            if outcome["status"] != "written":
+                Console().print("%s: %s" % (outcome["path"], outcome["status"]))
+            else:
+                Console().print("%s: ticket %s, %d findings" % (
+                    outcome["path"], outcome["status"], len(outcome["findings"])))
             return 0
         else:
             store = Store(args.db)
