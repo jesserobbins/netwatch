@@ -2,8 +2,9 @@
 
 netwatch tracks vulnerabilities and available updates across your machines and development environments, then lets you review and apply updates.
 
-- Checks Ubuntu, Arch/CachyOS, conda/mamba, uv and npm environments locally or over SSH.
+- Checks Ubuntu, Arch/CachyOS, conda/mamba, uv, npm and Homebrew environments locally or over SSH, plus uv-tool and pipx tool venvs by path.
 - Matches installed packages against Canonical, Arch and OSV advisories.
+- Scans a filesystem root to find those environments, and writes a `.netwatch` ticket into the git checkouts it owns.
 - Optionally adds cve.now context, pwn.watch incident leads and Cloudflare Zero Wire briefings for review with `check --context`.
 - Stores findings and history in SQLite, with text and JSON output for you or your agent.
 
@@ -58,6 +59,29 @@ netwatch check server --context
 
 This sends referenced CVE IDs to cve.now and downloads pwn.watch's public incident catalog and Cloudflare's Zero Wire RSS feed for local matching. Context does not change package applicability or update commands. Tag-based incident leads require investigation; they are not confirmed vulnerabilities. See [optional security context](docs/USAGE.md#optional-security-context).
 
+### Find what is on a machine
+
+Point a scan at a directory instead of naming every environment by hand:
+
+```bash
+netwatch scan ~/GitHub --list   # classify only: no git, no gh, no package tools, no database
+netwatch scan ~/GitHub          # also write tickets into the repos you own
+netwatch scan ~/GitHub --register 1 3
+netwatch report ~/src/some-checkout   # one ticket, any owner, on request
+```
+
+A scan separates **tool venvs** (uv tool, pipx — upgradeable, registerable as targets) from **git checkouts** (never targets: they get a `.netwatch` file listing drift, unpinned manifests and vulnerable locked versions, with the action to take). Nothing is registered without `--register`, and `--list` is safe to point anywhere because it reads directory structure and stops there. See [find what is on a machine](docs/USAGE.md#find-what-is-on-a-machine) and [repo tickets](docs/USAGE.md#repo-tickets).
+
+### Check a tool venv
+
+```bash
+netwatch add ruff-tool uvtool --path ~/.local/share/uv/tools/ruff
+netwatch check ruff-tool
+netwatch preview ruff-tool
+```
+
+A tool venv is bound to an installation by a probe token and upgraded with one constrained `uv pip install`, with the environment's own declared bounds and PEP 508 markers applied. `apply` reports `applied`, `needs_attention` or, when nothing changed, returns the plan for another try. See [uv tool and pipx environments](docs/USAGE.md#uv-tool-and-pipx-environments).
+
 ### Read status and history
 
 ```bash
@@ -97,7 +121,8 @@ Pass the returned `next_cursor` as `--since` to read later events. Give agents r
 
 ## Reference
 
-- [Usage guide](docs/USAGE.md): supported environments, caching, update commands and recovery.
+- [Usage guide](docs/USAGE.md): supported environments, scanning and tickets, probing and constrained approvals, caching, update commands and recovery.
+- [Design contract](docs/DESIGN.md): modules and the behavior to preserve.
 - `netwatch --help` or `netwatch COMMAND --help`: command arguments.
 
 Data lives in `~/.local/state/netwatch/state.db`. To use another database, put `--db /path/to/state.db` before the command.
@@ -111,7 +136,7 @@ python3 -B scripts/check_package.py
 
 For development, install the pinned dependencies with `python3 -m pip install --require-hashes -r requirements.lock`. The packaging check downloads those wheels, then installs and tests from the local copies.
 
-Add package-manager support in [`netwatch/adapters.py`](netwatch/adapters.py) and advisory matching in [`netwatch/sources.py`](netwatch/sources.py). See the [design contract](docs/DESIGN.md).
+Add package-manager support in [`netwatch/adapters.py`](netwatch/adapters.py), advisory matching in [`netwatch/sources.py`](netwatch/sources.py), and tool-venv behavior in [`netwatch/venvflow.py`](netwatch/venvflow.py) with its pure state machine in [`netwatch/lifecycle.py`](netwatch/lifecycle.py). See the [design contract](docs/DESIGN.md).
 
 ## License
 
