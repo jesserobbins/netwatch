@@ -159,9 +159,17 @@ def _pipx(venv: Path):
     data = json.loads((venv / PIPX_METADATA).read_text())
     main = data.get("main_package") or {}
     name, spec = main.get("package"), main.get("package_or_url") or ""
+    # pipx records the spec as it was typed: `black[colorama]==24.8.0` ends at a version,
+    # not at the extras, so a bracket-only parse sees nothing. Parse it as a requirement.
     extras = []
-    if "[" in spec and spec.rstrip().endswith("]"):
-        extras = [e.strip() for e in spec[spec.index("[") + 1:spec.rindex("]")].split(",") if e.strip()]
+    if spec:
+        try:
+            from packaging.requirements import Requirement
+            extras = sorted(Requirement(spec).extras)
+        except Exception:
+            if "[" in spec and "]" in spec:
+                extras = [e.strip() for e in
+                          spec[spec.index("[") + 1:spec.rindex("]")].split(",") if e.strip()]
     apps = main.get("app_paths") or []
     # pipx exposes the apps it installed into its own bin directory; the venv's bin holds
     # the generated script, the operator's launcher is elsewhere.

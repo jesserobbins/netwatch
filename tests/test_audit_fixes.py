@@ -962,3 +962,65 @@ class LabelledLauncherTests(unittest.TestCase):
         rows = venvflow._launchers(self.t)
         self.assertEqual([(r["script"], r["status"]) for r in rows],
                          [("scripted", "ok")], rows)
+
+
+class ToolVersusLabelTests(unittest.TestCase):
+    """The manager's tool and the operator's label can differ; the tool decides the extras."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "black")
+        dist = dist_dir(self.venv, "black")
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "black", extras = ["colorama"] }]\n'
+            'entrypoints = [\n  { name = "black", install-path = "%s", from = "black" },\n]\n'
+            % (self.venv / "bin" / "black"))
+        self.db = self.root / "state.db"
+        self.store = store_module.Store(self.db)
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "blabel", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.t = self.store.target("blabel")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def runner(self):
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "black", "version": "24.8.0",
+                                    "latest_version": "26.10.1"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "black", "version": "24.8.0"}])
+        return run
+
+    def test_a_labelled_targets_pin_carries_the_tools_observed_extras(self):
+        plan = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                request=Base.no_network, state_dir=self.state
+                                if hasattr(self, "state") else self.root / "state")
+        self.assertEqual(plan["pins"][0]["extras"], ["colorama"], plan["pins"])
+        artifact = Path(plan["constraints"]["path"]).read_text()
+        self.assertIn("black[colorama]==26.10.1", artifact)
+
+
+class PipxExtrasParseTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "black")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_version_pinned_spec_still_yields_its_extras(self):
+        meta = json.loads((FIXTURES / "pipx-metadata.json").read_text())
+        meta["main_package"]["package"] = "black"
+        # what pipx really writes for `pipx install "black[colorama]==24.8.0"`
+        meta["main_package"]["package_or_url"] = "black[colorama]==24.8.0"
+        meta["main_package"]["app_paths"][0]["__Path__"] = str(self.venv / "bin" / "black")
+        (self.venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        (self.venv / "uv-receipt.toml").unlink(missing_ok=True)
+        row = userlane.describe(self.venv)
+        self.assertEqual(row["extras"], ["colorama"])

@@ -123,6 +123,11 @@ def _structural(t):
     return ("present", str(venv))
 
 
+def tool_of(t):
+    """The manager's tool name. `add` lets the operator choose a label, so they can differ."""
+    return t.get("tool") or t["name"]
+
+
 def _identity(t, runner):
     """Manager metadata names the registered tool, and the distribution is listed."""
     if not t.get("path"):
@@ -141,7 +146,7 @@ def _identity(t, runner):
         packages = userlane.inventory(t["path"], runner)
     except Error as exc:
         return ("unreadable", "listing", str(exc))
-    wanted = (t.get("tool") or t["name"]).lower().replace("_", "-").replace(".", "-")
+    wanted = tool_of(t).lower().replace("_", "-").replace(".", "-")
     present = {p["name"].lower().replace("_", "-").replace(".", "-") for p in packages}
     if wanted not in present:
         return ("failed", "listing", "distribution absent")
@@ -227,8 +232,8 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                 try:
                     for entry in _consistency(t, runner):
                         findings.append({"key": digest(["consistency", t["name"], entry]),
-                                         "package": t["name"],
-                                         "installed": _version_of(packages, t["name"]),
+                                         "package": tool_of(t),
+                                         "installed": _version_of(packages, tool_of(t)),
                                          "advisory": "dependency-inconsistent",
                                          "state": "unknown", "fix_versions": [entry],
                                          "reason": entry, "url": ""})
@@ -264,8 +269,8 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                         if launcher["status"] == "broken":
                             findings.append({
                                 "key": digest(["launcher", t["name"], launcher["script"]]),
-                                "package": t["name"],
-                                "installed": _version_of(packages, t["name"]),
+                                "package": tool_of(t),
+                                "installed": _version_of(packages, tool_of(t)),
                                 "advisory": "launcher:" + launcher["script"],
                                 "state": "unknown", "fix_versions": [],
                                 "reason": launcher["detail"], "url": ""})
@@ -362,7 +367,7 @@ def _launchers(t):
     exposed = seen.get("exposed") or []
     try:
         checked = {row["script"]: row for row in
-                   pins.launchers(t["path"], str(bin_dir), t.get("tool") or t["name"],
+                   pins.launchers(t["path"], str(bin_dir), tool_of(t),
                                   as_written=written)}
     except (Error, OSError) as exc:
         return [{"script": "*", "status": "lead",
@@ -495,7 +500,7 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         raise Error("Configuration changed while candidates were resolved; nothing saved")
     result = pins.derive(t["path"], [p for p in packages if p["name"] not in held],
                          [c for c in outdated if c["name"] not in held],
-                         extras=seen.get("extras") or [], tool=t["name"])
+                         extras=seen.get("extras") or [], tool=tool_of(t))
     result["leads"] = list(result.get("leads") or []) + [
         {"type": "origin", "package": name,
          "detail": "installed from %s; held at its current version" % kind}
