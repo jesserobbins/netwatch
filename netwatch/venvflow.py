@@ -458,7 +458,10 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
             "inventory_digest": inventory_digest(t["path"], packages),
             "marker_env": marker_env(t),
             "index_digest": digest(_index_options_redacted(t)),
-            "expires_at": now + 3600, "leads": result["leads"]}
+            "expires_at": now + 3600, "leads": result["leads"],
+            # Distributions the plan holds at their version (direct/VCS/local origins):
+            # their absence after the install fails the gate.
+            "held": sorted(result.get("held") or [])}
     # Only the redacted form is stored: the raw index URL is read from the venv's own
     # metadata at the moment of use, so no credential ever lands in the database.
     body["commands_redacted"] = [pins.redacted(

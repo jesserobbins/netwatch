@@ -569,3 +569,32 @@ def plan_body_with_expiry(store, plan_id, expires_at):
                                        (plan_id,)).fetchone()[0])
     body["expires_at"] = expires_at
     return json.dumps(body)
+
+
+class HeldDistributionTests(Base):
+    """A held (direct/VCS/local) distribution must survive the install."""
+
+    def test_a_held_distribution_that_disappears_needs_attention(self):
+        vcs = make_venv(self.root, "vendored")
+        (dist_dir(vcs, "vendored") / "direct_url.json").write_text(json.dumps(
+            {"url": "https://github.com/x/y", "vcs_info": {"vcs": "git"}}))
+        self.store.add_target("uvtool", {"name": "vendored", "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(vcs),
+                                         "realpath": os.path.realpath(vcs)})
+        vend = self.store.target("vendored")
+        listing = {"rows": [{"name": "vendored", "version": "1.0"}]}
+
+        def runner(argv, **kw):
+            if "install" in argv:
+                return ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "vendored", "version": "1.0",
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps(listing["rows"])
+
+        # a candidate exists for the held tool, but it must be held, so no plan is made
+        with self.assertRaises(Exception):
+            venvflow.preview(self.store, vend, runner=runner,
+                             request=self.no_network, state_dir=self.state)
