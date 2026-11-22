@@ -6,7 +6,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-from . import sources
+from . import lifecycle, sources
 from .core import Error, canonical
 
 
@@ -206,8 +206,8 @@ class Store:
                     body = json.loads(row["body"])
                 except ValueError:
                     continue
-                at = body.get("expires_at")
-                if not isinstance(at, (int, float)) or now < int(at):
+                if not lifecycle.expires({"status": "proposed", "at": body.get("expires_at")},
+                                         now, ttl_seconds=0):
                     continue
                 self.db.execute("UPDATE plans SET status='stale' WHERE id=? AND status='proposed'",
                                 (row["id"],))

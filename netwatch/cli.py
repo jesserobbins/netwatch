@@ -92,9 +92,10 @@ def one_argv(runner, t):
 
 def dispatch(args, store, runner, request):
     if args.command in WRITE_COMMANDS:
-        # Lazy expiry runs in the command's own opening transaction: the next thing the
-        # operator runs is the cleaner. status/list/history stay read-only.
+        # Expiry and cleanup run in the command's own opening transaction: the next thing
+        # the operator runs is the cleaner. status/list/history stay read-only.
         store.expire()
+        store.cleanup()
     if args.command == "add":
         t = adapters.target(args.name, args.kind, args.host, args.path)
         with store.transaction():

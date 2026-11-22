@@ -271,6 +271,11 @@ def redacted(argv):
     return [sources.strip_credentials(token) if "://" in token else token for token in argv]
 
 
+def redacted(argv):
+    """The argv with any credential-bearing URL stripped, for display and comparison."""
+    return [sources.strip_credentials(token) if "://" in token else token for token in argv]
+
+
 def plan_body(venv, constraints, pins, index_options=(), *, target, extras=()):
     """Everything an approval needs to name exactly what will run."""
     argv = command(venv, constraints, pins, index_options)
