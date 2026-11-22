@@ -161,9 +161,14 @@ def _pipx(venv: Path):
     if "[" in spec and spec.rstrip().endswith("]"):
         extras = [e.strip() for e in spec[spec.index("[") + 1:spec.rindex("]")].split(",") if e.strip()]
     apps = main.get("app_paths") or []
-    bin_dir = venv / "bin"
+    # pipx exposes the apps it installed into its own bin directory and symlinks them
+    # there; the venv's bin is where the generated script lives, not where the operator's
+    # launcher does.
+    bin_dir = Path(os.environ.get("PIPX_BIN_DIR") or Path(os.path.expanduser("~/.local/bin")))
     if apps and isinstance(apps[0], dict) and apps[0].get("__Path__"):
-        bin_dir = Path(str(apps[0]["__Path__"]).replace("VENV", str(venv))).parent
+        inside = Path(str(apps[0]["__Path__"]).replace("VENV", str(venv)))
+        if inside.parent != venv / "bin":
+            bin_dir = inside.parent
     recorded = _pip_args_index_options(main.get("pip_args"))
     # pip_args only carry what pipx itself was told; pip's own configuration is what a
     # pip.conf-only install resolves against, so it is the fallback.

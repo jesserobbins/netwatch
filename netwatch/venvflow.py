@@ -240,17 +240,19 @@ def check(store, t, *, runner=local_runner, request=sources.fetch, now=None):
                                     {"detail": "%s is out of service; nothing published" % t["name"]})
                         raise Error("%s is out of service; nothing published. Resolve the "
                                     "duplicate or re-check once the venv returns" % t["name"])
-                    for row in launcher_rows:
-                        if row["status"] == "ok":
+                    for launcher in launcher_rows:
+                        if launcher["status"] == "ok":
                             continue
-                        warnings.append("launcher %s: %s" % (row["script"], row["detail"]))
-                        if row["status"] == "broken":
-                            findings.append({"key": digest(["launcher", t["name"], row["script"]]),
-                                             "package": t["name"],
-                                             "installed": _version_of(packages, t["name"]),
-                                             "advisory": "launcher:" + row["script"],
-                                             "state": "unknown", "fix_versions": [],
-                                             "reason": row["detail"], "url": ""})
+                        warnings.append("launcher %s: %s"
+                                        % (launcher["script"], launcher["detail"]))
+                        if launcher["status"] == "broken":
+                            findings.append({
+                                "key": digest(["launcher", t["name"], launcher["script"]]),
+                                "package": t["name"],
+                                "installed": _version_of(packages, t["name"]),
+                                "advisory": "launcher:" + launcher["script"],
+                                "state": "unknown", "fix_versions": [],
+                                "reason": launcher["detail"], "url": ""})
                     report = _report(
                         t, packages, findings, warnings, complete_advisories, now,
                         [{"package": c["name"], "candidate": c["version"]} for c in updates],
@@ -429,7 +431,27 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         for name, kind in sorted(held.items())]
     result["held"] = sorted(held)
     if not result["pins"]:
-        raise Error("No upgrade is available that respects this environment's bounds")
+        # (p11): no eligible update is an observation, not a failure. The token recovered, so
+        # a not_bindable target is cleared, the run records what it saw, and no plan is saved.
+        with store.transaction():
+            if row["state"] == "not_bindable":
+                status_now, token_now = probe.read(t["path"])
+                if status_now == "usable" and token_now == token:
+                    store.db.execute(
+                        "UPDATE targets SET state='live', state_seq=state_seq+1 "
+                        "WHERE name=? AND state='not_bindable'", (t["name"],))
+                    store.event(t["name"], "state_changed",
+                                {"from": "not_bindable", "to": "live",
+                                 "reason": "token recovered; no eligible update"})
+            store.event(t["name"], "preview_no_update",
+                        {"candidates": [c["name"] for c in outdated],
+                         "excluded": result.get("excluded") or [],
+                         "leads": result.get("leads") or []})
+        return {"status": "no_update", "target": t["name"], "pins": [],
+                "excluded": result.get("excluded") or [],
+                "leads": result.get("leads") or [],
+                "detail": "No eligible update: every candidate is excluded by this "
+                          "environment's own bounds"}
     if fingerprint(state_dir) != first:
         raise Error("Configuration changed while the pins were derived; nothing saved")
     # (p7) the inventory the plan records is a listing inside the bracket, not the identity
@@ -484,6 +506,16 @@ def preview(store, t, *, runner=local_runner, request=sources.fetch, now=None, s
         status, current_token = probe.read(t["path"])
         if status != "usable" or current_token != token:
             raise Error("The environment's probe changed while previewing; nothing saved")
+        # Recovering the token is what preview is for, so the state is cleared here — only
+        # if the token on disk is still the one this run read.
+        if row["state"] == "not_bindable":
+            status_now, token_now = probe.read(t["path"])
+            if status_now == "usable" and token_now == token:
+                store.db.execute(
+                    "UPDATE targets SET state='live', state_seq=state_seq+1 "
+                    "WHERE name=? AND state='not_bindable'", (t["name"],))
+                store.event(t["name"], "state_changed",
+                            {"from": "not_bindable", "to": "live", "reason": "token recovered"})
         cur = store.db.execute(
             "INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
             (t["name"], now, "proposed", canonical(body)))

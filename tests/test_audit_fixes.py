@@ -153,10 +153,10 @@ class OriginPolicyTests(unittest.TestCase):
         venv = make_venv(self.root, "vcs")
         (dist_dir(venv, "vcs") / "direct_url.json").write_text(json.dumps(
             {"url": "https://github.com/x/y", "vcs_info": {"vcs": "git"}}))
-        with self.assertRaises(Exception) as caught:
-            venvflow.preview(self.store, self.target_for(venv), runner=self.runner(venv.name),
-                             request=Base.no_network, state_dir=self.root / "state")
-        self.assertIn("No upgrade", str(caught.exception))
+        result = venvflow.preview(self.store, self.target_for(venv),
+                                  runner=self.runner(venv.name),
+                                  request=Base.no_network, state_dir=self.root / "state")
+        self.assertEqual(result["status"], "no_update", result)
 
 
 class RawIndexOptionTests(Base):
@@ -595,6 +595,106 @@ class HeldDistributionTests(Base):
             return json.dumps(listing["rows"])
 
         # a candidate exists for the held tool, but it must be held, so no plan is made
+        result = venvflow.preview(self.store, vend, runner=runner,
+                                  request=self.no_network, state_dir=self.state)
+        self.assertEqual(result["status"], "no_update", result)
+
+
+class LauncherAndTransitionTests(Base):
+    """The regression the audit found: a launcher row must not shadow the target state."""
+
+    def add_launcher(self, broken=False):
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        dist = next(site.glob("tool-*.dist-info"))
+        (dist / "entry_points.txt").write_text("[console_scripts]\ntool = tool.cli:main\n")
+        script = self.venv / "bin" / "tool"
+        interp = "/usr/bin/python3" if broken else str(self.venv / "bin" / "python")
+        script.write_text("#!/bin/sh\n'''exec' %s \"$0\" \"$@\"\n' '''\nfrom tool.cli import main\n" % interp)
+        script.chmod(0o755)
+
+    def test_a_malformed_probe_sets_not_bindable_with_a_launcher_present(self):
+        self.add_launcher()
+        (self.venv / probe.NAME).write_text("netwatch-probe: not-a-uuid\n")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "not_bindable")
+
+    def test_a_usable_token_lifts_not_bindable_with_a_launcher_present(self):
+        self.add_launcher()
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "live")
+
+    def test_a_returned_venv_recovers_from_unresolved_path_with_launchers_present(self):
+        self.add_launcher()
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='unresolved_path' WHERE name='tool'")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "live")
+
+    def test_preview_clears_not_bindable_so_the_plan_is_appliable(self):
+        self.add_launcher()
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        installed = {"version": "1.0"}
+
+        def runner(argv, **kw):
+            if "install" in argv:
+                installed["version"] = "2.0"
+                return ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": installed["version"],
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "tool", "version": installed["version"]}])
+
+        plan = venvflow.preview(self.store, self.t, runner=runner,
+                                request=self.no_network, state_dir=self.state)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "live")
+        result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "applied", result)
+
+
+class LauncherPathTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "px")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_launcher_on_the_shared_base_interpreter_is_healthy(self):
+        dist = dist_dir(self.venv, "px")
+        (dist / "entry_points.txt").write_text("[console_scripts]\npx = px.cli:main\n")
+        # bin/python is a symlink to the interpreter running the tests, which is the shared
+        # base case: the launcher names that same target.
+        script = self.venv / "bin" / "px"
+        script.write_text("#!/bin/sh\n'''exec' %s \"$0\"\n' '''\nfrom px.cli import main\n"
+                          % (self.venv / "bin" / "python"))
+        script.chmod(0o755)
+        rows = pins.launchers(str(self.venv), str(self.venv / "bin"), "px")
+        self.assertEqual([r["status"] for r in rows], ["ok"], rows)
+
+    def test_pipx_exposes_launchers_in_its_own_bin_dir(self):
+        meta = json.loads((FIXTURES / "pipx-metadata.json").read_text())
+        meta["main_package"]["app_paths"][0]["__Path__"] = str(self.venv / "bin" / "luna-doctor")
+        (self.venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        (self.venv / "uv-receipt.toml").unlink(missing_ok=True)
+        with mock.patch.dict(os.environ, {"PIPX_BIN_DIR": str(self.root / "pipxbin")}):
+            row = userlane.describe(self.venv)
+        self.assertEqual(row["bin_dir"], str(self.root / "pipxbin"))
+
+
+class AddVenvKindTests(unittest.TestCase):
+    def test_add_accepts_a_uvtool_target(self):
+        from netwatch import adapters
+        t = adapters.target("local-ruff", "uvtool", path="/tmp/some-venv")
+        self.assertEqual(t["kind"], "uvtool")
         with self.assertRaises(Exception):
-            venvflow.preview(self.store, vend, runner=runner,
-                             request=self.no_network, state_dir=self.state)
+            adapters.target("bad", "uvtool")          # the path is required

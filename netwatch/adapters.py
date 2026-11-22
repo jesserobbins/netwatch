@@ -11,6 +11,9 @@ from .core import Error, name, text
 
 
 KINDS = ("ubuntu", "arch", "cachyos", "conda", "mamba", "uv", "npm", "brew")
+# The venv-bound kinds are addable but do not speak this module's adapter protocol: their
+# check/preview/apply live in venvflow, driven by a manager receipt inside the venv.
+VENV_KINDS = ("uvtool", "pipx")
 
 # Homebrew and MacPorts are not on the PATH of a BatchMode SSH command. The
 # prefix travels inside the argv rather than being resolved at registration,
@@ -39,12 +42,12 @@ def brew_env(*args, cleanup=True):
 
 def target(name_, kind, host="local", path=None):
     name(name_)
-    if kind not in KINDS:
+    if kind not in KINDS and kind not in VENV_KINDS:
         raise Error("Unsupported environment kind")
     text(host, "SSH alias")
     if host.startswith("-") or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@" for c in host):
         raise Error("Host must be local or an explicit SSH alias/user@host")
-    if kind in ("conda", "mamba", "uv", "npm"):
+    if kind in ("conda", "mamba", "uv", "npm") or kind in VENV_KINDS:
         text(path, "absolute environment/project path")
         if not PurePosixPath(path).is_absolute():
             raise Error("Environment/project path must be absolute")

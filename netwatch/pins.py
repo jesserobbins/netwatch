@@ -305,6 +305,15 @@ def launchers(venv, bin_dir, name):
             interpreter = trampoline.group(1) if trampoline else interpreter
         written = _inside(interpreter, roots)
         resolved = _inside(os.path.realpath(interpreter), roots) if interpreter else False
+        if interpreter and not resolved:
+            # A uv/pipx venv's own `bin/python` usually symlinks to a shared base
+            # interpreter. A launcher naming that same target is healthy, not a lead: the
+            # written path is in the venv and it runs the interpreter the venv runs.
+            try:
+                resolved = (os.path.realpath(interpreter)
+                            == os.path.realpath(str(Path(venv) / "bin" / "python")))
+            except OSError:
+                resolved = False
         invokes = target.split(":")[0] in text.replace("\n", " ")
         if not written:
             reported.append({"script": script, "status": "broken",

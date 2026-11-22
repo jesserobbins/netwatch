@@ -162,11 +162,13 @@ class PreviewTests(VenvCase):
         self.assertEqual(result["status"], "proposed")
         self.assertEqual(probe.read(self.venv)[0], "usable")
 
-    def test_preview_refuses_when_no_upgrade_respects_the_bounds(self):
-        with self.assertRaises(Exception) as caught:
-            venvflow.preview(self.store, self.t, runner=runner_for("tool", latest="1.0"),
-                             request=self.no_network, state_dir=self.root / "state")
-        self.assertIn("No upgrade", str(caught.exception))
+    def test_no_eligible_update_is_reported_not_raised(self):
+        """(p11): no eligible update is an observation; no plan is saved."""
+        result = venvflow.preview(self.store, self.t, runner=runner_for("tool", latest="1.0"),
+                                  request=self.no_network, state_dir=self.root / "state")
+        self.assertEqual(result["status"], "no_update")
+        self.assertIn("No eligible update", result["detail"])
+        self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())
 
 
 class FingerprintTests(unittest.TestCase):
