@@ -227,3 +227,39 @@ class CleanupWithCustomDatabaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FingerprintEnvironmentTests(unittest.TestCase):
+    """The approval must be bound to uv's configuration, not only to its variables."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "state").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_uv_config_file_in_the_state_hierarchy_changes_the_fingerprint(self):
+        state = self.root / "state"
+        before = venvflow.fingerprint(state)
+        (state / "uv.toml").write_text("[index]\nurl = 'https://private.example/simple'\n")
+        self.assertNotEqual(before, venvflow.fingerprint(state))
+
+    def test_editing_that_file_changes_the_fingerprint_again(self):
+        state = self.root / "state"
+        config = state / "uv.toml"
+        config.write_text("index-url = 'https://one.example/simple'\n")
+        first = venvflow.fingerprint(state)
+        config.write_text("index-url = 'https://two.example/simple'\n")
+        self.assertNotEqual(first, venvflow.fingerprint(state))
+
+    def test_the_local_runner_pins_the_working_directory_to_the_state_dir(self):
+        seen = {}
+
+        def fake_run(t, argv, **kw):
+            seen["path"] = t.get("path")
+            return "[]"
+
+        with mock.patch.object(venvflow.adapters, "run", side_effect=fake_run):
+            venvflow.local_runner(["uv", "pip", "list"], cwd="/tmp/some-state")
+        self.assertEqual(seen["path"], "/tmp/some-state")
