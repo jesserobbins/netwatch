@@ -653,7 +653,9 @@ def apply(store, plan_id, *, yes=False, runner=local_runner, request=sources.fet
             after_consistency = None
         after_origins = _origins(t["path"])
 
-    result = {"plan": plan_id, "failure": failure}
+    # The result row carries the generation it was produced under, so a plan result from
+    # before a remove/revive never reads as current history.
+    result = {"plan": plan_id, "failure": failure, "generation": state["generation"]}
     if failure is None:
         # The five-condition gate: the install's own exit code is only the first of them.
         problems = []
