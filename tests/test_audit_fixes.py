@@ -767,3 +767,50 @@ class AddVenvTargetTests(unittest.TestCase):
         finally:
             store.close()
             shutil.rmtree(root, ignore_errors=True)
+
+
+class NoUpdateBranchTests(Base):
+    """(p11): a no-eligible-update preview clears not_bindable, and only at its own state."""
+
+    def runner(self, latest="1.0"):
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0",
+                                    "latest_version": latest}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "tool", "version": "1.0"}])
+        return run
+
+    def test_no_update_clears_not_bindable_and_saves_no_plan(self):
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        result = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                  request=self.no_network, state_dir=self.state)
+        self.assertEqual(result["status"], "no_update")
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "live")
+        self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())
+
+    def test_the_clear_is_guarded_by_generation_and_state_seq(self):
+        """A newer observation must not be overwritten by this run's stale one."""
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        real = venvflow.stored_state
+        calls = {"n": 0}
+
+        def drift(store, target):
+            calls["n"] += 1
+            state = real(store, target)
+            # the row moves on after this run read it, before the clear is attempted
+            if calls["n"] >= 1:
+                store.db.execute("UPDATE targets SET state_seq=state_seq+1 "
+                                 "WHERE name='tool'")
+            return state
+
+        with mock.patch.object(venvflow, "stored_state", side_effect=drift):
+            venvflow.preview(self.store, self.t, runner=self.runner(),
+                             request=self.no_network, state_dir=self.state)
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "not_bindable",
+            "a stale run must not clear a newer diagnosis")
