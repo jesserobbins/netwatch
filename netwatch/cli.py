@@ -11,6 +11,7 @@ from rich import box
 from datetime import datetime, timezone
 from collections import defaultdict
 import sqlite3
+from pathlib import Path
 
 from . import adapters, scan, sources, userlane, venvflow, workflow
 from .core import Error, text
@@ -85,9 +86,20 @@ WRITE_COMMANDS = {"add", "check", "preview", "apply", "resolve", "scan", "report
 VENV_KINDS = (userlane.UVTOOL, userlane.PIPX)
 
 
-def one_argv(runner, t):
-    """The venv kinds take a listing runner: one argv, no SSH, always local."""
-    return lambda argv, **kw: runner({"name": t["name"], "kind": "uv", "host": "local"}, argv, **kw)
+def one_argv(runner, t, state_dir):
+    """The venv kinds take a listing runner: one argv, no SSH, run from the state dir.
+
+    The working directory is pinned there for the same reason the fingerprint hashes the
+    configuration files: uv reads configuration from the cwd upward, so inheriting the
+    launch directory would let a repo-local `[tool.uv]` shape resolution.
+    """
+    return lambda argv, **kw: runner({"name": t["name"], "kind": "uv", "host": "local",
+                                      "path": str(state_dir)}, argv, **kw)
+
+
+def state_dir_for(args):
+    """Where an approval's artifacts and uv's working directory live: beside the database."""
+    return Path(args.db).expanduser().parent
 
 
 def dispatch(args, store, runner, request):
@@ -121,7 +133,8 @@ def dispatch(args, store, runner, request):
             if args.command == "check":
                 try:
                     if t["kind"] in VENV_KINDS:
-                        venvflow.check(store, t, runner=one_argv(runner, t), request=request)
+                        venvflow.check(store, t, runner=one_argv(runner, t, state_dir_for(args)),
+                                      request=request)
                     else:
                         workflow.check(store, t, offline=args.offline, refresh=args.refresh, refreshed=refreshed, context=args.context, runner=runner, request=request)
                 except Error as exc:
@@ -137,7 +150,8 @@ def dispatch(args, store, runner, request):
     if args.command == "preview":
         t = store.target(args.name)
         if t["kind"] in VENV_KINDS:
-            return venvflow.preview(store, t, runner=one_argv(runner, t), request=request)
+            return venvflow.preview(store, t, runner=one_argv(runner, t, state_dir_for(args)),
+                                    request=request, state_dir=state_dir_for(args))
         return workflow.preview(store, t, runner)
     if args.command == "apply":
         plan = store.db.execute("SELECT target FROM plans WHERE id=?", (args.plan,)).fetchone()
@@ -145,7 +159,8 @@ def dispatch(args, store, runner, request):
         if kind in VENV_KINDS:
             t = store.target(plan["target"])
             return venvflow.apply(store, args.plan, yes=args.yes,
-                                  runner=one_argv(runner, t), request=request)
+                                  runner=one_argv(runner, t, state_dir_for(args)),
+                                  request=request)
         return workflow.apply(store, args.plan, yes=args.yes, runner=runner, request=request)
     if args.command == "resolve":
         return workflow.resolve(store, args.plan, text(args.note, "recovery note"))
