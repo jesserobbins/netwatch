@@ -83,8 +83,8 @@ def co_claimants(store, t):
     if not path:
         return []
     found = []
-    for other in store.targets():
-        if other["name"] == t["name"] or other.get("removed"):
+    for other in store.target_rows():
+        if other["name"] == t["name"] or other["removed"]:
             continue
         if other.get("path") and workflow.same_venv(other["path"], path):
             found.append(other)

@@ -311,6 +311,23 @@ class Store:
         self.db.execute("INSERT INTO events(target,at,kind,body) VALUES(?,?,?,?)",
                         (target, int(time.time()), kind, canonical(body)))
 
+    def target_rows(self):
+        """Targets with their lifecycle columns: the flags are columns, not body fields.
+
+        Reading `removed` or `state` out of the body silently returns nothing, which is how
+        a retired target kept blocking another target's recovery.
+        """
+        rows = []
+        for row in self.db.execute(
+                "SELECT name, body, kind, state, removed, generation, state_seq "
+                "FROM targets ORDER BY name"):
+            entry = json.loads(row["body"])
+            entry.update(kind=row["kind"], state=row["state"], removed=int(row["removed"] or 0),
+                         generation=int(row["generation"] or 1),
+                         state_seq=int(row["state_seq"] or 0))
+            rows.append(entry)
+        return rows
+
     def targets(self):
         return [json.loads(r[0]) for r in self.db.execute("SELECT body FROM targets ORDER BY name")]
 

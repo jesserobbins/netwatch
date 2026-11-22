@@ -314,9 +314,10 @@ def register(store, root, indices, *, run_id=None, runner=None):
                     "realpath", "path_as_written", "st_dev", "st_ino")}
             row["name"] = detail.get("tool") or row["name"]
             verified.append((item, row, userlane.identity(row, runner)))
-        blocking = [t for t in store.targets()
-                    if t.get("kind") in (userlane.UVTOOL, userlane.PIPX)
-                    and t.get("path") and t.get("state") not in ("unresolved_path", "identity_mismatch")]
+        blocking = [row for row in store.target_rows()
+                    if row["kind"] in (userlane.UVTOOL, userlane.PIPX)
+                    and row.get("path") and not row["removed"]
+                    and row["state"] not in ("unresolved_path", "identity_mismatch")]
         for item, row, seen in verified:
             for other in blocking:
                 if other["name"] != row["name"] and workflow.same_venv(other["path"], row["realpath"]):

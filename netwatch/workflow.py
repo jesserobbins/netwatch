@@ -175,9 +175,12 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
     before = adapters.inventory(t, runner)
     if body["inventory_digest"] != digest(before) or int(time.time()) >= body["expires_at"]:
         raise Error("Inventory changed or preview expired; create a new preview")
-    if t.get("path"):
-        for other in store.targets():
-            if other["name"] != t["name"] and other.get("removed") == 0 \
+    if t.get("path") and t.get("kind") in ("uvtool", "pipx"):
+        # Only the venv-bound kinds claim a whole installation: a conda/uv/npm project may
+        # legitimately share a directory with another target.
+        for other in store.target_rows():
+            if other["name"] != t["name"] and other["removed"] == 0 \
+                    and other.get("kind") in ("uvtool", "pipx") \
                     and other.get("path") and same_venv(other.get("path"), t["path"]):
                 raise Error("%s already tracks this venv; remove that target first" % other["name"])
     with store.transaction():
