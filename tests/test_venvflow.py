@@ -386,3 +386,25 @@ class PreExistingDamageTests(ApplyCase):
         result = self.apply()
         self.assertEqual(result["status"], "failed_no_change", result)
         self.assertEqual(self.plan_status(), "proposed")
+
+
+class InventoryDigestTests(VenvCase):
+    """A same-version reinstall with different metadata is not the approved state."""
+
+    def test_a_metadata_change_at_the_same_version_changes_the_digest(self):
+        packages = [{"name": "tool", "version": "1.0"}]
+        before = venvflow.inventory_digest(self.t["path"], packages)
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        dist = next(site.glob("tool-*.dist-info"))
+        (dist / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: tool\nVersion: 1.0\nRequires-Dist: other>=2\n")
+        self.assertNotEqual(before, venvflow.inventory_digest(self.t["path"], packages))
+
+    def test_an_origin_appearing_at_the_same_version_changes_the_digest(self):
+        packages = [{"name": "tool", "version": "1.0"}]
+        before = venvflow.inventory_digest(self.t["path"], packages)
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        dist = next(site.glob("tool-*.dist-info"))
+        (dist / "direct_url.json").write_text(json.dumps(
+            {"url": "https://example.invalid/x", "vcs_info": {"vcs": "git"}}))
+        self.assertNotEqual(before, venvflow.inventory_digest(self.t["path"], packages))
