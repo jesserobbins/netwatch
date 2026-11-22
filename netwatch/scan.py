@@ -13,7 +13,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import tickets
+from . import tickets, userlane
+from .core import Error
 
 SKIP = (".git", "node_modules", ".venv", "__pycache__")
 DEFAULT_DEPTH = 4
@@ -197,6 +198,17 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
     for item in items:
         ordinals[item.lane] += 1
         detail = {"evidence": item.evidence}
+        if item.lane == USER:
+            row = userlane.describe(item.path)
+            if row is None or row.get("kind") is None:
+                detail["tool"] = None
+                detail["error"] = (row or {}).get("error", "no manager metadata")
+                item.lane = UNCLASSIFIED
+            else:
+                detail.update(tool=row["name"], kind=row["kind"], realpath=row["realpath"],
+                              path_as_written=row["path_as_written"], bin_dir=row["bin_dir"],
+                              extras=row["extras"], index_options=row["index_options"],
+                              st_dev=row["st_dev"], st_ino=row["st_ino"])
         if item.lane == REPO:
             is_owned = owned(item.path, handles)
             detail["owned"] = is_owned
@@ -244,3 +256,75 @@ def report(store, path, *, request=None) -> dict:
     store.event(None, "ticket_written", {"repo": str(repo), "findings": len(payload["findings"])})
     return {"path": str(repo), "status": status, "findings": payload["findings"],
             "leads": payload["leads"], "collection": payload["collection"], "reasons": why}
+
+
+MAX_BATCH = 5
+LISTING_TIMEOUT = 10
+
+
+def _resolve_run(store, root, run_id):
+    root = str(Path(root).expanduser().resolve())
+    if run_id is not None:
+        row = store.scan_run_row(run_id)
+        if row["root"] != root:
+            raise Error("scan run %d belongs to %s, not %s" % (run_id, row["root"], root))
+        return run_id
+    runs = [r["id"] for r in store.db.execute(
+        "SELECT id FROM scan_runs WHERE root=? ORDER BY id DESC", (root,)).fetchall()]
+    if not runs:
+        raise Error("no scan of %s; run scan first" % root)
+    if len(runs) > 1:
+        raise Error("ambiguous: pass --run, latest is %d" % runs[0])
+    return runs[0]
+
+
+def register(store, root, indices, *, run_id=None, runner=None):
+    """Turn stored scan rows into targets: by index, from the record, never a re-walk.
+
+    The batch is all-or-nothing and the identity checks run inside the write transaction,
+    so a transient failure on one item commits nothing and retrying the same command is
+    safe.
+    """
+    if runner is None:
+        runner = lambda argv: userlane.adapters.run({"name": "scan", "kind": "uv", "host": "local"},
+                                                    argv, timeout=LISTING_TIMEOUT)
+    indices = list(indices)
+    if not indices:
+        raise Error("name at least one index to register")
+    if len(indices) > MAX_BATCH:
+        raise Error("at most %d indices per registration; split the batch" % MAX_BATCH)
+    run = _resolve_run(store, root, run_id)
+    rows = store.scan_records(run, lane=USER)
+    if not rows:
+        raise Error("scan run %d found no user-lane environments" % run)
+    chosen = []
+    for index in indices:
+        if not isinstance(index, int) or index < 1 or index > len(rows):
+            raise Error("index %r is not a user-lane row of run %d (1..%d)"
+                        % (index, run, len(rows)))
+        chosen.append(rows[index - 1])
+    registered = []
+    with store.transaction():
+        verified = []
+        for item in chosen:
+            detail = item["detail"]
+            row = {key: detail.get(key) for key in
+                   ("kind", "name", "extras", "bin_dir", "index_options",
+                    "realpath", "path_as_written", "st_dev", "st_ino")}
+            row["name"] = detail.get("tool") or row["name"]
+            verified.append((item, row, userlane.identity(row, runner)))
+        for item, row, seen in verified:
+            body = {"name": row["name"], "kind": row["kind"], "host": "local",
+                    "path": row["realpath"],
+                    "bin_dir": row["bin_dir"], "extras": row["extras"],
+                    "index_options": row["index_options"],
+                    "registered_from_scan": {"run": run, "ordinal": item["ordinal"],
+                                            "path_as_written": row["path_as_written"],
+                                            "st_dev": row["st_dev"], "st_ino": row["st_ino"]}}
+            store.add_target(row["kind"], body)
+            store.event(row["name"], "registered", body)
+            registered.append({"name": row["name"], "kind": row["kind"],
+                               "path": row["realpath"], "extras": row["extras"]})
+    return {"run": run, "registered": registered,
+            "summary": "registered %d target%s from scan run %d"
+                       % (len(registered), "" if len(registered) == 1 else "s", run)}

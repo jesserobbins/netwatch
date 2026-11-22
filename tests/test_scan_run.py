@@ -77,7 +77,8 @@ class RunTests(unittest.TestCase):
         self.venv = self.root / "tool"
         self.venv.mkdir()
         (self.venv / "pyvenv.cfg").write_text("")
-        (self.venv / "uv-receipt.toml").write_text("")
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "tool" }]\nentrypoints = []\n')
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)

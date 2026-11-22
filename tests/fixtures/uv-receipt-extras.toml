@@ -1,0 +1,5 @@
+[tool]
+requirements = [{ name = "mlx-lm", extras = ["server"] }]
+entrypoints = [
+    { name = "mlx_lm.chat", install-path = "/Users/jesse/.local/bin/mlx_lm.chat", from = "mlx-lm" },
+]

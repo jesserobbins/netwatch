@@ -8,6 +8,12 @@ from .core import Error, canonical, digest
 
 
 def check(store, t, *, offline=False, refresh=False, refreshed=None, context=False, runner=adapters.run, request=sources.fetch):
+    if t["kind"] not in adapters.KINDS:
+        # A stage-2 build can hold targets whose kind lands in a later stage. Say so for
+        # that target only: a registered environment netwatch cannot observe yet is a
+        # coverage gap to report, not a reason to fail the whole run.
+        store.event(t["name"], "collection_failed", {"error": "kind not yet supported in this build"})
+        raise Error("kind not yet supported in this build")
     try:
         packages = adapters.inventory(t, runner)
     except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError) as exc:

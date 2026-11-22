@@ -57,6 +57,9 @@ def parser():
                     help="classification only: no git, no gh, no tool enumeration, no store")
     sc.add_argument("--depth", type=int, default=scan.DEFAULT_DEPTH, help="how deep to walk (default 4)")
     sc.add_argument("--exclude", action="append", default=[], metavar="PAT", help="skip paths matching PAT (repeatable)")
+    sc.add_argument("--register", nargs="+", type=int, metavar="INDEX",
+                    help="register these user-lane rows of a stored run as targets")
+    sc.add_argument("--run", type=int, help="scan run id (needed when the root has more than one)")
     sc.add_argument("--handle", action="append", default=[], metavar="NAME",
                     help="accept this GitHub owner as yours (repeatable; the gh login is always accepted)")
     rp = commands.add_parser("report", help="write the .netwatch ticket for one checkout, whatever its owner")
@@ -140,7 +143,7 @@ def display(result, json_output=False, show_all=False):
             affected_count = len({r["package"] for r in report["findings"] if r["state"] == "affected"})
             review_count = len({r["package"] for r in report["findings"] if r["state"] == "unknown"})
             summary = Text()
-            summary.append(f"{safe(t['kind'])} on {safe(t['host'])}  |  Checked {date(report['at'])}\n", style="dim")
+            summary.append(f"{safe(t['kind'])} on {safe(t.get('host', 'local'))}  |  Checked {date(report['at'])}\n", style="dim")
             for value, style in ((f"{len(report['packages'])} installed", "bold"),
                                  (f"{affected_count} affected", "bold red" if affected_count else "bold"),
                                  (f"{review_count} need review", "bold yellow" if review_count else "bold"),
@@ -151,7 +154,7 @@ def display(result, json_output=False, show_all=False):
             console.print(Panel(summary, title=Text(safe(t["name"]), style="bold cyan"), title_align="left",
                                 border_style="cyan", box=box.ROUNDED, width=width))
         else:
-            emit(f"{safe(t['name'])} ({safe(t['kind'])} on {safe(t['host'])})", "bold cyan")
+            emit(f"{safe(t['name'])} ({safe(t['kind'])} on {safe(t.get('host', 'local'))})", "bold cyan")
         if item.get("error"):
             emit("  Error: " + safe(item["error"]), "bold red")
         if (item.get("last_attempt") or {}).get("kind") == "collection_failed":
@@ -351,6 +354,13 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
             Console().print(scan.list_only(args.root, depth=args.depth,
                                            excludes=tuple(args.exclude), db=args.db))
             return 0
+        elif args.command == "scan" and args.register:
+            store = Store(args.db)
+            result = scan.register(store, args.root, args.register, run_id=args.run)
+            Console().print(result["summary"])
+            for row in result["registered"]:
+                Console().print("registered: %s (%s) %s" % (row["name"], row["kind"], row["path"]))
+            return 0
         elif args.command == "scan":
             store = Store(args.db)
             handles = scan.handles_from(args.handle)
@@ -375,8 +385,16 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
             store = Store(args.db)
             result = dispatch(args, store, runner, request)
         display(result, args.json, show_all=getattr(args, "all", False))
-        if args.command == "check" and any(r.get("error") or not r["report"]["advisory_check_ok"] or r["report"]["update_error"] or
-                                            any(c["status"] == "incomplete" for c in r["report"].get("context", {}).values()) for r in result):
+        def needs_attention(row):
+            """A row without a report is unfinished coverage, so it counts too."""
+            report = row.get("report")
+            if row.get("error") or not report:
+                return True
+            if not report["advisory_check_ok"] or report["update_error"]:
+                return True
+            return any(c["status"] == "incomplete" for c in report.get("context", {}).values())
+
+        if args.command == "check" and any(needs_attention(r) for r in result):
             return 1
         return 0
     except (Error, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError, sqlite3.Error) as exc:
