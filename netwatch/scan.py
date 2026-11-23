@@ -269,6 +269,11 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
     missing = [(key, query) for key, query in zip(keys, union.values()) if key not in known]
     failure = None
     if missing:
+        # The screen can be the only slow part of a scan, so it is announced before it
+        # runs — a two-request wait must not read as a hang, and a warm run shows the
+        # cache holding most of the work.
+        say("advisories: screening %d packages (%d already cached)"
+            % (len(missing), len(union) - len(missing)))
         try:
             answers = run_screen([query for _, query in missing])
             if len(answers) != len(missing):

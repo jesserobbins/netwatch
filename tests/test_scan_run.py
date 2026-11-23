@@ -343,8 +343,24 @@ class ScreenedRunTests(unittest.TestCase):
             self.assertTrue(any("advisory screen failed" in reason for reason in row["reasons"]),
                             row["reasons"])
 
-    def test_progress_gains_exactly_one_advisories_line(self):
+    def test_progress_announces_the_screening_before_the_screen_runs(self):
+        # the announcement is what keeps a two-request wait from reading as a hang,
+        # so it must precede the screen call; the outcome line stays exactly as ruled
+        messages = []
+
+        def screen(queries):
+            messages.append("screen ran")
+            return [[] for _ in queries]
+
+        self.run_scan(screen, progress=messages.append)
+        watched = [m for m in messages if m.startswith("advisories: ") or m == "screen ran"]
+        self.assertEqual(watched, ["advisories: screening 2 packages (0 already cached)",
+                                  "screen ran",
+                                  "advisories: 2 packages screened in 1 requests, 0 need detail"])
+
+    def test_a_fully_cached_scan_announces_nothing_to_screen(self):
+        self.run_scan(lambda queries: [[] for _ in queries])   # warm the hour cache
         messages = []
         self.run_scan(lambda queries: [[] for _ in queries], progress=messages.append)
-        lines = [m for m in messages if m.startswith("advisories: ")]
-        self.assertEqual(lines, ["advisories: 2 packages screened in 1 requests, 0 need detail"])
+        self.assertEqual([m for m in messages if m.startswith("advisories: ")],
+                         ["advisories: 2 packages screened in 0 requests, 0 need detail"])
