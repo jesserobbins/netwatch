@@ -16,6 +16,15 @@ netwatch demo
 
 The demo uses synthetic data and a simulated package manager. From a checkout, `python3 -m netwatch` runs the same CLI as `netwatch`.
 
+From a checkout you can also let the bundled script do the environment work:
+
+```bash
+./netwatch-run.sh                 # prepare .venv, then print the overview
+./netwatch-run.sh status          # any netwatch command, arguments passed through
+```
+
+It creates `.venv` with Python 3.12+ and installs the pinned requirements plus netwatch itself in editable mode, then runs the command. The install happens once: later runs only compare `pyproject.toml` and `requirements.lock` against a stamp inside the environment and start immediately. Progress notes go to stderr, so `--json` output stays clean. `NETWATCH_VENV`, `NETWATCH_PYTHON`, `NETWATCH_SETUP=always` and `NETWATCH_QUIET=0` change where it builds, which interpreter it uses, whether it reinstalls, and whether you see the installer work.
+
 Running `netwatch` with no command prints an overview of the daily loop, the commands, the supported kinds and where state lives.
 
 ## Daily workflow
