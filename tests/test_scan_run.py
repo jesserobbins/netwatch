@@ -136,6 +136,10 @@ class RunTests(unittest.TestCase):
         queried = []
 
         def request(url, body=None):
+            if isinstance(body, dict) and "queries" in body:
+                # the run-wide screen: flag every queried package for a detail pass
+                return {"results": [{"vulns": [{"id": "GHSA-example"}]}
+                                   for _ in body["queries"]]}
             queried.append(body["package"]["name"])
             return {"vulns": [{"id": "GHSA-example", "affected": [{
                 "package": {"ecosystem": "npm", "name": "minimist"},
@@ -147,6 +151,7 @@ class RunTests(unittest.TestCase):
         finally:
             store.close()
         self.assertEqual(queried, ["minimist"])
+        self.assertEqual(result["advisory_requests"], {"screen": 1, "detail": 1})
         self.assertEqual([Path(t["path"]).resolve() for t in result["tickets"]],
                          [self.owned.resolve()])
         self.assertTrue((self.owned / ".netwatch").is_file())
@@ -154,10 +159,10 @@ class RunTests(unittest.TestCase):
     def test_scan_does_not_write_a_ticket_when_collection_yields_nothing(self):
         store = store_module.Store(self.state)
         try:
-            with mock.patch.object(tickets, "collect", return_value=(
+            with mock.patch.object(tickets, "inspect", return_value=(
                     {"netwatch": 1, "generated": "x", "collection": "incomplete",
                      "error": "both parsers failed", "findings": [], "leads": []},
-                    ["both parsers failed"])):
+                    [], ["both parsers failed"])):
                 result = scan.run(store, self.root, handles={"jesserobbins"},
                                   request=lambda url, body=None: {"vulns": []})
         finally:
@@ -263,3 +268,83 @@ class IncompleteReportingTests(unittest.TestCase):
             store.close()
             shutil.rmtree(root, ignore_errors=True)
         self.assertEqual([Path(r["path"]).name for r in result["incomplete"]], ["repo"])
+
+
+class ScreenedRunTests(unittest.TestCase):
+    """One advisory screen covers the whole run; only what it flags gets a detail query."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.state = self.root / "state.db"
+        self.repos = []
+        for name, extra in (("one", ("left-pad", "1.0.0")), ("two", ())):
+            repo = self.root / name
+            repo.mkdir()
+            git(repo, "init", "-q")
+            git(repo, "remote", "add", "origin",
+                "https://github.com/jesserobbins/%s.git" % name)
+            (repo / "package.json").write_text('{"name":"%s"}' % name)
+            packages = {"": {}, "node_modules/minimist": {"version": "1.2.0"}}
+            if extra:
+                packages["node_modules/" + extra[0]] = {"version": extra[1]}
+            (repo / "package-lock.json").write_text(json.dumps(
+                {"lockfileVersion": 3, "packages": packages}))
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "init")
+            self.repos.append(repo)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def run_scan(self, screen, **kw):
+        store = store_module.Store(self.state)
+        try:
+            return scan.run(store, self.root, handles={"jesserobbins"},
+                            request=lambda url, body=None: {"vulns": []},
+                            screen=screen, **kw)
+        finally:
+            store.close()
+
+    def test_the_screen_runs_once_for_the_whole_run_and_dedupes(self):
+        # two repos locking the same package: one batch, minimist asked once in it
+        batches = []
+
+        def screen(queries):
+            batches.append([(q["package"]["ecosystem"], q["package"]["name"]) for q in queries])
+            return [[] for _ in queries]
+
+        result = self.run_scan(screen)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(sorted(batches[0]), [("npm", "left-pad"), ("npm", "minimist")])
+        self.assertEqual(len(set(batches[0])), len(batches[0]))      # no duplicates
+        self.assertEqual(result["advisory_requests"], {"screen": 1, "detail": 0})
+
+    def test_a_second_run_inside_the_hour_screens_nothing(self):
+        calls = []
+
+        def screen(queries):
+            calls.append(list(queries))
+            return [[] for _ in queries]
+
+        first = self.run_scan(screen)
+        second = self.run_scan(screen)
+        self.assertEqual(first["advisory_requests"]["screen"], 1)
+        self.assertEqual(second["advisory_requests"]["screen"], 0)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failed_screen_leaves_every_affected_repo_incomplete(self):
+        def screen(queries):
+            raise tickets.Error("OSV refused the batch")
+
+        result = self.run_scan(screen)
+        self.assertEqual(result["advisory_requests"]["screen"], 1)
+        self.assertEqual([Path(r["path"]).name for r in result["incomplete"]], ["one", "two"])
+        for row in result["incomplete"]:
+            self.assertTrue(any("advisory screen failed" in reason for reason in row["reasons"]),
+                            row["reasons"])
+
+    def test_progress_gains_exactly_one_advisories_line(self):
+        messages = []
+        self.run_scan(lambda queries: [[] for _ in queries], progress=messages.append)
+        lines = [m for m in messages if m.startswith("advisories: ")]
+        self.assertEqual(lines, ["advisories: 2 packages screened in 1 requests, 0 need detail"])

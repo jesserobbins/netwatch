@@ -183,11 +183,14 @@ def handles_from(names, runner=None) -> set:
 
 
 def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=None,
-        home=None, progress=None) -> dict:
+        home=None, progress=None, screen=None) -> dict:
     """Walk, classify, ticket the owned repos, persist the run.
 
     The records are what `--register` indexes into later, so the per-lane ordinals here
-    are the numbers the operator will type.
+    are the numbers the operator will type. One advisory screen covers the whole run:
+    every owned repo's packages are deduplicated per (ecosystem, name, version), what the
+    hour cache already knows is skipped, and the rest is asked in one batch so a scan of
+    a hundred repos costs one or two OSV requests instead of one per package.
     """
     from . import sources
     request = request or sources.fetch
@@ -201,8 +204,25 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
     say = progress or (lambda message: None)
     say("scanning %s (depth %d): %d item%s"
         % (spelling, depth, len(items), "" if len(items) == 1 else "s"))
+    asked = {"screen": 0, "detail": 0}
+
+    def counted(url, body=None):
+        # Both advisory lanes go through here, so the run can report what it asked: the
+        # batch screen posts to querybatch, the detail queries post to query.
+        asked["screen" if url == sources.OSV_BATCH else "detail"] += 1
+        return request(url, body)
+
+    if screen is None:
+        def run_screen(queries):
+            return sources.osv_batch(queries, request=counted)
+    else:
+        def run_screen(queries):
+            asked["screen"] += 1
+            return screen(queries)
+
     ordinals = {USER: 0, REPO: 0, UNCLASSIFIED: 0}
     rows, written, skipped, incomplete = [], [], [], []
+    repos = []   # owned repos in walk order: (item, detail, payload, packages, reasons)
     for item in items:
         ordinals[item.lane] += 1
         try:
@@ -229,27 +249,71 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
             detail["owned"] = is_owned
             if is_owned:
                 say("        reading %s" % label)
-                payload, why = tickets.collect(item.path, request=request,
-                                               cache=store)
-                if tickets.should_write(payload, item.path):
-                    try:
-                        tickets.write(item.path, tickets.render(payload))
-                        written.append({"path": str(item.path), "findings": len(payload["findings"])})
-                        say("        ticket written: %d finding%s"
-                            % (len(payload["findings"]),
-                               "" if len(payload["findings"]) == 1 else "s"))
-                        detail["ticket"] = "written"
-                        store.event(None, "ticket_written",
-                                    {"repo": str(item.path), "findings": len(payload["findings"])})
-                    except tickets.Refused as exc:
-                        detail["ticket"] = "refused: " + str(exc)
-                else:
-                    detail["ticket"] = "left alone"
-                if why:
-                    incomplete.append({"path": str(item.path), "reasons": why})
+                payload, packages, why = tickets.inspect(item.path)
+                repos.append((item, detail, payload, packages, why))
             else:
                 skipped.append({"path": str(item.path), "reason": "not an owned repo"})
         rows.append((item.lane, ordinals[item.lane], str(Path(item.path).absolute()), detail))
+    # One screen for the whole run: the deduplicated union of every owned repo's packages,
+    # minus the answers the hour cache already holds. The per-repo passes below then read
+    # everything from the cache, so the batch is asked once per scan, not once per checkout.
+    union = {}
+    for _, _, _, packages, _ in repos:
+        for package in packages:
+            triple = (package["ecosystem"], package["name"], package["version"])
+            union.setdefault(triple, {"package": {"name": package["name"],
+                                                   "ecosystem": package["ecosystem"]},
+                                       "version": package["version"]})
+    keys = ["osv-screen:%s:%s:%s" % triple for triple in union]
+    known = store.cached_many(keys, max_age=3600)
+    missing = [(key, query) for key, query in zip(keys, union.values()) if key not in known]
+    failure = None
+    if missing:
+        try:
+            answers = run_screen([query for _, query in missing])
+            if len(answers) != len(missing):
+                raise Error("advisory screen reply unusable: %d answers for %d packages"
+                            % (len(answers), len(missing)))
+        except Error as exc:
+            # A refused or malformed screen is recorded, never swallowed: every repo that
+            # asked reports an incomplete check below instead of reading as clean.
+            failure = exc
+        else:
+            for (key, _), answer in zip(missing, answers):
+                store.cached_put(key, answer)
+
+    def repo_screen(queries):
+        if failure is not None:
+            raise failure
+        return run_screen(queries)
+
+    for item, detail, payload, packages, why in repos:
+        findings, advise_why = tickets.advisories(packages, request=counted,
+                                                  cache=store, screen=repo_screen)
+        payload["findings"].extend(findings)
+        why.extend(advise_why)
+        if why:
+            payload["collection"] = "incomplete"
+            payload["error"] = "; ".join(why)
+        if tickets.should_write(payload, item.path):
+            try:
+                tickets.write(item.path, tickets.render(payload))
+                written.append({"path": str(item.path), "findings": len(payload["findings"])})
+                say("        ticket written: %d finding%s"
+                    % (len(payload["findings"]),
+                       "" if len(payload["findings"]) == 1 else "s"))
+                detail["ticket"] = "written"
+                store.event(None, "ticket_written",
+                            {"repo": str(item.path), "findings": len(payload["findings"])})
+            except tickets.Refused as exc:
+                detail["ticket"] = "refused: " + str(exc)
+        else:
+            detail["ticket"] = "left alone"
+        if why:
+            incomplete.append({"path": str(item.path), "reasons": why})
+    if union:
+        say("advisories: %d packages screened in %d requests, %d need detail"
+            % (len(union), asked["screen"], asked["detail"]))
     counts = {lane: n for lane, n in ordinals.items() if n}
     run_id = store.scan_run(str(root), counts)
     for lane, ordinal, path, detail in rows:
@@ -257,7 +321,8 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
     return {"run": run_id, "root": str(root),
             "summary": "scan run %d: %s" % (run_id, summary(items)),
             "counts": counts, "tickets": written, "skipped": skipped,
-            "incomplete": incomplete}
+            "incomplete": incomplete,
+            "advisory_requests": {"screen": asked["screen"], "detail": asked["detail"]}}
 
 
 def report(store, path, *, request=None) -> dict:
