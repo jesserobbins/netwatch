@@ -125,6 +125,32 @@ class RunTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "written")
         self.assertTrue((self.foreign / ".netwatch").is_file())
 
+    def test_a_repo_with_locked_packages_scans_with_the_cache(self):
+        (self.owned / "package.json").write_text('{"name":"x"}')
+        (self.owned / "package-lock.json").write_text(json.dumps({
+            "lockfileVersion": 3,
+            "packages": {"": {}, "node_modules/minimist": {"version": "1.2.0"}},
+        }))
+        git(self.owned, "add", "-A")
+        git(self.owned, "commit", "-qm", "lockfile")
+        queried = []
+
+        def request(url, body=None):
+            queried.append(body["package"]["name"])
+            return {"vulns": [{"id": "GHSA-example", "affected": [{
+                "package": {"ecosystem": "npm", "name": "minimist"},
+                "ranges": [{"events": [{"introduced": "0"}, {"fixed": "1.2.3"}]}]}]}]}
+
+        store = store_module.Store(self.state)
+        try:
+            result = scan.run(store, self.root, handles={"jesserobbins"}, request=request)
+        finally:
+            store.close()
+        self.assertEqual(queried, ["minimist"])
+        self.assertEqual([Path(t["path"]).resolve() for t in result["tickets"]],
+                         [self.owned.resolve()])
+        self.assertTrue((self.owned / ".netwatch").is_file())
+
     def test_scan_does_not_write_a_ticket_when_collection_yields_nothing(self):
         store = store_module.Store(self.state)
         try:

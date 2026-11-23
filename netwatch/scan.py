@@ -230,7 +230,7 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
             if is_owned:
                 say("        reading %s" % label)
                 payload, why = tickets.collect(item.path, request=request,
-                                               cache=store.cached)
+                                               cache=store)
                 if tickets.should_write(payload, item.path):
                     try:
                         tickets.write(item.path, tickets.render(payload))
@@ -267,7 +267,7 @@ def report(store, path, *, request=None) -> dict:
     repo = Path(path).expanduser().resolve()
     if not (repo / ".git").exists():
         raise NotADirectoryError(str(repo) + " is not a git checkout")
-    payload, why = tickets.collect(repo, request=request, cache=store.cached)
+    payload, why = tickets.collect(repo, request=request, cache=store)
     if not tickets.should_write(payload, repo):
         return {"path": str(repo), "status": "left alone",
                 "reasons": why or ["collection produced nothing"]}
