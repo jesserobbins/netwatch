@@ -516,6 +516,29 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
                         (key, int(time.time()), canonical(value)))
 
+    def cached_many(self, keys, *, max_age=3600):
+        """The cached values for the keys that are present and fresh, in one pass.
+
+        A whole scan's triples are screened with a handful of statements instead of one
+        query per key; the `IN` list is chunked so SQLite's bound-parameter limit cannot
+        refuse a long key list. Absent and stale keys are simply missing from the result,
+        never mapped to None, and `max_age <= 0` means "do not use the cache", exactly as
+        `cached_get` reads it.
+        """
+        if max_age <= 0:
+            return {}
+        now = int(time.time())
+        found = {}
+        CHUNK = 500
+        for start in range(0, len(keys), CHUNK):
+            chunk = list(keys[start:start + CHUNK])
+            marks = ",".join("?" * len(chunk))
+            for row in self.db.execute(
+                    "SELECT key, at, body FROM cache WHERE key IN (%s)" % (marks,), chunk):
+                if 0 <= now - row["at"] <= max_age:
+                    found[row["key"]] = json.loads(row["body"])
+        return found
+
     def cached(self, key, loader, *, offline=False, max_age=86400):
         body = self.cached_get(key, max_age=max_age)
         if body is not None:
