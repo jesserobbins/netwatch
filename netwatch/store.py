@@ -497,13 +497,31 @@ class Store:
                                (since, target, target)).fetchall()
         return [{**dict(r), "body": json.loads(r["body"])} for r in rows]
 
-    def cached(self, key, loader, *, offline=False, max_age=86400):
+    def cached_get(self, key, *, max_age=86400):
+        """Read one cache entry, or None when it is absent or stale.
+
+        Split from the write so a caller that fetches over the network in parallel with
+        other workers can read and write the cache only on the owning (single) connection.
+        """
         row = self.db.execute("SELECT at,body FROM cache WHERE key=?", (key,)).fetchone()
-        age = int(time.time()) - row["at"] if row else None
-        if row and max_age > 0 and 0 <= age <= max_age:
-            return json.loads(row["body"])
+        if row is None or max_age <= 0:
+            # max_age <= 0 means "do not use the cache", which is how --refresh asks for a
+            # fresh fetch.
+            return None
+        if not 0 <= int(time.time()) - row["at"] <= max_age:
+            return None
+        return json.loads(row["body"])
+
+    def cached_put(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)",
+                        (key, int(time.time()), canonical(value)))
+
+    def cached(self, key, loader, *, offline=False, max_age=86400):
+        body = self.cached_get(key, max_age=max_age)
+        if body is not None:
+            return body
         if offline:
             raise Error("Missing or stale cached advisory evidence; run check without --offline")
         body = loader()
-        self.db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?)", (key, int(time.time()), canonical(body)))
+        self.cached_put(key, body)
         return body
