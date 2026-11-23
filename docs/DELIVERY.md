@@ -1,6 +1,6 @@
 # Delivery checklist
 
-Tracks implementation and verification for Ubuntu, Arch/CachyOS, conda/mamba, uv and npm environments. Development history is recorded in the worklog.
+Tracks implementation and verification for Ubuntu, Arch/CachyOS, conda/mamba, uv, npm, Homebrew, and the uv-tool and pipx tool venvs, plus filesystem scanning and repo tickets. Development history is recorded in the worklog.
 
 ## Required workflow
 
@@ -67,6 +67,20 @@ Tracks implementation and verification for Ubuntu, Arch/CachyOS, conda/mamba, uv
 - [x] Cache only identities, dates, priority labels and tags; drop briefing prose and upgrade advice. Reject DTD/entity declarations, bound size/time, retain prior briefings on failure and record changes as context events.
 - [x] Document coverage, matching and license limits. Pass context, transport and full test suites plus a public-feed parse smoke check; no registered-target checks or real updates.
 
+## Scan, repo tickets and tool venvs
+
+- [x] `scan <root>` walks a filesystem, classifies user-lane venvs against repo-lane checkouts, stops at each repo root, skips noise directories, follows no symlinked directory, and keeps the operator's path spelling so alias-written launchers are recognised. `--depth` and `--exclude` bound it.
+- [x] `scan --list` classifies from directory structure only: no `git`, no `gh`, no package-tool enumeration, and it never opens the database, so it cannot create or migrate a state file. Covered by a test that asserts the store and the runner are untouched.
+- [x] Scans persist as runs plus per-lane records with 1-based ordinals; `scan --register` indexes into that stored run, batches are all-or-nothing and capped at five, and each item is re-verified on disk (realpath, device and inode, manager metadata, distribution) before anything is written. A name held by a different live target is suffixed rather than rebound.
+- [x] Repo lane findings: unpinned manifest, uncommitted lockfile, drifted lockfile, and OSV advisories for lockfile-resolved versions; staleness is a lead. Tickets are written only into repos whose github origin is the authenticated account or an explicit `--handle`, with `report` as the explicit override, and publish by temp file plus rename after a pre-rename header re-check. Symlinked, directory and foreign `.netwatch` files are refused; interrupted temps are cleaned.
+- [x] `uvtool`/`pipx` kinds: inventory through the venv's own interpreter, candidates from `uv pip list --outdated`, OSV per installed distribution, and launcher verification against what the manager records as exposed — including the as-written path tolerance and an explicit "not entry-point-verifiable" note for native binaries.
+- [x] Lifecycle state machine as pure functions over synthetic events (one pairing rule, one-shot facts, superseded and unfinished observations writing nothing), with flags in columns and every write guarded by generation and `state_seq`. States: live, not_bindable, identity_mismatch, unresolved_path, removed; `status` prints the state with the action that clears it.
+- [x] Schema 11: lifecycle columns plus `scan_runs`/`scan_records`. Version 10 migrates in one transaction; 11 is accepted; anything else is refused rather than migrated. Lazy expiry stales expired proposals and deletes their constraints files.
+- [x] Probe-bound approvals: one token per venv created by `os.link` only after identity passes and never rewritten; apply refuses on a changed token. The constraints artifact carries the retained bounds as well as the pins, with markers evaluated against the venv's interpreter.
+- [x] Apply verifies, in order: plan state and expiry, recorded path, runtime identity, probe token, inventory digest covering metadata and origin bytes, interpreter marker values, requested extras, index-option digest, constraints digest, and a verified copy that is what runs. `applied` further requires the approved pins installed, no new consistency entry, preserved origins and no held distribution removed; a failure that changed nothing returns the plan to `proposed`, anything else is `needs_attention`.
+- [x] Documented in `docs/USAGE.md` (lanes, tickets, registration, tool-venv lifecycle with a state-and-recovery table, the exact install command and the apply conditions), `docs/DESIGN.md` (seven modules and the behavior to preserve) and `README.md`.
+- [x] Verification: 419 deterministic tests, worklog checks, packaging check and demo. Live on the development machine in throwaway tool homes: uv-tool ruff 0.8.0 → 0.17.6 and pipx upgrades, each read back from the venv's own interpreter; a probe replaced after preview refused the approval; malformed-probe, recovery and unresolved_path transitions reproduced through the CLI. OS package-manager updates were not run. The work was put through repeated independent audit passes, which found and drove fixes for a shadowing bug, unredacted index credentials, a verified copy that never ran, and launcher verification by label.
+
 ## Before using live updates
 
-Test package-manager commands, credentials, project layouts and recovery on disposable targets before enabling updates on working systems. Live updates have not been tested. Conda-native vulnerability matching and authoritative CachyOS matching remain unimplemented; inventory and update discovery are supported.
+Test package-manager commands, credentials, project layouts and recovery on disposable targets before enabling updates on working systems. Tool-venv upgrades have been exercised end to end in throwaway tool homes; OS package-manager updates have not been run live and remain unverified. Conda-native vulnerability matching and authoritative CachyOS matching remain unimplemented; inventory and update discovery are supported.

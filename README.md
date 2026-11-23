@@ -5,6 +5,7 @@ netwatch tracks vulnerabilities and available updates across your machines and d
 - Checks Ubuntu, Arch/CachyOS, conda/mamba, uv, npm and Homebrew environments locally or over SSH, plus uv-tool and pipx tool venvs by path.
 - Matches installed packages against Canonical, Arch and OSV advisories.
 - Scans a filesystem root to find those environments, and writes a `.netwatch` ticket into the git checkouts it owns.
+- Binds each tool-venv approval to a probe token and installs the pinned set under the environment's own declared bounds.
 - Optionally adds cve.now context, pwn.watch incident leads and Cloudflare Zero Wire briefings for review with `check --context`.
 - Stores findings and history in SQLite, with text and JSON output for you or your agent.
 
@@ -95,7 +96,7 @@ Advisories are cached for one hour, except Homebrew's scanner, which runs on the
 
 ### Apply updates
 
-`apply` updates the **whole selected environment**, including dependencies, so review its scope and back up before running it. Live updates have not been tested; start with a disposable environment.
+`apply` updates the **whole selected environment**, including dependencies, so review its scope and back up before running it. Tool-venv upgrades (`uvtool`, `pipx`) have been exercised end to end on the machine they were developed on, in throwaway tool homes; OS package-manager updates have not. Start with a disposable environment.
 
 ```bash
 netwatch preview server

@@ -1,10 +1,12 @@
 # Agent guide
 
-netwatch is a small Python/SQLite CLI for maintained environments, cached advisory checks, agent-readable status and human-approved package-manager updates. Prefer fewer functions and files over frameworks. User instructions override this guide. Do not use subagents unless the user explicitly changes that direction.
+netwatch is a small Python/SQLite CLI for maintained environments, cached advisory checks, agent-readable status and human-approved package-manager updates. It also scans a filesystem root for environments and checkouts, and writes a ticket into the repos it owns. Prefer fewer functions and files over frameworks. User instructions override this guide. Do not use subagents unless the user explicitly changes that direction.
 
 ## Using netwatch
 
-Read [docs/USAGE.md](docs/USAGE.md) for installation, environment registration, checks, status/history queries, update approval and recovery. It is the operating manual for users and agents. [README.md](README.md) gives the quick start; [docs/DESIGN.md](docs/DESIGN.md) describes the modules.
+Read [docs/USAGE.md](docs/USAGE.md) for installation, environment registration, scanning and repo tickets, checks, status/history queries, update approval and recovery. It is the operating manual for users and agents. [README.md](README.md) gives the quick start; [docs/DESIGN.md](docs/DESIGN.md) describes the modules and the behavior to preserve.
+
+`scan ROOT --list` is the safe way to look at an unfamiliar root: it reads directory structure only and never opens the database. A real `scan ROOT` runs git inside each classified checkout and writes tickets only into repos the configured account owns. `report PATH` writes one ticket anywhere on request. Registration is a separate, explicit `scan ROOT --register …` step.
 
 Start with `netwatch list` and `netwatch status` to inspect saved state without contacting targets. Use `netwatch --json status` and `netwatch --json history --since 0` for structured results. Run `check` only for authorized targets, and `apply` only after explicit update approval. `netwatch demo` exercises a temporary simulation without network or package changes.
 

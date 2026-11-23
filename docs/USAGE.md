@@ -39,7 +39,7 @@ netwatch apply PLAN_ID --yes
 netwatch status server
 ```
 
-OS updates on Linux require `sudo -n` access. Application updates, including Homebrew on macOS, use the invoking account; Homebrew is never run as root. `apply` updates the whole selected environment, including dependencies. Live updates have not been tested; start on a disposable target. See [update behavior and recovery](#updates).
+OS updates on Linux require `sudo -n` access. Application updates, including Homebrew on macOS, use the invoking account; Homebrew is never run as root. `apply` updates the whole selected environment, including dependencies. Tool-venv upgrades have been exercised end to end in throwaway tool homes; OS package-manager updates have not been exercised live, so start on a disposable target. See [update behavior and recovery](#updates).
 
 ## Agent and script queries
 
@@ -183,7 +183,7 @@ netwatch targets remove server
 
 Retirement marks the row removed, keeps its history and frees its name; proposed plans for the target, and for any other target on the same venv, are marked stale in the same transaction. It refuses while an update for that target or venv is `running` or locked `needs_attention`, because the venv is still being inspected.
 
-Custom uv environment locations, uninstalled lockfile dependencies, containers, Snap and Flatpak are not scanned. Source forks need separate assessment. Held packages and project constraints can prevent an update from reaching an advisory's fixed version.
+A scan only sees what lies under the root you give it; it does not consult uv's or pipx's own registry of other locations. Uninstalled lockfile dependencies, containers, Snap and Flatpak are not assessed. Source forks need separate assessment. Held packages and project constraints can prevent an update from reaching an advisory's fixed version.
 
 ## Cache and network
 
