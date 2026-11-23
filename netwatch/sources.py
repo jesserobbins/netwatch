@@ -9,13 +9,14 @@ import urllib.error
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
-from . import adapters
+from . import adapters, __version__
 from .core import Error, digest, text
 from .versions import compare_versions
 
 USN = "https://usn.ubuntu.com/usn-db/database.json"
 ARCH = "https://security.archlinux.org/issues/all.json"
 OSV = "https://api.osv.dev/v1/query"
+OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 PWN = "https://pwn.watch/incidents.json"
 CVE_NOW = "https://cve.now/api/v1/entries/"
 ZERO_WIRE = "https://radar.cloudflare.com/security/zero-wire/rss"
@@ -36,15 +37,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Error("Advisory endpoint redirected; check source configuration in code")
 
 
+def user_agent():
+    """One source of truth for how netwatch identifies itself to advisory feeds."""
+    return "netwatch/" + __version__
+
+
 def fetch(url, body=None):
     cve_lookup = url.startswith(CVE_NOW) and re.fullmatch(CVE_ID, url[len(CVE_NOW):])
-    if url not in (USN, ARCH, OSV, PWN, ZERO_WIRE) and not cve_lookup:
+    if url not in (USN, ARCH, OSV, OSV_BATCH, PWN, ZERO_WIRE) and not cve_lookup:
         raise Error("Unknown advisory endpoint")
     briefing = cve_lookup or url in (PWN, ZERO_WIRE)
     if briefing and body is not None:
         raise Error("Context sources accept only public GET requests")
     request = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"User-Agent": "netwatch/0.2", "Content-Type": "application/json",
+                                     headers={"User-Agent": user_agent(), "Content-Type": "application/json",
                                               "Accept-Encoding": "identity"})
     limit = 512 * 1024 * 1024 if url == USN else (2 if cve_lookup else 5 if url == ZERO_WIRE else 20) * 1024 * 1024
     timeout = 10 if briefing else 30
@@ -62,6 +68,60 @@ def fetch(url, body=None):
         return raw.decode("utf-8") if url == ZERO_WIRE else json.loads(raw)
     except (OSError, ValueError, urllib.error.URLError) as exc:
         raise Error("Advisory request failed; previous findings retained") from exc
+
+
+def osv_batch(queries, *, request=fetch, chunk=1000):
+    """One batched OSV question for a whole scan: advisory ids per query, in input order.
+
+    `queries` are `querybatch` bodies; a refusal shrinks the chunk and re-asks, so one
+    oversized request cannot fail a scan. Pagination is resolved here: only the queries
+    that carry a token are re-asked, and their ids merge in place.
+    """
+    result, start = [], 0
+    while start < len(queries):
+        batch = queries[start:start + chunk]
+        try:
+            reply = request(OSV_BATCH, {"queries": batch})
+        except Error:
+            # A refusal is a size problem, not a data problem: halve and re-ask this chunk.
+            if chunk <= 1:
+                raise
+            chunk = max(1, chunk // 2)
+            continue
+        result.extend(_osv_batch_page(batch, reply, request))
+        start += len(batch)
+    return result
+
+
+def _osv_batch_page(queries, reply, request):
+    # A malformed reply is not a size refusal: re-asking smaller cannot fix it, so it fails
+    # outright instead of re-sending the batch one query at a time.
+    if (not isinstance(reply, dict) or not isinstance(reply.get("results"), list)
+            or len(reply["results"]) != len(queries)):
+        raise Error("OSV batch response is malformed")
+    ids, follow = [], []
+    for index, (query, row) in enumerate(zip(queries, reply["results"])):
+        if not isinstance(row, dict) or not isinstance(row.get("vulns", []), list):
+            raise Error("OSV batch response is malformed")
+        ids.append([v["id"] for v in row.get("vulns") or []
+                    if isinstance(v, dict) and isinstance(v.get("id"), str)])
+        if row.get("next_page_token"):
+            follow.append((index, query, row["next_page_token"]))
+    while follow:
+        reply = request(OSV_BATCH, {"queries": [{**q, "page_token": t} for _, q, t in follow]})
+        if (not isinstance(reply, dict) or not isinstance(reply.get("results"), list)
+                or len(reply["results"]) != len(follow)):
+            raise Error("OSV batch response is malformed")
+        remaining = []
+        for (index, query, _), row in zip(follow, reply["results"]):
+            if not isinstance(row, dict) or not isinstance(row.get("vulns", []), list):
+                raise Error("OSV batch response is malformed")
+            ids[index].extend(v["id"] for v in row.get("vulns") or []
+                              if isinstance(v, dict) and isinstance(v.get("id"), str))
+            if row.get("next_page_token"):
+                remaining.append((index, query, row["next_page_token"]))
+        follow = remaining
+    return ids
 
 
 def finding(p, advisory, state, fixes, reason, link):
