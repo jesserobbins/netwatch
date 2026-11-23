@@ -317,7 +317,7 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
         if why:
             incomplete.append({"path": str(item.path), "reasons": why})
     if union:
-        say("advisories: %d packages screened in %d requests, %d need detail"
+        say("advisories: %d packages screened in %d requests, %d detail requests"
             % (len(union), asked["screen"], asked["detail"]))
     counts = {lane: n for lane, n in ordinals.items() if n}
     run_id = store.scan_run(str(root), counts)

@@ -356,11 +356,12 @@ class ScreenedRunTests(unittest.TestCase):
         watched = [m for m in messages if m.startswith("advisories: ") or m == "screen ran"]
         self.assertEqual(watched, ["advisories: screening 2 packages (0 already cached)",
                                   "screen ran",
-                                  "advisories: 2 packages screened in 1 requests, 0 need detail"])
+                                  "advisories: 2 packages screened in 1 requests, 0 detail requests"])
 
     def test_a_fully_cached_scan_announces_nothing_to_screen(self):
         self.run_scan(lambda queries: [[] for _ in queries])   # warm the hour cache
         messages = []
-        self.run_scan(lambda queries: [[] for _ in queries], progress=messages.append)
+        second = self.run_scan(lambda queries: [[] for _ in queries], progress=messages.append)
         self.assertEqual([m for m in messages if m.startswith("advisories: ")],
-                         ["advisories: 2 packages screened in 0 requests, 0 need detail"])
+                         ["advisories: 2 packages screened in 0 requests, 0 detail requests"])
+        self.assertEqual(second["advisory_requests"], {"screen": 0, "detail": 0})
