@@ -95,7 +95,8 @@ def _uv_lock_packages(path):
     packages = []
     for row in data.get("package", []):
         if isinstance(row, dict) and "name" in row and "version" in row:
-            packages.append({"name": row["name"], "version": row["version"], "ecosystem": "PyPI"})
+            packages.append({"name": row["name"], "version": row["version"],
+                             "ecosystem": "PyPI", "direct": True})
     return packages
 
 
@@ -111,6 +112,43 @@ def _npm_lock_packages(path):
     return packages
 
 
+def _screen(packages, screen, cache, incomplete):
+    """Which packages need a detail query, or None when the screen failed.
+
+    The screen answers does-anything-apply for many packages at once, and its answer is
+    kept per triple for the hour so a repeat scan asks nothing. A screen that fails or
+    replies short makes the check incomplete: a refused batch must never read as a
+    clean tree.
+    """
+    if screen is None:
+        # Today's behaviour: every package gets its own /v1/query in the detail pass.
+        return packages
+    queries, keys = [], []
+    for package in packages:
+        queries.append({"package": {"name": package["name"], "ecosystem": package["ecosystem"]},
+                        "version": package["version"]})
+        keys.append("osv-screen:" + (package["ecosystem"] + ":" + package["name"] + ":" +
+                                     package["version"]))
+    answers = [cache.cached_get(key, max_age=3600) if cache is not None else None
+               for key in keys]
+    asked = [i for i, answer in enumerate(answers) if answer is None]
+    if asked:
+        try:
+            replies = screen([queries[i] for i in asked])
+        except Error as exc:
+            incomplete.append("advisory screen failed: %s" % (exc,))
+            return None
+        if len(replies) != len(asked):
+            incomplete.append("advisory screen reply unusable: %d answers for %d packages"
+                              % (len(replies), len(asked)))
+            return None
+        for i, reply in zip(asked, replies):
+            answers[i] = reply
+            if cache is not None:
+                cache.cached_put(keys[i], reply)
+    return [package for package, answer in zip(packages, answers) if answer]
+
+
 def _advisories(packages, request, incomplete, cache=None):
     findings = []
     for package in packages:
@@ -122,8 +160,10 @@ def _advisories(packages, request, incomplete, cache=None):
             else:
                 key = "osv-repo:" + (body["package"]["ecosystem"] + ":" +
                                      body["package"]["name"] + ":" + body["version"])
-                load = lambda: request(sources.OSV, body)
-                data = cache(key, load, max_age=3600)
+                data = cache.cached_get(key, max_age=3600)
+                if data is None:
+                    data = request(sources.OSV, body)
+                    cache.cached_put(key, data)
         except Error as exc:
             incomplete.append("%s advisory query failed: %s" % (package["name"], exc))
             continue
@@ -163,10 +203,16 @@ def _advice(package, fixed):
             "lockfile and manifest together" % (package["name"], target))
 
 
-def collect(repo, *, request=sources.fetch, runner=subprocess.run, cache=None):
-    """Findings plus leads for one checkout. Never writes anything."""
+def inspect(repo, *, runner=subprocess.run):
+    """Read a checkout: git state and lockfiles, no advisory queries.
+
+    Returns the payload (no advisory entries), the locked packages as
+    {"name", "version", "ecosystem", "source", "direct"} dicts for the advisory
+    pass, and the reasons collection fell short.
+    """
     repo = Path(repo) if not isinstance(repo, Path) else repo
     findings, leads, incomplete = [], [], []
+    packages = []
     for manifest, lock, ecosystem, action in MANIFEST_LOCK:
         if not (repo / manifest).is_file():
             continue
@@ -199,14 +245,14 @@ def collect(repo, *, request=sources.fetch, runner=subprocess.run, cache=None):
             leads.append({"type": "staleness",
                           "detail": "%s was last touched %d days ago" % (lock, (time.time() - touched) // 86400)})
         try:
-            packages = (_uv_lock_packages(repo / lock) if lock == "uv.lock"
-                        else _npm_lock_packages(repo / lock))
+            locked = (_uv_lock_packages(repo / lock) if lock == "uv.lock"
+                      else _npm_lock_packages(repo / lock))
         except (ValueError, OSError, tomllib.TOMLDecodeError) as exc:
             incomplete.append("%s unreadable: %s" % (lock, type(exc).__name__))
             continue
-        for package in packages:
+        for package in locked:
             package["source"] = lock
-        findings.extend(_advisories(packages, request, incomplete, cache))
+        packages.extend(locked)
 
     payload = {"netwatch": 1,
                "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -214,6 +260,35 @@ def collect(repo, *, request=sources.fetch, runner=subprocess.run, cache=None):
                "findings": findings,
                "leads": leads}
     if incomplete:
+        payload["error"] = "; ".join(incomplete)
+    return payload, packages, incomplete
+
+
+def advisories(packages, *, request=sources.fetch, cache=None, screen=None):
+    """Ask OSV about locked packages: screen first, detail only where it flags.
+
+    `screen(queries)` answers does-anything-apply for the whole list at once; `None`
+    keeps today's behaviour of one query per package. A refused screen is an incomplete
+    check, never a clean one. Returns the advisory findings and the reasons the check
+    fell short.
+    """
+    incomplete = []
+    if not packages:
+        return [], incomplete
+    flagged = _screen(packages, screen, cache, incomplete)
+    if flagged is None:
+        return [], incomplete
+    return _advisories(flagged, request, incomplete, cache), incomplete
+
+
+def collect(repo, *, request=sources.fetch, runner=subprocess.run, cache=None, screen=None):
+    """Findings plus leads for one checkout. Never writes anything."""
+    payload, packages, incomplete = inspect(repo, runner=runner)
+    findings, why = advisories(packages, request=request, cache=cache, screen=screen)
+    payload["findings"].extend(findings)
+    incomplete.extend(why)
+    if incomplete:
+        payload["collection"] = "incomplete"
         payload["error"] = "; ".join(incomplete)
     return payload, incomplete
 
