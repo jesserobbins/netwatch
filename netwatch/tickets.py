@@ -25,9 +25,13 @@ TICKET = ".netwatch"
 TEMP_PREFIX = ".netwatch.tmp-"
 TEMP_AGE = 3600
 STALE_DAYS = 90
-GIT_ENV = {"GIT_OPTIONAL_LOCKS": "0"}
+GIT_ENV = {"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
 GIT_CONFIG = ("-c", "core.fsmonitor=", "-c", "core.untrackedCache=")
 GIT_NO_SIGN = ("-c", "log.showSignature=false")
+# A checkout on a stalled mount, a lock held elsewhere, or anything else that makes git
+# wait must not stop a scan of forty other repos. The read is abandoned and the repo is
+# reported as unreadable.
+GIT_TIMEOUT = 60
 
 MANIFEST_LOCK = (
     ("pyproject.toml", "uv.lock", "uv", "uv lock"),
@@ -49,12 +53,20 @@ def git(repo, *args, runner=subprocess.run):
         argv.extend(["log", "--no-show-signature", *args[1:]])
     else:
         argv.extend(args)
-    if runner is subprocess.run:
-        result = subprocess.run(argv, capture_output=True, text=True, env={**os.environ, **GIT_ENV})
-        if result.returncode != 0:
-            raise Error("git failed: " + (result.stderr or "").strip()[:200])
-        return result.stdout
-    return runner(argv, env={**os.environ, **GIT_ENV})
+    env = {**os.environ, **GIT_ENV}
+    try:
+        if runner is subprocess.run:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=GIT_TIMEOUT,
+                                    stdin=subprocess.DEVNULL, env=env)
+            if result.returncode != 0:
+                raise Error("git failed: " + (result.stderr or "").strip()[:200])
+            return result.stdout
+        return runner(argv, env=env)
+    except subprocess.TimeoutExpired as exc:
+        # A stalled read is abandoned; the caller records the repo as unreadable and the
+        # scan of everything else continues.
+        raise Error("git did not answer within %ss in %s"
+                    % (exc.timeout or GIT_TIMEOUT, repo)) from exc
 
 
 def _tracked(repo, name, runner):
@@ -164,17 +176,25 @@ def collect(repo, *, request=sources.fetch, runner=subprocess.run, cache=None):
                              "action_kind": "command",
                              "action": "%s && git add %s && git commit %s" % (action, lock, lock)})
             continue
-        if not _tracked(repo, lock, runner):
+        try:
+            tracked = _tracked(repo, lock, runner)
+            modified = _modified(repo, lock, runner) if tracked else False
+            touched = _last_touch(repo, lock, runner)
+        except Error as exc:
+            # One unreadable checkout must not stop the scan: record why its git reads
+            # failed and keep going with what could be read.
+            incomplete.append(str(exc))
+            continue
+        if not tracked:
             findings.append({"type": "not_revertible", "severity": "high", "ecosystem": ecosystem,
                              "evidence": "%s is not committed" % lock,
                              "action_kind": "command",
                              "action": "git add %s && git commit %s" % (lock, lock)})
-        elif _modified(repo, lock, runner):
+        elif modified:
             findings.append({"type": "drifted", "severity": "medium", "ecosystem": ecosystem,
                              "evidence": "%s differs from the committed state" % lock,
                              "action_kind": "manual",
                              "action": "review the change and commit it, or restore the committed %s" % lock})
-        touched = _last_touch(repo, lock, runner)
         if touched is not None and time.time() - touched > STALE_DAYS * 86400:
             leads.append({"type": "staleness",
                           "detail": "%s was last touched %d days ago" % (lock, (time.time() - touched) // 86400)})

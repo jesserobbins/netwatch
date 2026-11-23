@@ -131,6 +131,8 @@ def parser():
     sc.add_argument("--run", type=int, help="scan run id (needed when the root has more than one)")
     sc.add_argument("--handle", action="append", default=[], metavar="NAME",
                     help="accept this GitHub owner as yours (repeatable; the gh login is always accepted)")
+    sc.add_argument("--quiet", action="store_true",
+                    help="no progress lines on stderr; the summary still prints")
     tg = commands.add_parser("targets", help="retire a tracked target")
     tsub = tg.add_subparsers(dest="action", required=True)
     trem = tsub.add_parser("remove", help="retire a target; history and name are kept")
@@ -540,13 +542,20 @@ def main(argv=None, *, runner=adapters.run, request=sources.fetch):
             store.expire()
             store.cleanup()
             handles = scan.handles_from(args.handle)
+            # Progress goes to stderr, so stdout stays the summary and --json stays clean.
+            progress = None if args.quiet else (
+                lambda message: print(message, file=sys.stderr, flush=True))
             result = scan.run(store, args.root, depth=args.depth,
-                              excludes=tuple(args.exclude), handles=handles, request=request)
+                              excludes=tuple(args.exclude), handles=handles, request=request,
+                              progress=progress)
             Console().print(result["summary"])
             for row in result["tickets"]:
                 Console().print("ticket: %s (%d findings)" % (row["path"], row["findings"]))
             for row in result["skipped"]:
                 Console().print("skipped: %s (%s)" % (row["path"], row["reason"]))
+            for row in result["incomplete"]:
+                Console().print("incomplete: %s (%s)"
+                                % (row["path"], "; ".join(row["reasons"])))
             return 0
         elif args.command == "report":
             store = Store(args.db)

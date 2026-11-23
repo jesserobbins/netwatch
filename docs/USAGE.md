@@ -84,6 +84,10 @@ The walk stops at each repo root and does not descend into it, skips `.git`, `no
 
 `--list` is the safe first step: it reads directory structure and nothing else — no `git`, no `gh`, no package-tool enumeration, and it does not open the database, so it cannot create or migrate one. Point it at any root to see what a real scan would touch, then choose `--exclude` entries before running one. A real scan runs `git` inside the checkouts it classifies, and git honours repository configuration: a configured clean filter (for example `git-lfs filter-process`) can execute while `git status` hashes stat-dirty files. netwatch disables the filesystem monitor, the untracked cache and commit-signature verification, but a clean filter is the checkout owner's own program and runs under their configuration.
 
+A real scan works through the tree in order and says so: one line per classified item on **stderr**, plus a line when it starts reading a checkout and one when it writes that checkout's ticket. Stdout carries only the summary and results, so `--quiet` gives you a scriptable run and `--json` output is never mixed with progress. The slow part is the checkout reads — git queries plus one OSV advisory query per locked package — so a first scan of a large root takes minutes while a repeat within the hour is near-instant from the advisory cache.
+
+No single checkout can stall the scan: every git read is bounded at 60 seconds and gets no terminal prompt, and a checkout whose reads fail is reported as `incomplete: <path> (<reason>)` while the rest of the walk continues. `--list` runs none of this.
+
 Scan output starts with a summary line carrying the run id:
 
 ```

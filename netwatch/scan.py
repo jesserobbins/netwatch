@@ -183,7 +183,7 @@ def handles_from(names, runner=None) -> set:
 
 
 def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=None,
-        home=None) -> dict:
+        home=None, progress=None) -> dict:
     """Walk, classify, ticket the owned repos, persist the run.
 
     The records are what `--register` indexes into later, so the per-lane ordinals here
@@ -196,10 +196,21 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
     # the walk keeps the operator's spelling, so a launcher naming an alias of the same
     # directory can be recognised as inside the venv
     items = list(walk(spelling, depth=depth, excludes=excludes))
+    # Progress goes to the caller's own channel (the CLI sends it to stderr), so a scan of a
+    # large root says what it is doing instead of going quiet for minutes.
+    say = progress or (lambda message: None)
+    say("scanning %s (depth %d): %d item%s"
+        % (spelling, depth, len(items), "" if len(items) == 1 else "s"))
     ordinals = {USER: 0, REPO: 0, UNCLASSIFIED: 0}
     rows, written, skipped, incomplete = [], [], [], []
     for item in items:
         ordinals[item.lane] += 1
+        try:
+            label = item.path.relative_to(spelling).as_posix() or "."
+        except ValueError:
+            label = str(item.path)
+        say("[%d/%d] %s  %s" % (ordinals[USER] + ordinals[REPO] + ordinals[UNCLASSIFIED],
+                               len(items), item.lane, label))
         detail = {"evidence": item.evidence}
         if item.lane == USER:
             row = userlane.describe(item.path)
@@ -217,12 +228,16 @@ def run(store, root, *, depth=DEFAULT_DEPTH, excludes=(), handles=(), request=No
             is_owned = owned(item.path, handles)
             detail["owned"] = is_owned
             if is_owned:
+                say("        reading %s" % label)
                 payload, why = tickets.collect(item.path, request=request,
                                                cache=store.cached)
                 if tickets.should_write(payload, item.path):
                     try:
                         tickets.write(item.path, tickets.render(payload))
                         written.append({"path": str(item.path), "findings": len(payload["findings"])})
+                        say("        ticket written: %d finding%s"
+                            % (len(payload["findings"]),
+                               "" if len(payload["findings"]) == 1 else "s"))
                         detail["ticket"] = "written"
                         store.event(None, "ticket_written",
                                     {"repo": str(item.path), "findings": len(payload["findings"])})

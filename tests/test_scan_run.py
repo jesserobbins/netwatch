@@ -142,3 +142,98 @@ class RunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressTests(unittest.TestCase):
+    """A scan of a big root says what it is doing instead of going quiet."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.state = self.root / "state.db"
+        (self.root / "tools").mkdir()
+        for name in ("a", "b"):
+            venv = self.root / "tools" / name
+            (venv / "bin").mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text("")
+            (venv / "uv-receipt.toml").write_text(
+                '[tool]\nrequirements = [{ name = "%s" }]\nentrypoints = []\n' % name)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_one_progress_line_per_item_and_a_leading_summary(self):
+        messages = []
+        store = store_module.Store(self.state)
+        try:
+            scan.run(store, self.root, handles=set(),
+                     request=lambda u, b=None: {"vulns": []},
+                     progress=messages.append)
+        finally:
+            store.close()
+        self.assertTrue(messages[0].startswith("scanning "), messages[0])
+        self.assertIn("2 items", messages[0])
+        self.assertEqual([m.split()[0] for m in messages[1:]], ["[1/2]", "[2/2]"])
+        self.assertIn("user", messages[1])
+
+    def test_quiet_means_the_caller_passes_no_progress(self):
+        store = store_module.Store(self.state)
+        try:
+            result = scan.run(store, self.root, handles=set(),
+                              request=lambda u, b=None: {"vulns": []})
+        finally:
+            store.close()
+        self.assertIn("scan run 1", result["summary"])
+
+
+class GitReadFailureTests(unittest.TestCase):
+    """A checkout whose git reads stall or fail must not stop the scan."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.repo = self.root / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        (self.repo / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (self.repo / "uv.lock").write_text("")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_timed_out_git_read_is_recorded_as_incomplete(self):
+        def hang(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        payload, incomplete = tickets.collect(self.repo, runner=hang,
+                                              request=lambda u, b=None: {"vulns": []})
+        self.assertEqual(payload["collection"], "incomplete")
+        self.assertTrue(any("git" in reason for reason in incomplete), incomplete)
+
+    def test_the_timeout_is_set_on_the_real_runner(self):
+        with mock.patch.object(tickets.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            # the default runner is bound at definition time, so pass the patched one
+            tickets.git(self.repo, "status", "--porcelain", runner=tickets.subprocess.run)
+        self.assertEqual(run.call_args.kwargs.get("timeout"), tickets.GIT_TIMEOUT)
+        self.assertIsNotNone(run.call_args.kwargs.get("timeout"))
+
+
+class IncompleteReportingTests(unittest.TestCase):
+    def test_a_repo_whose_reads_failed_is_named_in_the_summary(self):
+        root = Path(tempfile.mkdtemp())
+        repo = root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (repo / "uv.lock").write_text("")
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                        "https://github.com/jesserobbins/x.git"], check=True, capture_output=True)
+        store = store_module.Store(root / "state.db")
+        try:
+            with mock.patch.object(scan, "owned", return_value=True), \
+                    mock.patch.object(tickets, "git",
+                                      side_effect=tickets.Error("git did not answer")):
+                result = scan.run(store, root, handles={"jesserobbins"},
+                                  request=lambda u, b=None: {"vulns": []})
+        finally:
+            store.close()
+            shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual([Path(r["path"]).name for r in result["incomplete"]], ["repo"])
