@@ -16,6 +16,8 @@ netwatch demo
 
 The demo uses synthetic data and a simulated package manager. From a checkout, `python3 -m netwatch` runs the same CLI as `netwatch`.
 
+Running `netwatch` with no command prints an overview of the daily loop, the commands, the supported kinds and where state lives.
+
 ## Daily workflow
 
 Replace the example SSH alias with your target. Registration saves a name; `check` collects installed versions, advisory evidence and available updates.

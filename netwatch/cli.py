@@ -18,12 +18,80 @@ from .core import Error, text
 from .store import Store
 
 
+OVERVIEW = """\
+netwatch — track vulnerabilities and available updates for machines, projects and tool venvs
+
+Usage
+  netwatch [--db PATH] [--json] COMMAND [args]
+
+The loop
+  1  netwatch scan ~/GitHub --list            classify what a root contains; touches nothing
+  2  netwatch scan ~/GitHub --register 1 3    register chosen rows as targets
+  3  netwatch check                           collect inventory, advisories and updates
+  4  netwatch preview NAME                    save an update plan, with its constraints
+  5  netwatch apply PLAN_ID --yes             run exactly what the preview showed
+
+Find and register
+  scan <root> [--list] [--register N...]     classify environments and checkouts; write tickets
+  report <path>                              write one .netwatch ticket, whatever the owner
+  add <name> <kind> [--path P | --host H]    register one environment by hand
+  list                                       show registered environments
+  targets remove <name>                      retire a target, keeping its history
+
+Observe
+  check [NAME] [--all] [--refresh | --offline] [--context]
+  status [NAME] [--all]                      read saved results without connecting
+  history [--name NAME] [--since CURSOR]     changes, failures and update attempts
+
+Approve and recover
+  preview NAME                               save the update plan and print it
+  apply PLAN_ID --yes                        run the approved update
+  resolve PLAN_ID --note 'TEXT'              record recovery after an interrupted update
+
+Kinds
+  ubuntu  arch  cachyos  conda  mamba  uv  npm  brew  uvtool  pipx
+
+State
+  ~/.local/state/netwatch/state.db           override with --db PATH
+
+More
+  netwatch demo                              simulated run; no network, no changes
+  netwatch COMMAND --help                    arguments for one command
+  docs/USAGE.md                              the operating manual, in the source repository
+"""
+
+SECTIONS = ("Usage", "The loop", "Find and register", "Observe",
+            "Approve and recover", "Kinds", "State", "More")
+
+
+def print_overview():
+    """The page a bare `netwatch` prints: the model first, then the commands.
+
+    Help is help, not data, so it stays text even under --json; and it is printed
+    before any Store is opened, so asking for it never creates or migrates a database.
+    """
+    colour = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+              and os.environ.get("TERM") != "dumb")
+    if not colour:
+        print(OVERVIEW)
+        return
+    console = Console(highlight=False, markup=False)
+    for line in OVERVIEW.splitlines():
+        stripped = line.strip()
+        if line.startswith("netwatch —"):
+            console.print(Text(line, style="bold cyan"))
+        elif stripped in SECTIONS:
+            console.print(Text(line, style="bold"))
+        else:
+            console.print(Text(line))
+
+
 def parser():
     p = argparse.ArgumentParser(prog="netwatch", description="Track environments, security advisories and human-approved updates.")
     p.add_argument("--db", default=os.path.expanduser("~/.local/state/netwatch/state.db"))
     p.add_argument("--json", action="store_true", help="machine-readable JSON (all strings escaped)")
     p.add_argument("--version", action="version", version="netwatch 0.2.0")
-    commands = p.add_subparsers(dest="command", required=True)
+    commands = p.add_subparsers(dest="command", required=False)
     add = commands.add_parser("add", help="register one OS, environment or project; does not connect")
     add.add_argument("name")
     add.add_argument("kind", choices=adapters.KINDS + adapters.VENV_KINDS)
@@ -446,6 +514,9 @@ def display(result, json_output=False, show_all=False):
 
 def main(argv=None, *, runner=adapters.run, request=sources.fetch):
     args = parser().parse_args(argv)
+    if args.command is None:
+        print_overview()
+        return 0
     store = None
     try:
         if args.command == "demo":

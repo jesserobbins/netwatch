@@ -26,6 +26,15 @@ netwatch demo
 
 The demo checks and updates a synthetic package in temporary state without making network requests or changing your installed software.
 
+To skip the environment steps, run the bundled script — it builds `.venv`, installs the pinned dependencies and netwatch, and starts it:
+
+```bash
+./netwatch-run.sh          # prints the overview: the daily loop, commands and kinds
+./netwatch-run.sh status   # any command, with its arguments passed through
+```
+
+It reinstalls only when `pyproject.toml` or `requirements.lock` change, writes progress to stderr so `--json` stays clean, and takes `NETWATCH_VENV` / `NETWATCH_PYTHON` to build somewhere else or with another interpreter.
+
 ## Usage
 
 ### Check a machine or project
