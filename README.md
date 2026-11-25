@@ -3,8 +3,9 @@
 netwatch tracks vulnerabilities and available updates across your machines and development environments, then lets you review and apply updates.
 
 - Checks Ubuntu, Arch/CachyOS, conda/mamba, uv, npm and Homebrew environments locally or over SSH, plus uv-tool and pipx tool venvs by path.
+- Gets Homebrew advisories for formulae from Homebrew's own scan, and tracks casks for updates only.
 - Matches installed packages against Canonical, Arch and OSV advisories.
-- Scans a filesystem root to find those environments, and writes a `.netwatch` ticket into the git checkouts it owns.
+- Scans a filesystem root to find those environments, including the uv-tool and pipx venvs a Mac already has, and writes a `.netwatch` ticket into the git checkouts it owns.
 - Binds each tool-venv approval to a probe token and installs the pinned set under the environment's own declared bounds.
 - Optionally adds cve.now context, pwn.watch incident leads and Cloudflare Zero Wire briefings for review with `check --context`.
 - Stores findings and history in SQLite, with text and JSON output for you or your agent.
@@ -37,7 +38,24 @@ It reinstalls only when `pyproject.toml` or `requirements.lock` change, writes p
 
 ## Usage
 
-### Check a machine or project
+### Check a Mac
+
+```bash
+netwatch add laptop brew
+netwatch check laptop
+```
+
+Homebrew formulae get advisories from Homebrew's own scan. Casks are collected and updated, and Homebrew never scans them for vulnerabilities. To find the tool venvs a Mac already has:
+
+```bash
+netwatch scan ~/.local/share/uv/tools --list
+netwatch scan ~/.local/share/uv/tools --register 1 3
+netwatch add ruff-tool uvtool --path ~/.local/share/uv/tools/ruff
+```
+
+Homebrew needs a `vulns` command, netwatch never runs it as root, and a remote Mac needs Remote Login enabled. See the [macOS guide](docs/MACOS.md) for host setup, Homebrew coverage, updating and troubleshooting.
+
+### Check a Linux host
 
 For an Ubuntu **24.04 LTS, amd64** machine, replace `my-server` with your SSH alias:
 
@@ -46,7 +64,11 @@ netwatch add server ubuntu --host my-server
 netwatch check server
 ```
 
-For local projects and environments:
+OS updates need `sudo -n` access. Ubuntu matching covers published Noble fixes and excludes Pro/ESM. CachyOS findings need investigation. See [environment support](docs/USAGE.md#environments).
+
+### Check a project or environment
+
+These work on any host:
 
 ```bash
 netwatch add api uv --path /srv/api
@@ -58,8 +80,6 @@ netwatch check
 uv checks the project's `.venv`; npm checks installed dependencies. Remote targets need their package tools available over SSH.
 
 Reports show affected packages, advisory links, fix versions, available updates and failed checks.
-
-Ubuntu matching covers published Noble fixes and excludes Pro/ESM. Conda-native packages lack vulnerability matching; CachyOS findings need investigation. See [environment support](docs/USAGE.md#environments).
 
 Python/npm checks send package names and versions to OSV. Add optional incident and exploitation context with:
 
@@ -131,6 +151,7 @@ Pass the returned `next_cursor` as `--since` to read later events. Give agents r
 
 ## Reference
 
+- [macOS guide](docs/MACOS.md): Homebrew coverage, host setup, updating and troubleshooting on a Mac.
 - [Usage guide](docs/USAGE.md): supported environments, scanning and tickets, probing and constrained approvals, caching, update commands and recovery.
 - [Design contract](docs/DESIGN.md): modules and the behavior to preserve.
 - `netwatch --help` or `netwatch COMMAND --help`: command arguments.
