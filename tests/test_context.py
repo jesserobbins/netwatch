@@ -64,7 +64,7 @@ class ContextTests(unittest.TestCase):
         self.store = Store(self.path)
         self.addCleanup(self.store.close)
         self.t = adapters.target("host", "ubuntu")
-        self.store.db.execute("INSERT INTO targets VALUES(?,?)", ("host", canonical(self.t)))
+        self.store.add_target(self.t["kind"], self.t)
         clock = patch("netwatch.store.time.time", return_value=1800000000)
         clock.start()
         self.addCleanup(clock.stop)

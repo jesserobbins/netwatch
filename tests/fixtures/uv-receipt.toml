@@ -1,0 +1,5 @@
+[tool]
+requirements = [{ name = "ruff" }]
+entrypoints = [
+    { name = "ruff", install-path = "/home/example/.local/bin/ruff", from = "ruff" },
+]

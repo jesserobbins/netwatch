@@ -11,10 +11,79 @@ from rich import box
 from datetime import datetime, timezone
 from collections import defaultdict
 import sqlite3
+from pathlib import Path
 
-from . import adapters, sources, workflow
-from .core import Error, canonical, text
+from . import adapters, scan, sources, userlane, venvflow, workflow
+from .core import Error, text
 from .store import Store
+
+
+OVERVIEW = """\
+netwatch — track vulnerabilities and available updates for machines, projects and tool venvs
+
+Usage
+  netwatch [--db PATH] [--json] COMMAND [args]
+
+The loop
+  1  netwatch scan ~/GitHub --list            classify what a root contains; touches nothing
+  2  netwatch scan ~/GitHub --register 1 3    register chosen rows as targets
+  3  netwatch check                           collect inventory, advisories and updates
+  4  netwatch preview NAME                    save an update plan, with its constraints
+  5  netwatch apply PLAN_ID --yes             run exactly what the preview showed
+
+Find and register
+  scan <root> [--list] [--register N...]     classify environments and checkouts; write tickets
+  report <path>                              write one .netwatch ticket, whatever the owner
+  add <name> <kind> [--path P | --host H]    register one environment by hand
+  list                                       show registered environments
+  targets remove <name>                      retire a target, keeping its history
+
+Observe
+  check [NAME] [--all] [--refresh | --offline] [--context]
+  status [NAME] [--all]                      read saved results without connecting
+  history [--name NAME] [--since CURSOR]     changes, failures and update attempts
+
+Approve and recover
+  preview NAME                               save the update plan and print it
+  apply PLAN_ID --yes                        run the approved update
+  resolve PLAN_ID --note 'TEXT'              record recovery after an interrupted update
+
+Kinds
+  ubuntu  arch  cachyos  conda  mamba  uv  npm  brew  uvtool  pipx
+
+State
+  ~/.local/state/netwatch/state.db           override with --db PATH
+
+More
+  netwatch demo                              simulated run; no network, no changes
+  netwatch COMMAND --help                    arguments for one command
+  docs/USAGE.md                              the operating manual, in the source repository
+"""
+
+SECTIONS = ("Usage", "The loop", "Find and register", "Observe",
+            "Approve and recover", "Kinds", "State", "More")
+
+
+def print_overview():
+    """The page a bare `netwatch` prints: the model first, then the commands.
+
+    Help is help, not data, so it stays text even under --json; and it is printed
+    before any Store is opened, so asking for it never creates or migrates a database.
+    """
+    colour = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+              and os.environ.get("TERM") != "dumb")
+    if not colour:
+        print(OVERVIEW)
+        return
+    console = Console(highlight=False, markup=False)
+    for line in OVERVIEW.splitlines():
+        stripped = line.strip()
+        if line.startswith("netwatch —"):
+            console.print(Text(line, style="bold cyan"))
+        elif stripped in SECTIONS:
+            console.print(Text(line, style="bold"))
+        else:
+            console.print(Text(line))
 
 
 def parser():
@@ -22,10 +91,10 @@ def parser():
     p.add_argument("--db", default=os.path.expanduser("~/.local/state/netwatch/state.db"))
     p.add_argument("--json", action="store_true", help="machine-readable JSON (all strings escaped)")
     p.add_argument("--version", action="version", version="netwatch 0.2.0")
-    commands = p.add_subparsers(dest="command", required=True)
+    commands = p.add_subparsers(dest="command", required=False)
     add = commands.add_parser("add", help="register one OS, environment or project; does not connect")
     add.add_argument("name")
-    add.add_argument("kind", choices=adapters.KINDS)
+    add.add_argument("kind", choices=adapters.KINDS + adapters.VENV_KINDS)
     add.add_argument("--host", default="local", help="local or a configured SSH alias/user@host")
     add.add_argument("--path", help="absolute conda prefix or uv/npm project directory")
     commands.add_parser("list", help="list explicitly registered environments")
@@ -51,6 +120,25 @@ def parser():
     resolve.add_argument("plan", type=int)
     resolve.add_argument("--note", required=True)
     commands.add_parser("demo", help="run a temporary simulated workflow; no network or package operations")
+    sc = commands.add_parser("scan", help="classify environments under a root; writes tickets into owned repos")
+    sc.add_argument("root")
+    sc.add_argument("--list", action="store_true",
+                    help="classification only: no git, no gh, no tool enumeration, no store")
+    sc.add_argument("--depth", type=int, default=scan.DEFAULT_DEPTH, help="how deep to walk (default 4)")
+    sc.add_argument("--exclude", action="append", default=[], metavar="PAT", help="skip paths matching PAT (repeatable)")
+    sc.add_argument("--register", nargs="+", type=int, metavar="INDEX",
+                    help="register these user-lane rows of a stored run as targets")
+    sc.add_argument("--run", type=int, help="scan run id (needed when the root has more than one)")
+    sc.add_argument("--handle", action="append", default=[], metavar="NAME",
+                    help="accept this GitHub owner as yours (repeatable; the gh login is always accepted)")
+    sc.add_argument("--quiet", action="store_true",
+                    help="no progress lines on stderr; the summary still prints")
+    tg = commands.add_parser("targets", help="retire a tracked target")
+    tsub = tg.add_subparsers(dest="action", required=True)
+    trem = tsub.add_parser("remove", help="retire a target; history and name are kept")
+    trem.add_argument("name")
+    rp = commands.add_parser("report", help="write the .netwatch ticket for one checkout, whatever its owner")
+    rp.add_argument("path")
     return p
 
 
@@ -59,27 +147,100 @@ def status(store, t):
                             (t["name"],)).fetchone()
     report = store.latest(t["name"])
     pending = [dict(r) for r in store.db.execute("SELECT id,status,at FROM plans WHERE target=? AND status IN ('proposed','running','needs_attention') ORDER BY id", (t["name"],))]
-    return {"target": t, "last_attempt": dict(last) if last else None, "report": report, "pending_updates": pending}
+    lifecycle = store.db.execute(
+        "SELECT state, generation, state_seq, removed FROM targets WHERE name=?",
+        (t["name"],)).fetchone()
+    return {"target": t, "last_attempt": dict(last) if last else None, "report": report,
+            "pending_updates": pending,
+            "state": lifecycle["state"] if lifecycle else None,
+            "generation": int(lifecycle["generation"] or 1) if lifecycle else None,
+            "removed": int(lifecycle["removed"] or 0) if lifecycle else 0}
+
+
+WRITE_COMMANDS = {"add", "check", "preview", "apply", "resolve", "scan", "report", "targets"}
+
+
+VENV_KINDS = (userlane.UVTOOL, userlane.PIPX)
+
+
+def one_argv(runner, t, state_dir):
+    """The venv kinds take a listing runner: one argv, no SSH, run from the state dir.
+
+    The working directory is pinned there for the same reason the fingerprint hashes the
+    configuration files: uv reads configuration from the cwd upward, so inheriting the
+    launch directory would let a repo-local `[tool.uv]` shape resolution.
+    """
+    return lambda argv, **kw: runner({"name": t["name"], "kind": "uv", "host": "local",
+                                      "path": str(state_dir)}, argv, **kw)
+
+
+def state_dir_for(args):
+    """Where an approval's artifacts and uv's working directory live: beside the database."""
+    return Path(args.db).expanduser().parent
 
 
 def dispatch(args, store, runner, request):
+    if args.command in WRITE_COMMANDS:
+        # Expiry and cleanup run in the command's own opening transaction: the next thing
+        # the operator runs is the cleaner. status/list/history stay read-only.
+        store.expire()
+        store.cleanup()
     if args.command == "add":
         t = adapters.target(args.name, args.kind, args.host, args.path)
+        if t["kind"] in adapters.VENV_KINDS:
+            # A venv-bound target registered by hand needs the same facts a scan would
+            # record: the realpath the identity check compares against and the directory
+            # the manager exposes its launchers in.
+            seen = userlane.describe(t["path"])
+            if not seen or seen.get("kind") is None:
+                raise Error("%s is not a %s environment (%s)"
+                            % (t["path"], t["kind"], (seen or {}).get("error", "no manager metadata")))
+            for other in store.target_rows():
+                # The blocking set: a row whose venv is gone or foreign does not block.
+                if other["name"] == t["name"] or other["removed"] \
+                        or other["state"] in ("unresolved_path", "identity_mismatch"):
+                    continue
+                if other["kind"] in adapters.VENV_KINDS and other.get("path") \
+                        and workflow.same_venv(other["path"], seen["realpath"]):
+                    raise Error("%s already tracks this venv; remove that target first"
+                                % other["name"])
+            t = {**t, "tool": seen["name"], "realpath": seen["realpath"],
+                 "bin_dir": seen["bin_dir"],
+                 "extras": seen.get("extras") or [],
+                 "index_options": seen.get("index_options_redacted") or []}
         with store.transaction():
             if store.db.execute("SELECT 1 FROM targets WHERE name=?", (args.name,)).fetchone():
                 raise Error("Environment already exists; use a new name rather than rewriting its history")
-            store.db.execute("INSERT INTO targets VALUES(?,?)", (args.name, canonical(t)))
+            store.add_target(t["kind"], t)
             store.event(args.name, "registered", t)
         return t
     if args.command == "list":
         return store.targets()
+    if args.command == "targets" and args.action == "remove":
+        t = store.target(args.name)
+        # A running or locked update is inspecting this venv right now; retiring the row
+        # would orphan the command in flight. The lock must be honoured, not discarded.
+        busy = workflow.busy_plan(store, t)
+        if busy:
+            raise Error("Update %s is running or needs attention; resolve it before "
+                        "removing this target" % busy)
+        with store.transaction():
+            staled = store.stale_siblings(args.name, path=t.get("path"),
+                                           venv_match=workflow.same_venv)
+            removed = store.remove_target(args.name)
+            store.event(args.name, "removed", {"plans_staled": staled})
+        return {"name": args.name, "removed": bool(removed), "plans_staled": len(staled)}
     if args.command in ("check", "status"):
         targets = [store.target(args.name)] if args.name else store.targets()
         results, refreshed = [], set()
         for t in targets:
             if args.command == "check":
                 try:
-                    workflow.check(store, t, offline=args.offline, refresh=args.refresh, refreshed=refreshed, context=args.context, runner=runner, request=request)
+                    if t["kind"] in VENV_KINDS:
+                        venvflow.check(store, t, runner=one_argv(runner, t, state_dir_for(args)),
+                                      request=request)
+                    else:
+                        workflow.check(store, t, offline=args.offline, refresh=args.refresh, refreshed=refreshed, context=args.context, runner=runner, request=request)
                 except Error as exc:
                     results.append({**status(store, t), "error": str(exc)})
                     continue
@@ -91,8 +252,19 @@ def dispatch(args, store, runner, request):
         rows = store.events(args.since, args.name)
         return {"events": rows, "next_cursor": rows[-1]["id"] if rows else args.since}
     if args.command == "preview":
-        return workflow.preview(store, store.target(args.name), runner)
+        t = store.target(args.name)
+        if t["kind"] in VENV_KINDS:
+            return venvflow.preview(store, t, runner=one_argv(runner, t, state_dir_for(args)),
+                                    request=request, state_dir=state_dir_for(args))
+        return workflow.preview(store, t, runner)
     if args.command == "apply":
+        plan = store.db.execute("SELECT target FROM plans WHERE id=?", (args.plan,)).fetchone()
+        kind = store.target(plan["target"])["kind"] if plan else None
+        if kind in VENV_KINDS:
+            t = store.target(plan["target"])
+            return venvflow.apply(store, args.plan, yes=args.yes,
+                                  runner=one_argv(runner, t, state_dir_for(args)),
+                                  request=request)
         return workflow.apply(store, args.plan, yes=args.yes, runner=runner, request=request)
     if args.command == "resolve":
         return workflow.resolve(store, args.plan, text(args.note, "recovery note"))
@@ -130,7 +302,7 @@ def display(result, json_output=False, show_all=False):
             affected_count = len({r["package"] for r in report["findings"] if r["state"] == "affected"})
             review_count = len({r["package"] for r in report["findings"] if r["state"] == "unknown"})
             summary = Text()
-            summary.append(f"{safe(t['kind'])} on {safe(t['host'])}  |  Checked {date(report['at'])}\n", style="dim")
+            summary.append(f"{safe(t['kind'])} on {safe(t.get('host', 'local'))}  |  Checked {date(report['at'])}\n", style="dim")
             for value, style in ((f"{len(report['packages'])} installed", "bold"),
                                  (f"{affected_count} affected", "bold red" if affected_count else "bold"),
                                  (f"{review_count} need review", "bold yellow" if review_count else "bold"),
@@ -141,11 +313,23 @@ def display(result, json_output=False, show_all=False):
             console.print(Panel(summary, title=Text(safe(t["name"]), style="bold cyan"), title_align="left",
                                 border_style="cyan", box=box.ROUNDED, width=width))
         else:
-            emit(f"{safe(t['name'])} ({safe(t['kind'])} on {safe(t['host'])})", "bold cyan")
+            emit(f"{safe(t['name'])} ({safe(t['kind'])} on {safe(t.get('host', 'local'))})", "bold cyan")
         if item.get("error"):
             emit("  Error: " + safe(item["error"]), "bold red")
         if (item.get("last_attempt") or {}).get("kind") == "collection_failed":
             emit("  Collection failed; showing the previous report.", "bold red")
+        if item.get("removed"):
+            emit("  Retired; history retained. Re-register to track it again.", "yellow")
+        state = item.get("state")
+        if state and state != "live":
+            detail = {"not_bindable": "no usable probe token: delete "
+                                      + safe(str(Path(t.get('path') or '') / ".netwatch-probe"))
+                                      + " and re-run check (it is safe)",
+                      "unresolved_path": "the recorded path is gone; restore it or "
+                                         "netwatch targets remove " + safe(t["name"]),
+                      "identity_mismatch": "the venv no longer names this tool; inspect it, "
+                                           "then re-register or remove the target"}.get(state, "")
+            emit("  State: " + safe(state) + (" — " + detail if detail else ""), "bold yellow")
         if not report:
             emit("  No inventory collected. Run netwatch check " + safe(t["name"]), "yellow")
             continue
@@ -157,7 +341,8 @@ def display(result, json_output=False, show_all=False):
             emit(f"  Update check: {safe(report['update_error'])}; last observed {date(report.get('updates_observed_at'))}", "yellow")
         for plan in item["pending_updates"]:
             emit(f"  Update plan {plan['id']}: {safe(plan['status'])}", "yellow")
-        updates = {u["package"]: u for u in report["updates"]}
+        updates = {u["package"]: u for u in report["updates"]
+                   if u.get("ecosystem") in (None, "Homebrew")}
         shortened = False
         for state, label in (("affected", "Affected"), ("unknown", "Needs review")):
             groups = defaultdict(list)
@@ -207,30 +392,84 @@ def display(result, json_output=False, show_all=False):
         omitted = sum(e.get("matching", {}).get("fixed_notices_omitted", 0) for e in report.get("evidence", []))
         if omitted:
             emit(f"\n{omitted} historical notices omitted: installed versions meet the tracker fixes.", "dim")
-        if updates:
+        if report["updates"]:
             emit("\nAvailable updates:", "bold cyan")
             emit("  Repository candidates; not all are security fixes.", "dim")
-            versions = defaultdict(set)
+            versions, by_name = defaultdict(set), defaultdict(set)
             for p in report["packages"]:
-                versions[p["name"]].add(p["version"])
-            affected = {r["package"] for r in report["findings"] if r["state"] == "affected"}
-            review = {r["package"] for r in report["findings"] if r["state"] == "unknown"}
-            ordered = sorted(updates, key=lambda n: (n not in affected, n not in review, n))
+                versions[(p.get("ecosystem"), p["name"])].add(p["version"])
+                by_name[p["name"]].add(p["version"])
+
+            def installed_for(row):
+                # Homebrew keeps formulae and casks apart; a name can appear in both, so a
+                # row that names its ecosystem never falls back to the other one's versions.
+                found = versions.get((row.get("ecosystem"), row["package"]))
+                if found or row.get("ecosystem") is not None:
+                    return found or set()
+                return by_name[row["package"]]
+            # Findings carry the tap-qualified identity; a short name alone must not
+            # join a finding to an update row for a replaced formula.
+            def identities(state):
+                return {r["package"]: {f.get("tap") for f in report["findings"]
+                                       if f["package"] == r["package"] and f["state"] == state}
+                        for r in report["findings"] if r["state"] == state}
+            affected, review = identities("affected"), identities("unknown")
+            def has(row, names):
+                # Advisories cover formulae, never casks; sorting must agree with the label.
+                taps = names.get(row["package"])
+                return row.get("ecosystem") in (None, "Homebrew") and taps is not None and (
+                    None in taps or row.get("tap") in taps)
+            rows = sorted(report["updates"], key=lambda u: (not has(u, affected), not has(u, review),
+                                                            u["package"], u.get("ecosystem") or ""))
+            # The same package can be upgradable on several architectures; one row per
+            # name and ecosystem keeps the ten-row view from spending slots on duplicates.
+            grouped, seen_rows = [], set()
+            for row in rows:
+                marker = (row["package"], row.get("ecosystem"))
+                if marker in seen_rows:
+                    continue
+                seen_rows.add(marker)
+                grouped.append(row)
+            rows = grouped
             grid = table("Package", "Installed", "Available", "Finding") if wide else None
-            for n in ordered if show_all else ordered[:10]:
-                label, style = (" [affected]", "bold red") if n in affected else ((" [review]", "yellow") if n in review else ("", "cyan"))
-                installed = safe(', '.join(sorted(versions[n])) or '?')
-                candidate = safe(updates[n].get('candidate') or 'unknown')
+            for row in rows if show_all else rows[:10]:
+                n = row["package"]
+                # Advisories cover formulae, never casks, so a same-named cask row must not
+                # inherit the formula's marker.
+                advisory_applies = row.get("ecosystem") in (None, "Homebrew")
+                if advisory_applies and has(row, affected):
+                    label, style = " [affected]", "bold red"
+                elif advisory_applies and has(row, review):
+                    label, style = " [review]", "yellow"
+                else:
+                    label, style = "", "cyan"
+                # A held formula and a cask excluded from the default list are not
+                # updates the approved plan will take, so say which one it is.
+                state = " [held " + safe(row["held_version"]) + "]" if row.get("held") else (
+                    " [not in default upgrade as observed]" if row.get("greedy_only") else "")
+                # An update row retained from an earlier report may name a formula that
+                # is no longer installed; say so, so a same-named cask row cannot be
+                # mistaken for it.
+                if row.get("ecosystem") == "Homebrew" and not installed_for(row):
+                    state += " [not installed]"
+                if row.get("ecosystem") == "Homebrew-cask" and (
+                        any(p["name"] == row["package"] and p["ecosystem"] == "Homebrew"
+                            for p in report["packages"])
+                        or any(f["package"] == row["package"] for f in report["findings"])):
+                    state += " [cask]"
+                installed = safe(', '.join(sorted(installed_for(row))) or '?')
+                candidate = safe(row.get('candidate') or 'unknown')
                 if grid is not None:
                     grid.add_row(Text(safe(n), style="bold"), Text(installed, style="dim"), Text(candidate, style="bold cyan"),
-                                 Text(label.strip() or "No matching advisory", style=style if label else "dim"))
+                                 Text((label + state).strip() or "No matching advisory",
+                                      style=style if label or row.get("held") else "dim"))
                 else:
-                    emit(f"  {safe(n)}: {installed} -> {candidate}{label}", style)
+                    emit(f"  {safe(n)}: {installed} -> {candidate}{label}{state}", style)
             if grid is not None:
                 console.print(grid)
-                if not show_all and len(ordered) > 10:
-                    emit(f"  Showing 10 of {len(ordered)} updates.", "dim")
-            shortened |= not show_all and len(ordered) > 10
+                if not show_all and len(rows) > 10:
+                    emit(f"  Showing 10 of {len(rows)} updates.", "dim")
+            shortened |= not show_all and len(rows) > 10
         for source, label in (("cve_now", "cve.now CVE context"), ("pwn_watch", "pwn.watch incident leads"),
                               ("zero_wire", "Cloudflare Zero Wire briefings")):
             context = report.get("context", {}).get(source)
@@ -277,17 +516,72 @@ def display(result, json_output=False, show_all=False):
 
 def main(argv=None, *, runner=adapters.run, request=sources.fetch):
     args = parser().parse_args(argv)
+    if args.command is None:
+        print_overview()
+        return 0
     store = None
     try:
         if args.command == "demo":
             from .demo import demo
             result = demo()
+        elif args.command == "scan" and args.list:
+            Console().print(scan.list_only(args.root, depth=args.depth,
+                                           excludes=tuple(args.exclude), db=args.db))
+            return 0
+        elif args.command == "scan" and args.register:
+            store = Store(args.db)
+            store.expire()
+            store.cleanup()
+            result = scan.register(store, args.root, args.register, run_id=args.run)
+            Console().print(result["summary"])
+            for row in result["registered"]:
+                Console().print("registered: %s (%s) %s" % (row["name"], row["kind"], row["path"]))
+            return 0
+        elif args.command == "scan":
+            store = Store(args.db)
+            store.expire()
+            store.cleanup()
+            handles = scan.handles_from(args.handle)
+            # Progress goes to stderr, so stdout stays the summary and --json stays clean.
+            progress = None if args.quiet else (
+                lambda message: print(message, file=sys.stderr, flush=True))
+            result = scan.run(store, args.root, depth=args.depth,
+                              excludes=tuple(args.exclude), handles=handles, request=request,
+                              progress=progress)
+            Console().print(result["summary"])
+            for row in result["tickets"]:
+                Console().print("ticket: %s (%d findings)" % (row["path"], row["findings"]))
+            for row in result["skipped"]:
+                Console().print("skipped: %s (%s)" % (row["path"], row["reason"]))
+            for row in result["incomplete"]:
+                Console().print("incomplete: %s (%s)"
+                                % (row["path"], "; ".join(row["reasons"])))
+            return 0
+        elif args.command == "report":
+            store = Store(args.db)
+            store.expire()
+            store.cleanup()
+            outcome = scan.report(store, args.path, request=request)
+            if outcome["status"] != "written":
+                Console().print("%s: %s" % (outcome["path"], outcome["status"]))
+            else:
+                Console().print("%s: ticket %s, %d findings" % (
+                    outcome["path"], outcome["status"], len(outcome["findings"])))
+            return 0
         else:
             store = Store(args.db)
             result = dispatch(args, store, runner, request)
         display(result, args.json, show_all=getattr(args, "all", False))
-        if args.command == "check" and any(r.get("error") or not r["report"]["advisory_check_ok"] or r["report"]["update_error"] or
-                                            any(c["status"] == "incomplete" for c in r["report"].get("context", {}).values()) for r in result):
+        def needs_attention(row):
+            """A row without a report is unfinished coverage, so it counts too."""
+            report = row.get("report")
+            if row.get("error") or not report:
+                return True
+            if not report["advisory_check_ok"] or report["update_error"]:
+                return True
+            return any(c["status"] == "incomplete" for c in report.get("context", {}).values())
+
+        if args.command == "check" and any(needs_attention(r) for r in result):
             return 1
         return 0
     except (Error, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError, sqlite3.Error) as exc:

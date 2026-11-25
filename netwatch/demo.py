@@ -45,7 +45,7 @@ def demo():
         store = Store(Path(root) / "state.db")
         try:
             t, runner = adapters.target("demo", "ubuntu"), DemoRunner()
-            store.db.execute("INSERT INTO targets VALUES(?,?)", (t["name"], canonical(t)))
+            store.add_target(t["kind"], t)
             request = lambda url, body=None: NOTICE
             first = workflow.check(store, t, runner=runner, request=request)
             assert first["findings"][0]["state"] == "affected"

@@ -10,23 +10,72 @@ from pathlib import PurePosixPath
 from .core import Error, name, text
 
 
-KINDS = ("ubuntu", "arch", "cachyos", "conda", "mamba", "uv", "npm")
+KINDS = ("ubuntu", "arch", "cachyos", "conda", "mamba", "uv", "npm", "brew")
+# The venv-bound kinds are addable but do not speak this module's adapter protocol: their
+# check/preview/apply live in venvflow, driven by a manager receipt inside the venv.
+VENV_KINDS = ("uvtool", "pipx")
+
+# Homebrew and MacPorts are not on the PATH of a BatchMode SSH command. The
+# prefix travels inside the argv rather than being resolved at registration,
+# because `add` must not connect and `commands(t)` is compared against the
+# approved plan body.
+MAC_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def brew_env(*args, cleanup=True):
+    """Fixed PATH and Homebrew's non-interactive settings, carried in argv.
+
+    `cleanup=False` unsets HOMEBREW_NO_INSTALL_CLEANUP so an approved upgrade may
+    remove the superseded keg; read-only commands keep it set. `env -u` is needed
+    because a locally exported variable would otherwise be inherited.
+    """
+    pairs = {"PATH": MAC_PATH, "HOMEBREW_NO_AUTO_UPDATE": "1", "NONINTERACTIVE": "1"}
+    if cleanup:
+        pairs["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
+    head = ["env"] + [f"{key}={value}" for key, value in pairs.items()]
+    if not cleanup:
+        # Unset an inherited value; `env` applies -u before any assignments, and none
+        # of the assignments may re-set the variable.
+        head = ["env", "-u", "HOMEBREW_NO_INSTALL_CLEANUP"] + head[1:]
+    return [*head, *args]
 
 
 def target(name_, kind, host="local", path=None):
     name(name_)
-    if kind not in KINDS:
+    if kind not in KINDS and kind not in VENV_KINDS:
         raise Error("Unsupported environment kind")
     text(host, "SSH alias")
     if host.startswith("-") or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@" for c in host):
         raise Error("Host must be local or an explicit SSH alias/user@host")
-    if kind in ("conda", "mamba", "uv", "npm"):
+    if kind in ("conda", "mamba", "uv", "npm") or kind in VENV_KINDS:
         text(path, "absolute environment/project path")
         if not PurePosixPath(path).is_absolute():
             raise Error("Environment/project path must be absolute")
     elif path is not None:
         raise Error("OS environments do not take a project path")
     return {"name": name_, "kind": kind, "host": host, "path": path}
+
+
+def step_label(argv):
+    """The tool and its subcommand, ignoring an `env K=V` prefix or SSH wrapper."""
+    args = list(argv)
+    if args and args[0] == "ssh":
+        try:
+            args = shlex.split(args[-1])
+        except ValueError:
+            return args[0]
+        # A project target is wrapped as `cd -- PATH && <command>`.
+        if args[:2] == ["cd", "--"] and "&&" in args:
+            args = args[args.index("&&") + 1:]
+    if args and args[0] == "env":
+        args = args[1:]
+        while args and ("=" in args[0] or (args[0] == "-u" and len(args) > 1)):
+            args = args[2:] if args[0] == "-u" else args[1:]
+    if args and args[0] == "sudo":
+        args = args[1:]
+        while args and args[0].startswith("-"):
+            args = args[1:]
+    return " ".join(args[:3]) if args else str(argv[0])
 
 
 def run(t, argv, *, ok=(0,), timeout=120):
@@ -49,12 +98,12 @@ def run(t, argv, *, ok=(0,), timeout=120):
             process.wait()
             raise
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Error(f"Command unavailable or timed out: {argv[0]}") from exc
+        raise Error(f"Command unavailable or timed out: {step_label(argv)}") from exc
     if len(out) + len(err) > 20 * 1024 * 1024:
         raise Error("Command output exceeds 20 MiB")
     if process.returncode not in ok:
         # Avoid storing tool output that can include credentials or private URLs.
-        raise Error(f"Command failed: {argv[0]} (exit {process.returncode})")
+        raise Error(f"Command failed: {step_label(argv)} (exit {process.returncode})")
     return out.decode("utf-8")
 
 
@@ -63,6 +112,12 @@ def package(n, v, ecosystem, **extra):
 
 
 def os_info(t, runner):
+    if t["kind"] == "brew":
+        if runner(t, ["uname", "-s"]).strip() != "Darwin":
+            raise Error("Homebrew adapter requires a macOS host")
+        return {"ID": "macos", "PLATFORM": runner(t, ["uname", "-m"]).strip(),
+                "VERSION": runner(t, ["sw_vers", "-productVersion"]).strip(),
+                "UID": runner(t, ["id", "-u"]).strip()}
     data = {}
     for line in runner(t, ["cat", "/etc/os-release"]).splitlines():
         if "=" in line and not line.startswith("#"):
@@ -147,8 +202,123 @@ def npm_inventory(t, runner):
     return list(result.values())
 
 
+# Homebrew writes a revision into the keg name (`ffmpeg 9.0.2_1`), so `_` is legal;
+# 21 formulae on the reference host carry one.
+BREW_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
+
+
+def brew_base(version):
+    """`9.0.2_1` -> `9.0.2`: `brew vulns` reports the upstream version.
+
+    Only a trailing `_<digits>` is a revision, matching Homebrew's own parse; an
+    underscore inside the version itself is part of the version.
+    """
+    return re.sub(r"_\d+$", "", version)
+
+
+def brew_formula_rows(t, runner):
+    """One (name, full_name, version, unloadable) tuple per installed formula keg.
+
+    `brew info --installed --json=v2` is the shared parse: the tap-qualified full_name
+    makes a same-name same-version formula from a different tap a different row, which
+    the plain `brew list --versions` cannot express. `brew list --formula --versions`
+    reads the Cellar racks directly, so a keg whose formula can no longer be loaded
+    (its tap was untapped, or the formula left core) appears there but not in `brew
+    info --installed` — Homebrew's `Formula.installed` silently skips unloadable racks.
+    Such a keg is yielded with `unloadable` set: it is installed and must not be
+    treated as removed, but no advisory assessment can reach it.
+    """
+    try:
+        data = json.loads(runner(t, brew_env("brew", "info", "--installed", "--json=v2"), timeout=300))
+        formulae = data["formulae"]
+        if not isinstance(formulae, list):
+            raise TypeError("formulae must be a list")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Error("Unrecognized Homebrew installed formulae output") from exc
+    known = {}
+    for entry in formulae:
+        name = text(entry["name"], "formula name")
+        if not entry.get("full_name"):
+            raise Error("Unrecognized Homebrew installed formulae output")
+        full = text(entry["full_name"], "formula full name")
+        known[name] = {keg.get("version") for keg in (entry.get("installed") or [])
+                       if isinstance(keg, dict) and isinstance(keg.get("version"), str)}
+        installed = entry.get("installed")
+        if not isinstance(installed, list) or not installed:
+            raise Error("Unrecognized Homebrew installed formulae output")
+        for keg in installed:
+            version = keg.get("version") if isinstance(keg, dict) else None
+            if not isinstance(version, str) or BREW_VERSION.fullmatch(version) is None:
+                raise Error("Unrecognized Homebrew inventory line")
+            yield name, full, version, False
+    cellar = {}
+    for line in runner(t, brew_env("brew", "list", "--formula", "--versions")).splitlines():
+        parts = line.split()
+        if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
+            raise Error("Unrecognized Homebrew inventory line")
+        cellar.setdefault(parts[0], []).extend(parts[1:])
+        for version in parts[1:]:
+            if version not in known.get(parts[0], ()):
+                # The Cellar has a keg the metadata read does not describe: keep it, but
+                # no advisory assessment can reach it and it carries no tap identity.
+                yield parts[0], None, version, True
+    gone = sorted(f"{name} {version}" for name in known for version in known[name]
+                  if version not in cellar.get(name, []))
+    if gone:
+        # The Cellar listing ran after the metadata read; a keg it no longer shows was
+        # removed in between, so the two observations cannot be combined.
+        raise Error("Homebrew inventory disagreement: " + ", ".join(gone))
+
+
+def brew_formula_package(name, full, version, stale):
+    extra = ({"tap": full} if full else {}) | ({"unloadable": True} if stale else {})
+    return package(name, version, "Homebrew", **extra)
+
+
+def brew_formula_inventory(t, runner):
+    """Formulae only. Advisory reconciliation must not pay for a cask listing."""
+    try:
+        brew_refuse_root(t, runner, prefix=True)
+    except Error as exc:
+        if "requires a macOS host" in str(exc):
+            # A successful probe earlier in this check makes this a mid-check change.
+            raise Error(HOST_STATE_ERRORS + ": the host is no longer macOS") from exc
+        raise
+    return [brew_formula_package(*row) for row in brew_formula_rows(t, runner)]
+
+
+HOST_STATE_ERRORS = "Homebrew host state changed"
+
+
+def brew_refuse_root(t, runner, prefix=False):
+    """Homebrew must not run as root and needs a macOS host; every check or apply path
+    collects inventory first, so refusing here covers all of them. `prefix` marks a read
+    that happens after a successful probe in the same check, where a failure really is a
+    mid-check host-state change rather than a misconfigured target."""
+    probe = os_info(t, runner)
+    if probe["UID"] == "0":
+        raise Error((HOST_STATE_ERRORS + ": " if prefix else "")
+                    + "Homebrew must not run as root; re-run as the invoking user")
+    if probe["ID"] != "macos":
+        raise Error((HOST_STATE_ERRORS + ": " if prefix else "")
+                    + "Homebrew adapter requires a macOS host")
+
+
+def brew_inventory(t, runner):
+    """One row per installed keg version, formulae then casks."""
+    brew_refuse_root(t, runner)
+    result = [brew_formula_package(*row) for row in brew_formula_rows(t, runner)]
+    for line in runner(t, brew_env("brew", "list", "--cask", "--versions")).splitlines():
+        parts = line.split()
+        if len(parts) < 2 or any(BREW_VERSION.fullmatch(value) is None for value in parts[1:]):
+            raise Error("Unrecognized Homebrew inventory line")
+        result.extend(package(parts[0], version, "Homebrew-cask") for version in parts[1:])
+    return result
+
+
 INVENTORIES = {"ubuntu": ubuntu_inventory, "arch": arch_inventory, "cachyos": arch_inventory,
-               "conda": conda_inventory, "mamba": conda_inventory, "uv": uv_inventory, "npm": npm_inventory}
+               "conda": conda_inventory, "mamba": conda_inventory, "uv": uv_inventory, "npm": npm_inventory,
+               "brew": brew_inventory}
 
 
 def inventory(t, runner=run):
@@ -158,7 +328,7 @@ def inventory(t, runner=run):
     return sorted(rows, key=lambda p: (p["name"], p["version"], p.get("architecture", "")))
 
 
-def updates(t, runner=run):
+def updates(t, runner=run, identities=None):
     kind = t["kind"]
     if kind == "ubuntu":
         output = runner(t, ["apt", "list", "--upgradable"])
@@ -173,6 +343,8 @@ def updates(t, runner=run):
         if data.get("success") is False or data.get("error"):
             raise Error("Environment solver could not determine updates")
         return [{"package": r["name"], "candidate": r["version"]} for r in data.get("actions", {}).get("LINK", [])]
+    if kind == "brew":
+        return brew_outdated(t, runner, identities=identities)
     if kind == "uv":
         data = json.loads(runner(t, ["uv", "pip", "list", "--outdated", "--format", "json", "--python",
                                     t["path"].rstrip("/") + "/.venv/bin/python"]))
@@ -180,6 +352,60 @@ def updates(t, runner=run):
     data = json.loads(runner(t, ["npm", "outdated", "--json"], ok=(0, 1)) or "{}")
     return [{"package": n, "candidate": r.get("wanted"), "latest": r.get("latest")} for n, r in sorted(data.items())]
 
+
+
+def brew_outdated(t, runner, identities=None):
+    """Pending updates, with held and greedy-only entries marked honestly.
+
+    `brew outdated --json=v2` reports formulae by their full name, which is
+    tap-qualified for third-party taps, while the inventory and findings use the short
+    name. `identities` (full name -> short name, from the collected inventory) maps the
+    row back so every join in the report works, and the tap-qualified name is kept in
+    `tap`."""
+    identities = identities or {}
+    def rows(*extra):
+        data = json.loads(runner(t, brew_env("brew", "outdated", "--json=v2", *extra), timeout=300))
+        # A formula and a cask can share a name, so the identity is the pair. An empty
+        # object where an array belongs is malformed, not an empty update list.
+        for field in ("formulae", "casks"):
+            value = data.get(field)
+            if not isinstance(value, list):
+                raise Error("Unrecognized Homebrew update output")
+        def short(row, ecosystem):
+            raw = row["name"]
+            if ecosystem == "Homebrew":
+                mapped = identities.get(raw)
+                if mapped is not None:
+                    row = {**row, "name": mapped, "tap": raw}
+                return row
+            return row
+        found = {("Homebrew", short(r, "Homebrew")["name"]): short(r, "Homebrew") for r in data.get("formulae", [])}
+        found.update({("Homebrew-cask", r["name"]): r for r in data.get("casks", [])})
+        for row in found.values():
+            if not isinstance(row.get("name"), str) or not row["name"]:
+                raise Error("Unrecognized Homebrew update name")
+            for field in ("current_version", "pinned_version"):
+                value = row.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise Error("Unrecognized Homebrew update version")
+        return found
+    plain, greedy = rows(), rows("--greedy")
+    result = []
+    for (ecosystem, name), row in sorted(greedy.items(), key=lambda item: (item[0][1], item[0][0])):
+        entry = {"package": name, "candidate": row.get("current_version"), "ecosystem": ecosystem}
+        if row.get("tap"):
+            entry["tap"] = row["tap"]
+        if row.get("pinned"):
+            entry.update(held=True, held_version=row.get("pinned_version"))
+        # Only a cask is honestly greedy-only: `brew upgrade --cask` without --greedy
+        # leaves auto-updating casks alone. A formula the plain call missed became
+        # outdated between the two calls (a concurrent `brew update`), and the approved
+        # upgrade will take it, so it is listed as an ordinary update.
+        if (ecosystem, name) not in plain and ecosystem != "Homebrew":
+            entry.update(greedy_only=True, reason="Not in the default outdated list: excluded by "
+                                                  "Homebrew, or it became outdated between the two calls")
+        result.append(entry)
+    return result
 
 def commands(t):
     """Operator-approved environment-wide updates, not arbitrary feed commands."""
@@ -191,4 +417,11 @@ def commands(t):
         "mamba": [["mamba", "update", "--all", "--yes", "--prefix", t.get("path")]],
         "uv": [["uv", "lock", "--upgrade"], ["uv", "sync", "--locked"]],
         "npm": [["npm", "update", "--ignore-scripts"]],
+        # HOMEBREW_NO_AUTO_UPDATE=1 suppresses Homebrew's implicit refresh, so the
+        # plan refreshes first, the way apt-get update and pacman -Syu do. The upgrades
+        # run without HOMEBREW_NO_INSTALL_CLEANUP so the superseded keg is removed and a
+        # later scan can cover the formula; cleanup stays on for read-only commands.
+        "brew": [brew_env("brew", "update"),
+                 brew_env("brew", "upgrade", "--formula", cleanup=False),
+                 brew_env("brew", "upgrade", "--cask", cleanup=False)],
     }[t["kind"]]

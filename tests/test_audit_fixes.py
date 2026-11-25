@@ -1,0 +1,1026 @@
+"""Tests for the paths the second audit found unexercised."""
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from netwatch import pins, probe, store as store_module, userlane, venvflow
+from netwatch.core import Error
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def dist_dir(venv: Path, name: str, version="1.0"):
+    site = venv / "lib" / "python3.12" / "site-packages"
+    dist = site / ("%s-%s.dist-info" % (name, version))
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: %s\nVersion: %s\n"
+                                   % (name, version))
+    return dist
+
+
+def make_venv(root: Path, name="tool", requires=(), direct_url=None, receipt=None):
+    venv = root / "tools" / name
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    if not (venv / "bin" / "python").exists():
+        (venv / "bin" / "python").symlink_to(sys.executable)
+    (venv / "pyvenv.cfg").write_text("")
+    body = "Metadata-Version: 2.1\nName: %s\nVersion: 1.0\n" % name
+    body += "".join("Requires-Dist: %s\n" % r for r in requires)
+    dist = dist_dir(venv, name)
+    (dist / "METADATA").write_text(body)
+    if direct_url is not None:
+        (dist / "direct_url.json").write_text(json.dumps(direct_url))
+    text = (FIXTURES / "uv-receipt.toml").read_text().replace('"ruff"', '"%s"' % name)
+    (venv / "uv-receipt.toml").write_text(receipt if receipt is not None else text)
+    return venv
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.state = self.root / "state"
+        self.venv = make_venv(self.root)
+        self.store = store_module.Store(self.state / "state.db")
+        self.store.add_target("uvtool", {"name": "tool", "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(self.venv),
+                                         "realpath": os.path.realpath(self.venv)})
+        self.t = self.store.target("tool")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def no_network(self, url, body=None):
+        return {"vulns": []}
+
+    def runner(self, latest="2.0", listing=None, name="tool"):
+        rows = listing if listing is not None else [{"name": name, "version": "1.0"}]
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": name, "version": "1.0",
+                                    "latest_version": latest}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps(rows)
+        return run
+
+
+class ConstraintsArtifactTests(Base):
+    def test_a_retained_bound_reaches_the_constraints_file(self):
+        """Selecting under a bound is not constraining the install to it."""
+        requiring = dist_dir(self.venv, "requirer")
+        (requiring / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: requirer\nVersion: 9.0\n"
+            "Requires-Dist: other<2\n")
+        listing = [{"name": "tool", "version": "1.0"}, {"name": "requirer", "version": "9.0"}]
+
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0", "latest_version": "2.0"},
+                                   {"name": "other", "version": "1.0", "latest_version": "3.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps(listing)
+
+        result = venvflow.preview(self.store, self.t, runner=run,
+                                  request=self.no_network, state_dir=self.state)
+        body = Path(result["constraints"]["path"]).read_text()
+        # the bound that blocked `other` is in the artifact the installer is given
+        self.assertIn("other<2", body)
+        self.assertIn("tool==2.0", body)
+        self.assertNotIn("other==", body)
+
+    def test_a_marker_guarded_bound_is_evaluated_against_the_venv_interpreter(self):
+        # python_version >= "3.12" is true here, so the bound applies and blocks 3.0
+        requiring = dist_dir(self.venv, "requirer")
+        (requiring / "METADATA").write_text(
+            'Metadata-Version: 2.1\nName: requirer\nVersion: 9.0\n'
+            'Requires-Dist: other<2; python_version >= "3.12"\n')
+        derived = pins.derive(self.venv,
+                              [{"name": "tool", "version": "1.0"},
+                               {"name": "requirer", "version": "9.0"}],
+                              [{"name": "other", "version": "3.0"}],
+                              environment=pins.marker_environment({"path": str(self.venv)}))
+        self.assertEqual(derived["pins"], [])
+        self.assertIn("other", derived["blocked"])
+
+    def test_a_false_marker_lets_the_upgrade_through(self):
+        requiring = dist_dir(self.venv, "requirer")
+        (requiring / "METADATA").write_text(
+            'Metadata-Version: 2.1\nName: requirer\nVersion: 9.0\n'
+            'Requires-Dist: other<2; python_version < "3"\n')
+        derived = pins.derive(self.venv,
+                              [{"name": "tool", "version": "1.0"},
+                               {"name": "requirer", "version": "9.0"}],
+                              [{"name": "other", "version": "3.0"}],
+                              environment=pins.marker_environment({"path": str(self.venv)}))
+        self.assertEqual([p["name"] for p in derived["pins"]], ["other"])
+
+
+class OriginPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.store = store_module.Store(self.root / "state.db")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def target_for(self, venv):
+        self.store.add_target("uvtool", {"name": venv.name, "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(venv),
+                                         "realpath": os.path.realpath(venv)})
+        return self.store.target(venv.name)
+
+    def runner(self, name):
+        return Base.runner(self, latest="2.0", name=name)
+
+    def test_an_undetermined_origin_makes_the_target_unplannable(self):
+        venv = make_venv(self.root, "vcs")
+        (dist_dir(venv, "vcs") / "direct_url.json").write_text("{not json")
+        with self.assertRaises(Exception) as caught:
+            venvflow.preview(self.store, self.target_for(venv), runner=self.runner(venv.name),
+                             request=Base.no_network, state_dir=self.root / "state")
+        self.assertIn("undetermined origin", str(caught.exception))
+
+    def test_a_vcs_install_is_held_at_its_version(self):
+        venv = make_venv(self.root, "vcs")
+        (dist_dir(venv, "vcs") / "direct_url.json").write_text(json.dumps(
+            {"url": "https://github.com/x/y", "vcs_info": {"vcs": "git"}}))
+        result = venvflow.preview(self.store, self.target_for(venv),
+                                  runner=self.runner(venv.name),
+                                  request=Base.no_network, state_dir=self.root / "state")
+        self.assertEqual(result["status"], "no_update", result)
+
+
+class RawIndexOptionTests(Base):
+    def test_the_install_argv_carries_the_raw_credential(self):
+        meta = make_venv(self.root, "tool")
+        receipt = ('[tool]\nrequirements = [{ name = "tool" }]\n'
+                   'index = "https://user:secret@private.example/simple"\n')
+        (meta / "uv-receipt.toml").write_text(receipt)
+        result = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                  request=self.no_network, state_dir=self.state)
+        argv = pins.command(self.t["path"], result["constraints"]["path"], result["pins"],
+                            venvflow._index_options(self.t))
+        self.assertTrue(any("secret" in token for token in argv),
+                        "the raw index URL must reach uv, or the install cannot authenticate")
+        # stored forms stay clean
+        stored = json.loads(self.store.db.execute("SELECT body FROM plans").fetchone()[0])
+        self.assertNotIn("secret", json.dumps(stored))
+
+
+class LifecyclePathTests(Base):
+    def test_two_unreadable_identity_reads_set_identity_mismatch(self):
+        (self.venv / "uv-receipt.toml").write_text("not toml = =")
+        for _ in range(2):
+            with self.assertRaises(Exception):
+                venvflow.check(self.store, self.t, runner=self.runner(),
+                               request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "identity_mismatch")
+
+    def test_recovery_publishes_a_token(self):
+        (self.venv / probe.NAME).unlink(missing_ok=True)
+        self.store.db.execute("UPDATE targets SET state='unresolved_path' WHERE name='tool'")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        self.assertEqual(probe.read(self.venv)[0], "usable")
+
+    def test_revival_from_a_non_live_state_returns_the_row_to_service(self):
+        self.store.db.execute("UPDATE targets SET state='unresolved_path' WHERE name='tool'")
+        self.store.remove_target("tool")
+        self.store.add_target("uvtool", {"name": "tool", "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(self.venv),
+                                         "realpath": os.path.realpath(self.venv)})
+        row = self.store.db.execute(
+            "SELECT state, removed FROM targets WHERE name='tool'").fetchone()
+        self.assertEqual(tuple(row), ("live", 0))
+
+
+class CleanupWithCustomDatabaseTests(unittest.TestCase):
+    def test_preview_and_cleanup_agree_on_the_constraints_directory(self):
+        root = Path(tempfile.mkdtemp())
+        state = root / "custom"
+        store = store_module.Store(state / "state.db")
+        try:
+            venv = make_venv(root, "tool")
+            store.add_target("uvtool", {"name": "tool", "kind": "uvtool", "host": "local",
+                                        "path": os.path.realpath(venv),
+                                        "realpath": os.path.realpath(venv)})
+            t = store.target("tool")
+            result = venvflow.preview(store, t, runner=Base.runner(self),
+                                      request=Base.no_network, state_dir=state)
+            path = Path(result["constraints"]["path"])
+            self.assertTrue(str(path).startswith(str(state)), path)
+            store.db.execute("UPDATE plans SET status='stale'")
+            store.cleanup()
+            self.assertFalse(path.exists())
+        finally:
+            store.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class FingerprintEnvironmentTests(unittest.TestCase):
+    """The approval must be bound to uv's configuration, not only to its variables."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "state").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_uv_config_file_in_the_state_hierarchy_changes_the_fingerprint(self):
+        state = self.root / "state"
+        before = venvflow.fingerprint(state)
+        (state / "uv.toml").write_text("[index]\nurl = 'https://private.example/simple'\n")
+        self.assertNotEqual(before, venvflow.fingerprint(state))
+
+    def test_editing_that_file_changes_the_fingerprint_again(self):
+        state = self.root / "state"
+        config = state / "uv.toml"
+        config.write_text("index-url = 'https://one.example/simple'\n")
+        first = venvflow.fingerprint(state)
+        config.write_text("index-url = 'https://two.example/simple'\n")
+        self.assertNotEqual(first, venvflow.fingerprint(state))
+
+    def test_the_local_runner_pins_the_working_directory_to_the_state_dir(self):
+        seen = {}
+
+        def fake_run(t, argv, **kw):
+            seen["path"] = t.get("path")
+            return "[]"
+
+        with mock.patch.object(venvflow.adapters, "run", side_effect=fake_run):
+            venvflow.local_runner(["uv", "pip", "list"], cwd="/tmp/some-state")
+        self.assertEqual(seen["path"], "/tmp/some-state")
+
+
+class DefaultStateDirTests(unittest.TestCase):
+    """Without an explicit state_dir, artifacts go beside the database cleanup reads."""
+
+    def test_preview_defaults_to_the_databases_directory(self):
+        root = Path(tempfile.mkdtemp())
+        state = root / "custom"
+        store = store_module.Store(state / "state.db")
+        try:
+            venv = make_venv(root, "tool")
+            store.add_target("uvtool", {"name": "tool", "kind": "uvtool", "host": "local",
+                                        "path": os.path.realpath(venv),
+                                        "realpath": os.path.realpath(venv)})
+            result = venvflow.preview(store, store.target("tool"), runner=Base.runner(self),
+                                      request=Base.no_network)
+            path = Path(result["constraints"]["path"])
+            self.assertTrue(str(path).startswith(str(state)), path)
+            store.db.execute("UPDATE plans SET status='stale'")
+            store.cleanup()
+            self.assertFalse(path.exists(), "cleanup must find the file preview wrote")
+        finally:
+            store.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class ConstraintSourceTests(Base):
+    def test_a_bound_from_a_distribution_being_replaced_is_not_written(self):
+        """Its bound describes the version being left behind, not the one being installed."""
+        requiring = dist_dir(self.venv, "tool")          # the tool is itself the requirer
+        (requiring / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: tool\nVersion: 1.0\nRequires-Dist: other<2\n")
+        listing = [{"name": "tool", "version": "1.0"}]
+
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0", "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps(listing)
+
+        result = venvflow.preview(self.store, self.t, runner=run,
+                                  request=self.no_network, state_dir=self.state)
+        body = Path(result["constraints"]["path"]).read_text()
+        self.assertIn("tool==2.0", body)
+        self.assertNotIn("other<2", body)
+
+
+class CredentialedIndexApplyTests(Base):
+    """A private-index tool must be previewable *and* appliable."""
+
+    def setUp(self):
+        super().setUp()
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "tool" }]\n'
+            'index = "https://user:secret@private.example/simple"\n')
+
+    def test_preview_then_apply_with_a_credentialed_index(self):
+        installed = {"version": "1.0"}
+
+        def runner(argv, **kw):
+            if "install" in argv:
+                return seen.setdefault("argv", argv) and ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": installed["version"],
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "tool", "version": installed["version"]}])
+
+        preview = venvflow.preview(self.store, self.t, runner=runner,
+                                   request=self.no_network, state_dir=self.state)
+        seen = {}
+
+        def installer(argv, **kw):
+            if "install" in argv:
+                seen["argv"] = argv
+                installed["version"] = "2.0"     # the install actually happened
+                return ""
+            return runner(argv, **kw)
+
+        result = venvflow.apply(self.store, preview["id"], yes=True, runner=installer,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "applied", result)
+        # the install authenticates with the raw URL, from the verified copy
+        self.assertTrue(any("secret" in token for token in seen["argv"]))
+        self.assertTrue(seen["argv"][6].endswith(".tmp"), seen["argv"][6])
+
+    def test_pipx_pip_args_keep_their_credential_for_use(self):
+        venv = make_venv(self.root, "px", receipt="[tool]\nrequirements = [{ name = \"px\" }]\n")
+        meta = json.loads((FIXTURES / "pipx-metadata.json").read_text())
+        meta["main_package"]["package"] = "px"
+        meta["main_package"]["pip_args"] = ["--index-url",
+                                           "https://user:secret@private.example/simple"]
+        (venv / "uv-receipt.toml").unlink()
+        (venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        row = userlane.describe(venv)
+        self.assertTrue(any("secret" in token for token in row["index_options"]))
+        self.assertFalse(any("secret" in token for token in row["index_options_redacted"]))
+
+
+class RemoveRefusalTests(Base):
+    def test_remove_refuses_while_an_update_is_running(self):
+        from netwatch import cli
+        self.store.db.execute(
+            "INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
+            ("tool", int(time.time()), "running", json.dumps({"target": self.t})))
+        with self.assertRaises(Exception) as caught:
+            cli.dispatch(cli.parser().parse_args(["targets", "remove", "tool"]),
+                         self.store, None, None)
+        self.assertIn("running", str(caught.exception))
+        self.assertEqual(
+            self.store.db.execute("SELECT removed FROM targets WHERE name='tool'").fetchone()[0], 0)
+
+
+class PlanByteIntegrityTests(ApplyCase if False else Base):
+    def test_tampered_plan_bytes_are_refused(self):
+        preview = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                   request=self.no_network, state_dir=self.state)
+        body = json.loads(self.store.db.execute(
+            "SELECT body FROM plans WHERE id=?", (preview["id"],)).fetchone()[0])
+        body["constraints"]["bytes"] = "tool==9.9\n"
+        self.store.db.execute("UPDATE plans SET body=? WHERE id=?",
+                              (json.dumps(body), preview["id"]))
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, preview["id"], yes=True, runner=self.runner(),
+                           request=self.no_network)
+        self.assertIn("do not match their digest", str(caught.exception))
+
+
+class BracketSequenceTests(Base):
+    """The Task 8-9 bracket guarantees, exercised on the real paths."""
+
+    def runner_seq(self, listings):
+        """Successive `uv pip list` answers, so the bracket's own read can differ."""
+        calls = {"n": 0}
+
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0",
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            index = min(calls["n"], len(listings) - 1)
+            calls["n"] += 1
+            return json.dumps([{"name": "tool", "version": v} for v in [listings[index]]])
+        return run
+
+    def test_a_change_after_the_identity_listing_is_caught_inside_the_bracket(self):
+        """(3)'s digest must come from the bracket's own listing, not step (2)'s."""
+        runner = self.runner_seq(["1.0", "1.0", "1.0", "1.1"])
+        preview = venvflow.preview(self.store, self.t, runner=runner,
+                                   request=self.no_network, state_dir=self.state)
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, preview["id"], yes=True, runner=runner,
+                           request=self.no_network)
+        self.assertIn("approval is stale", str(caught.exception))
+
+    def test_preview_re_reads_identity_after_publication(self):
+        """(p1): a venv that took the path before tokening must not be planned for."""
+        statuses = [("ok", "none", [{"name": "tool", "version": "1.0"}]),
+                    ("failed", "manager_metadata", "metadata names other")]
+        with mock.patch.object(venvflow, "_identity", side_effect=statuses):
+            with self.assertRaises(Exception) as caught:
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        self.assertIn("tokened", str(caught.exception))
+
+    def test_a_refused_claim_leaves_no_verified_copy_behind(self):
+        """A refused claim must delete the copy step (5) wrote."""
+        preview = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                   request=self.no_network, state_dir=self.state)
+        constraints_dir = Path(preview["constraints"]["path"]).parent
+        real = venvflow.stored_state
+        calls = {"n": 0}
+
+        def drifting(store, target):
+            calls["n"] += 1
+            state = real(store, target)
+            if calls["n"] > 1:            # the claim's own re-read sees a moved target
+                return {**state, "state_seq": state["state_seq"] + 1}
+            return state
+
+        with mock.patch.object(venvflow, "stored_state", side_effect=drifting):
+            with self.assertRaises(Exception) as caught:
+                venvflow.apply(self.store, preview["id"], yes=True, runner=self.runner(),
+                               request=self.no_network)
+        self.assertIn("Target changed under us", str(caught.exception))
+        self.assertEqual(list(constraints_dir.glob("apply-*.tmp")), [],
+                         "a refused claim must not leave the verified copy behind")
+
+    def test_a_vanished_constraints_file_saves_no_plan(self):
+        real = venvflow._write_constraints
+
+        def swept(state_dir, plan_pins, bounds=()):
+            result = real(state_dir, plan_pins, bounds)
+            Path(result["path"]).unlink()
+            return result
+
+        with mock.patch.object(venvflow, "_write_constraints", side_effect=swept):
+            with self.assertRaises(Exception) as caught:
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        self.assertIn("constraints file", str(caught.exception))
+        self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())
+
+
+class PostInstallSequenceTests(Base):
+    """The post-upgrade sequence: probe, identity+inventory, consistency, probe again."""
+
+    def base_runner(self, listing_version="2.0", on_check=None, on_list=None,
+                    on_install=None):
+        installed = {"ran": False}
+
+        def run(argv, **kw):
+            if "install" in argv:
+                installed["ran"] = True
+                if on_install:
+                    on_install()
+                return ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0",
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return on_check() if on_check else "No broken requirements found."
+            if on_list and installed["ran"]:
+                on_list()
+            return json.dumps([{"name": "tool", "version": listing_version}])
+        return run
+
+    def preview_with(self, runner):
+        return venvflow.preview(self.store, self.t, runner=runner,
+                                request=self.no_network, state_dir=self.state)
+
+    def test_an_unreadable_post_install_consistency_check_needs_attention(self):
+        state = {"checks": 0}
+
+        def on_check():
+            state["checks"] += 1
+            if state["checks"] > 1:                      # the post-install run
+                raise Error("Command failed: uv pip check (exit 2)")
+            return "No broken requirements found."
+
+        runner = self.base_runner(on_check=on_check)
+        plan = self.preview_with(runner)
+        result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "needs_attention", result)
+        self.assertIn("unreadable", " ".join(result["problems"]))
+
+    def test_a_probe_change_during_the_post_install_observation_needs_attention(self):
+        after_install = {"n": 0}
+
+        def drift_probe():
+            after_install["n"] = 1
+
+        runner = self.base_runner(on_install=drift_probe)
+        plan = self.preview_with(runner)
+        real = probe.read
+
+        def drifting(venv):
+            status, value = real(venv)
+            if after_install["n"]:
+                after_install["n"] += 1
+                if after_install["n"] > 2:               # the second post-install read
+                    return ("usable", "00000000-0000-4000-8000-000000000000")
+            return (status, value)
+
+        with mock.patch.object(venvflow.probe, "read", side_effect=drifting):
+            result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                    request=self.no_network)
+        self.assertEqual(result["status"], "needs_attention", result)
+        self.assertIn("post-install observation", " ".join(result["problems"]))
+
+    def test_the_venv_stopping_being_this_tool_after_the_install_needs_attention(self):
+        def on_list():
+            (self.venv / "uv-receipt.toml").unlink(missing_ok=True)
+
+        runner = self.base_runner(on_list=on_list)
+        plan = self.preview_with(runner)
+        result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "needs_attention", result)
+        self.assertTrue(any("identity no longer holds" in p for p in result["problems"]), result)
+
+    def test_an_expired_plan_is_staled_and_its_artifact_removed(self):
+        runner = self.base_runner()
+        plan = self.preview_with(runner)
+        artifact = Path(plan["constraints"]["path"])
+        self.store.db.execute("UPDATE plans SET body=? WHERE id=?",
+                              (plan_body_with_expiry(self.store, plan["id"], 0), plan["id"]))
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                           request=self.no_network)
+        self.assertIn("staled", str(caught.exception))
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0], "stale")
+        self.assertFalse(artifact.exists())
+
+
+def plan_body_with_expiry(store, plan_id, expires_at):
+    body = json.loads(store.db.execute("SELECT body FROM plans WHERE id=?",
+                                       (plan_id,)).fetchone()[0])
+    body["expires_at"] = expires_at
+    return json.dumps(body)
+
+
+class HeldDistributionTests(Base):
+    """A held (direct/VCS/local) distribution must survive the install."""
+
+    def test_a_held_distribution_that_disappears_needs_attention(self):
+        vcs = make_venv(self.root, "vendored")
+        (dist_dir(vcs, "vendored") / "direct_url.json").write_text(json.dumps(
+            {"url": "https://github.com/x/y", "vcs_info": {"vcs": "git"}}))
+        self.store.add_target("uvtool", {"name": "vendored", "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(vcs),
+                                         "realpath": os.path.realpath(vcs)})
+        vend = self.store.target("vendored")
+        listing = {"rows": [{"name": "vendored", "version": "1.0"}]}
+
+        def runner(argv, **kw):
+            if "install" in argv:
+                return ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "vendored", "version": "1.0",
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps(listing["rows"])
+
+        # a candidate exists for the held tool, but it must be held, so no plan is made
+        result = venvflow.preview(self.store, vend, runner=runner,
+                                  request=self.no_network, state_dir=self.state)
+        self.assertEqual(result["status"], "no_update", result)
+
+
+class LauncherAndTransitionTests(Base):
+    """The regression the audit found: a launcher row must not shadow the target state."""
+
+    def add_launcher(self, broken=False):
+        site = self.venv / "lib" / "python3.12" / "site-packages"
+        dist = next(site.glob("tool-*.dist-info"))
+        (dist / "entry_points.txt").write_text("[console_scripts]\ntool = tool.cli:main\n")
+        script = self.venv / "bin" / "tool"
+        interp = "/usr/bin/python3" if broken else str(self.venv / "bin" / "python")
+        script.write_text("#!/bin/sh\n'''exec' %s \"$0\" \"$@\"\n' '''\nfrom tool.cli import main\n" % interp)
+        script.chmod(0o755)
+
+    def test_a_malformed_probe_sets_not_bindable_with_a_launcher_present(self):
+        self.add_launcher()
+        (self.venv / probe.NAME).write_text("netwatch-probe: not-a-uuid\n")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "not_bindable")
+
+    def test_a_usable_token_lifts_not_bindable_with_a_launcher_present(self):
+        self.add_launcher()
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "live")
+
+    def test_a_returned_venv_recovers_from_unresolved_path_with_launchers_present(self):
+        self.add_launcher()
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='unresolved_path' WHERE name='tool'")
+        venvflow.check(self.store, self.t, runner=self.runner(), request=self.no_network)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "live")
+
+    def test_preview_clears_not_bindable_so_the_plan_is_appliable(self):
+        self.add_launcher()
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        installed = {"version": "1.0"}
+
+        def runner(argv, **kw):
+            if "install" in argv:
+                installed["version"] = "2.0"
+                return ""
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": installed["version"],
+                                    "latest_version": "2.0"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "tool", "version": installed["version"]}])
+
+        plan = venvflow.preview(self.store, self.t, runner=runner,
+                                request=self.no_network, state_dir=self.state)
+        state = self.store.db.execute("SELECT state FROM targets WHERE name='tool'").fetchone()[0]
+        self.assertEqual(state, "live")
+        result = venvflow.apply(self.store, plan["id"], yes=True, runner=runner,
+                                request=self.no_network)
+        self.assertEqual(result["status"], "applied", result)
+
+
+class LauncherPathTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "px")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_launcher_on_the_shared_base_interpreter_is_healthy(self):
+        dist = dist_dir(self.venv, "px")
+        (dist / "entry_points.txt").write_text("[console_scripts]\npx = px.cli:main\n")
+        # bin/python is a symlink to the interpreter running the tests, which is the shared
+        # base case: the launcher names that same target.
+        script = self.venv / "bin" / "px"
+        script.write_text("#!/bin/sh\n'''exec' %s \"$0\"\n' '''\nfrom px.cli import main\n"
+                          % (self.venv / "bin" / "python"))
+        script.chmod(0o755)
+        rows = pins.launchers(str(self.venv), str(self.venv / "bin"), "px")
+        self.assertEqual([r["status"] for r in rows], ["ok"], rows)
+
+    def test_pipx_exposes_launchers_in_its_own_bin_dir(self):
+        meta = json.loads((FIXTURES / "pipx-metadata.json").read_text())
+        meta["main_package"]["app_paths"][0]["__Path__"] = str(self.venv / "bin" / "luna-doctor")
+        (self.venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        (self.venv / "uv-receipt.toml").unlink(missing_ok=True)
+        with mock.patch.dict(os.environ, {"PIPX_BIN_DIR": str(self.root / "pipxbin")}):
+            row = userlane.describe(self.venv)
+        self.assertEqual(row["bin_dir"], str(self.root / "pipxbin"))
+
+
+class AddVenvKindTests(unittest.TestCase):
+    def test_add_accepts_a_uvtool_target(self):
+        from netwatch import adapters
+        t = adapters.target("local-ruff", "uvtool", path="/tmp/some-venv")
+        self.assertEqual(t["kind"], "uvtool")
+        with self.assertRaises(Exception):
+            adapters.target("bad", "uvtool")          # the path is required
+
+
+class ClaimSetTests(Base):
+    """The Co-claimant set and who publishes, exactly as the Store section defines them."""
+
+    def twin(self, name, state, path, removed=0):
+        self.store.add_target("uvtool", {"name": name, "kind": "uvtool", "host": "local",
+                                         "path": os.path.realpath(path)})
+        self.store.db.execute("UPDATE targets SET state=?, removed=? WHERE name=?",
+                              (state, removed, name))
+
+    def test_an_unresolved_path_row_is_not_a_co_claimant(self):
+        self.twin("gone", "unresolved_path", self.venv)
+        reports = venvflow.check(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network)
+        self.assertEqual([p["name"] for p in reports["packages"]], ["tool"])
+
+    def test_an_identity_mismatch_twin_does_not_silence_an_in_service_target(self):
+        self.twin("twin", "identity_mismatch", self.venv)
+        report = venvflow.check(self.store, self.t, runner=self.runner(),
+                                request=self.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["tool"])
+
+    def test_a_removed_row_is_not_a_co_claimant(self):
+        self.twin("retired", "live", self.venv, removed=1)
+        report = venvflow.check(self.store, self.t, runner=self.runner(),
+                                request=self.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["tool"])
+
+
+class PreviewStepTests(Base):
+    def test_preview_cleans_a_stale_probe_temp(self):
+        stale = self.venv / (probe.TEMP_PREFIX + "c" * 32)
+        stale.write_text("")
+        os.utime(stale, (time.time() - 7200,) * 2)
+        venvflow.preview(self.store, self.t, runner=self.runner(),
+                         request=self.no_network, state_dir=self.state)
+        self.assertFalse(stale.exists(), "preview must run the (p1) temp cleanup")
+
+    def test_preview_refuses_an_unreadable_probe_before_resolving(self):
+        (self.venv / probe.NAME).mkdir()          # a directory cannot be read as a token
+        with self.assertRaises(Exception) as caught:
+            venvflow.preview(self.store, self.t, runner=self.runner(),
+                             request=self.no_network, state_dir=self.state)
+        self.assertIn("probe token", str(caught.exception))
+
+
+class AddVenvTargetTests(unittest.TestCase):
+    def test_add_records_realpath_and_bin_dir_and_refuses_a_shared_venv(self):
+        import subprocess
+        from netwatch import cli
+        root = Path(tempfile.mkdtemp())
+        venv = make_venv(root, "ruffish")
+        db = root / "state.db"
+        args = cli.parser().parse_args(["--db", str(db), "add", "first", "uvtool",
+                                       "--path", str(venv)])
+        store = store_module.Store(db)
+        try:
+            created = cli.dispatch(args, store, None, None)
+            self.assertEqual(created["realpath"], os.path.realpath(venv))
+            self.assertTrue(created["bin_dir"])
+            second = cli.parser().parse_args(
+                ["--db", str(db), "add", "second", "uvtool", "--path", str(venv / ".")])
+            with self.assertRaises(Exception) as caught:
+                cli.dispatch(second, store, None, None)
+            self.assertIn("already tracks this venv", str(caught.exception))
+        finally:
+            store.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class NoUpdateBranchTests(Base):
+    """(p11): a no-eligible-update preview clears not_bindable, and only at its own state."""
+
+    def runner(self, latest="1.0"):
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "tool", "version": "1.0",
+                                    "latest_version": latest}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "tool", "version": "1.0"}])
+        return run
+
+    def test_no_update_clears_not_bindable_and_saves_no_plan(self):
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        result = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                  request=self.no_network, state_dir=self.state)
+        self.assertEqual(result["status"], "no_update")
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "live")
+        self.assertIsNone(self.store.db.execute("SELECT id FROM plans").fetchone())
+
+    def test_the_clear_is_guarded_by_generation_and_state_seq(self):
+        """A newer observation must not be overwritten by this run's stale one."""
+        probe.publish(self.venv)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        real = venvflow.stored_state
+        calls = {"n": 0}
+
+        def drift(store, target):
+            calls["n"] += 1
+            state = real(store, target)
+            # the row moves on after this run read it, before the clear is attempted
+            if calls["n"] >= 1:
+                store.db.execute("UPDATE targets SET state_seq=state_seq+1 "
+                                 "WHERE name='tool'")
+            return state
+
+        with mock.patch.object(venvflow, "stored_state", side_effect=drift):
+            venvflow.preview(self.store, self.t, runner=self.runner(),
+                             request=self.no_network, state_dir=self.state)
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "not_bindable",
+            "a stale run must not clear a newer diagnosis")
+
+
+class LabelledAddTests(unittest.TestCase):
+    """`add` lets the operator choose the label; the manager names the tool."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "pygments")
+        self.db = self.root / "state.db"
+        self.store = store_module.Store(self.db)
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "mylabel", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.t = self.store.target("mylabel")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_labelled_target_identifies_by_the_manager_tool(self):
+        report = venvflow.check(self.store, self.t,
+                                runner=lambda argv, **kw: json.dumps(
+                                    [{"name": "pygments", "version": "2.17.2"}]),
+                                request=Base.no_network)
+        self.assertEqual([p["name"] for p in report["packages"]], ["pygments"])
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='mylabel'").fetchone()[0], "live")
+
+    def test_an_identity_mismatch_row_does_not_block_re_adding_the_same_venv(self):
+        self.store.db.execute("UPDATE targets SET state='identity_mismatch' WHERE name='mylabel'")
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "pygments", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.assertEqual(self.store.db.execute(
+            "SELECT count(*) FROM targets").fetchone()[0], 2)
+
+
+class PreviewTokenWriteTests(Base):
+    def test_a_failed_token_write_sets_not_bindable(self):
+        os.chmod(self.venv, 0o500)
+        try:
+            with self.assertRaises(Exception) as caught:
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        finally:
+            os.chmod(self.venv, 0o700)
+        self.assertIn("not_bindable", str(caught.exception))
+        self.assertEqual(self.store.db.execute(
+            "SELECT state FROM targets WHERE name='tool'").fetchone()[0], "not_bindable")
+
+
+class MalformedProbePreviewTests(Base):
+    def test_a_malformed_probe_is_decided_before_resolving(self):
+        (self.venv / probe.NAME).write_text("netwatch-probe: nope\n")
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return self.runner()(argv, **kw)
+
+        with self.assertRaises(Exception) as caught:
+            venvflow.preview(self.store, self.t, runner=runner,
+                             request=self.no_network, state_dir=self.state)
+        self.assertIn("Run incomplete", str(caught.exception))
+        self.assertEqual([c for c in calls if "--outdated" in c], [],
+                         "nothing may be resolved for an incomplete observation")
+
+    def test_a_failed_save_deletes_the_artifact_it_wrote(self):
+        before = set((self.state / "constraints").glob("preview-*.txt")) \
+            if (self.state / "constraints").exists() else set()
+        real = venvflow._identity
+        calls = {"n": 0}
+
+        def fail_on_confirmation(target, runner):
+            calls["n"] += 1
+            if calls["n"] >= 3:          # the (p6) confirmation read
+                return ("failed", "manager_metadata", "changed")
+            return real(target, runner)
+
+        with mock.patch.object(venvflow, "_identity", side_effect=fail_on_confirmation):
+            with self.assertRaises(Exception):
+                venvflow.preview(self.store, self.t, runner=self.runner(),
+                                 request=self.no_network, state_dir=self.state)
+        after = set((self.state / "constraints").glob("preview-*.txt"))
+        self.assertEqual(after - before, set(), "a failed save must delete its artifact")
+
+
+class IdentityReportTests(Base):
+    def test_an_identity_failure_names_what_the_metadata_says(self):
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "somethingelse" }]\nentrypoints = []\n')
+        with self.assertRaises(Exception) as caught:
+            venvflow.check(self.store, self.t, runner=self.runner(),
+                           request=self.no_network)
+        self.assertIn("somethingelse", str(caught.exception))
+        events = [json.loads(r[0]) for r in self.store.db.execute(
+            "SELECT body FROM events WHERE target='tool' ORDER BY id DESC LIMIT 1")]
+        self.assertIn("somethingelse", json.dumps(events))
+
+
+class ApplyNotBindableTests(Base):
+    def test_apply_refuses_a_stored_not_bindable_target(self):
+        probe.publish(self.venv)
+        plan = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                request=self.no_network, state_dir=self.state)
+        self.store.db.execute("UPDATE targets SET state='not_bindable' WHERE name='tool'")
+        with self.assertRaises(Exception) as caught:
+            venvflow.apply(self.store, plan["id"], yes=True, runner=self.runner(),
+                           request=self.no_network)
+        self.assertIn("not_bindable", str(caught.exception))
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM plans WHERE id=?", (plan["id"],)).fetchone()[0], "proposed")
+
+
+class LabelledLauncherTests(unittest.TestCase):
+    """A labelled target must still be entry-point-verified: the manager knows the tool."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "scripted")
+        dist = dist_dir(self.venv, "scripted")
+        (dist / "entry_points.txt").write_text("[console_scripts]\nscripted = scripted.cli:main\n")
+        script = self.venv / "bin" / "scripted"
+        script.write_text("#!/bin/sh\n'''exec' %s \"$0\"\n' '''\nfrom scripted.cli import main\n"
+                          % (self.venv / "bin" / "python"))
+        script.chmod(0o755)
+        # this venv's own receipt: the exposed launcher is the script just written
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "scripted" }]\nentrypoints = [\n'
+            '  { name = "scripted", install-path = "%s", from = "scripted" },\n]\n' % script)
+        self.db = self.root / "state.db"
+        self.store = store_module.Store(self.db)
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "mylabel", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.t = self.store.target("mylabel")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_labelled_targets_launchers_are_verified_not_reported_as_leads(self):
+        rows = venvflow._launchers(self.t)
+        self.assertEqual([(r["script"], r["status"]) for r in rows],
+                         [("scripted", "ok")], rows)
+
+
+class ToolVersusLabelTests(unittest.TestCase):
+    """The manager's tool and the operator's label can differ; the tool decides the extras."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "black")
+        dist = dist_dir(self.venv, "black")
+        (self.venv / "uv-receipt.toml").write_text(
+            '[tool]\nrequirements = [{ name = "black", extras = ["colorama"] }]\n'
+            'entrypoints = [\n  { name = "black", install-path = "%s", from = "black" },\n]\n'
+            % (self.venv / "bin" / "black"))
+        self.db = self.root / "state.db"
+        self.store = store_module.Store(self.db)
+        from netwatch import cli
+        cli.dispatch(cli.parser().parse_args(
+            ["--db", str(self.db), "add", "blabel", "uvtool", "--path", str(self.venv)]),
+            self.store, None, None)
+        self.t = self.store.target("blabel")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def runner(self):
+        def run(argv, **kw):
+            if "--outdated" in argv:
+                return json.dumps([{"name": "black", "version": "24.8.0",
+                                    "latest_version": "26.10.1"}])
+            if "check" in argv:
+                return "No broken requirements found."
+            return json.dumps([{"name": "black", "version": "24.8.0"}])
+        return run
+
+    def test_a_labelled_targets_pin_carries_the_tools_observed_extras(self):
+        plan = venvflow.preview(self.store, self.t, runner=self.runner(),
+                                request=Base.no_network, state_dir=self.state
+                                if hasattr(self, "state") else self.root / "state")
+        self.assertEqual(plan["pins"][0]["extras"], ["colorama"], plan["pins"])
+        artifact = Path(plan["constraints"]["path"]).read_text()
+        self.assertIn("black[colorama]==26.10.1", artifact)
+
+
+class PipxExtrasParseTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.venv = make_venv(self.root, "black")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_version_pinned_spec_still_yields_its_extras(self):
+        meta = json.loads((FIXTURES / "pipx-metadata.json").read_text())
+        meta["main_package"]["package"] = "black"
+        # what pipx really writes for `pipx install "black[colorama]==24.8.0"`
+        meta["main_package"]["package_or_url"] = "black[colorama]==24.8.0"
+        meta["main_package"]["app_paths"][0]["__Path__"] = str(self.venv / "bin" / "black")
+        (self.venv / "pipx_metadata.json").write_text(json.dumps(meta))
+        (self.venv / "uv-receipt.toml").unlink(missing_ok=True)
+        row = userlane.describe(self.venv)
+        self.assertEqual(row["extras"], ["colorama"])

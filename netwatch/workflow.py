@@ -3,23 +3,109 @@ import json
 import os
 import time
 
-from . import adapters, sources
+from . import adapters, lifecycle, sources
 from .core import Error, canonical, digest
 
 
+def same_venv(a, b):
+    """Are these two recorded paths the same installation?
+
+    One predicate, used identically at registration, apply step (2), recovery and the busy
+    query: a venv reached by two spellings is one venv, and a lock or a claim travels with
+    the installation, not with a name.
+    """
+    if not a or not b:
+        return False
+    try:
+        left, right = os.path.realpath(str(a)), os.path.realpath(str(b))
+    except OSError:
+        return False
+    if os.path.normcase(left) == os.path.normcase(right):
+        return True
+    try:
+        one, two = os.stat(left), os.stat(right)
+    except OSError:
+        return False
+    return (one.st_dev, one.st_ino) == (two.st_dev, two.st_ino)
+
+
+def busy_plan(store, t):
+    """The plan blocking this target: its own, or any plan on the same venv."""
+    rows = store.db.execute(
+        "SELECT id, target FROM plans WHERE status IN ('running','needs_attention') ORDER BY id")
+    path = t.get("path")
+    for row in rows:
+        if row["target"] == t["name"]:
+            return row["id"]
+        if not path:
+            continue
+        try:
+            other = store.target(row["target"])
+        except Exception:
+            continue
+        if same_venv(other.get("path"), path):
+            return row["id"]
+    return None
+
+
 def check(store, t, *, offline=False, refresh=False, refreshed=None, context=False, runner=adapters.run, request=sources.fetch):
+    if t["kind"] not in adapters.KINDS:
+        # A stage-2 build can hold targets whose kind lands in a later stage. Say so for
+        # that target only: a registered environment netwatch cannot observe yet is a
+        # coverage gap to report, not a reason to fail the whole run.
+        store.event(t["name"], "collection_failed", {"error": "kind not yet supported in this build"})
+        raise Error("kind not yet supported in this build")
     try:
         packages = adapters.inventory(t, runner)
     except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError) as exc:
-        store.event(t["name"], "collection_failed", {"error": str(exc) if isinstance(exc, Error) else "Invalid inventory output"})
-        raise Error("Inventory collection failed; previous report retained (see history)") from exc
+        reason = str(exc) if isinstance(exc, Error) else "Invalid inventory output"
+        store.event(t["name"], "collection_failed", {"error": reason})
+        raise Error(f"Inventory collection failed: {reason}; previous report retained (see history)") from exc
     findings, warnings, complete, evidence = sources.assess(t, packages, store, offline=offline, refresh=refresh, refreshed=refreshed, request=request, runner=runner)
+    coverage = next((e["coverage"] for e in evidence if "coverage" in e), None)
+    if coverage is not None and coverage.get("scanner") is True and not coverage.get("deferred"):
+        # The scan is a second observation of the same host. Cask changes say nothing about
+        # formula advisories, so reconciliation compares formulae only. If they moved while
+        # the scan ran, its version claims cannot be tied to this report: retain the earlier
+        # findings and publish none of the new ones.
+        formulae = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
+                    for p in packages if p["ecosystem"] == "Homebrew"]
+        try:
+            after = [((p.get("tap") or p["name"]), p["version"], bool(p.get("unloadable")))
+                     for p in adapters.brew_formula_inventory(t, runner)]
+        except Error as exc:
+            if str(exc).startswith(adapters.HOST_STATE_ERRORS) \
+                    or "requires a macOS host" in str(exc):
+                # The host can no longer be probed as the invoking user (or is no longer
+                # a macOS host): no further Homebrew command runs, the refusal or
+                # rejection is recorded, and the check fails as it happened.
+                store.event(t["name"], "collection_failed", {"error": str(exc)})
+                raise Error(f"Inventory collection failed: {exc}; previous report retained (see history)") from exc
+            after = None
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
+            after = None
+        if after is None or sorted(after) != sorted(formulae):
+            findings = []
+            # The scan's evidence cannot be tied to this host, so nothing is covered. The
+            # retention metadata describes the inventory this report saves (the pre-scan
+            # read); the store keeps every prior finding as unknown on an incomplete
+            # check regardless, and the next complete check re-assesses against the then
+            # current tap-qualified identities.
+            coverage.update(scanned=[], retained=sorted({name for name, _, _ in formulae}),
+                            retained_versions=sorted([name, version] for name, version, _ in formulae),
+                            complete=False, changed_during_scan=True)
+            # The scan's evidence cannot be tied to this host, so the advisory check is
+            # incomplete rather than clean, and check exits 1.
+            complete = False
+            warnings.append("Coverage: installed formulae changed or could not be re-read while Homebrew's "
+                            "scan ran; earlier findings are retained and no scan result is used — re-run the check")
     available, update_error = [], None
     if offline:
         update_error = "Update availability not refreshed in offline mode"
     else:
         try:
-            available = adapters.updates(t, runner)
+            available = adapters.updates(t, runner, identities={p["tap"]: p["name"] for p in packages
+                                                                if p["ecosystem"] == "Homebrew" and p.get("tap")})
         except (Error, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError) as exc:
             update_error = str(exc) if isinstance(exc, Error) else "Invalid package-manager update output"
     if update_error:
@@ -33,10 +119,21 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
     report = {"target": t, "packages": packages, "findings": findings,
               "updates": available, "warnings": warnings, "advisory_check_ok": complete,
               "evidence": evidence, "update_error": update_error,
+              "coverage": next((e["coverage"] for e in evidence if "coverage" in e), None),
               "matcher_revision": 2 if t["kind"] in ("arch", "cachyos") else 1}
     if context:
         previous = store.latest(t["name"])
-        linked = findings if complete or not previous else [*previous["findings"], *findings]
+        coverage = next((e["coverage"] for e in evidence if "coverage" in e), None)
+        prior = previous["findings"] if previous else []
+        if not complete:
+            carried = prior  # the store keeps every prior finding on incomplete evidence
+        else:
+            pairs = {tuple(pair) for pair in (coverage or {}).get("retained_versions") or []}
+            unloadable = {pair[:2] for pair in pairs if len(pair) == 3 and pair[2] == "unloadable"}
+            carried = [row for row in prior
+                       if (row.get("tap") or row["package"], row["installed"]) in pairs
+                       or (row["package"], row["installed"]) in unloadable]
+        linked = [*carried, *findings] if carried else findings
         report["context"] = sources.context(packages, linked, store, offline=offline, refresh=refresh,
                                             refreshed=refreshed, request=request)
     return store.save_scan(t["name"], report)
@@ -44,12 +141,18 @@ def check(store, t, *, offline=False, refresh=False, refreshed=None, context=Fal
 
 def preview(store, t, runner=adapters.run):
     packages = adapters.inventory(t, runner)
-    available = adapters.updates(t, runner)
+    available = adapters.updates(t, runner, identities={p["tap"]: p["name"] for p in packages
+                                                        if p["ecosystem"] == "Homebrew" and p.get("tap")})
     body = {"target": t, "inventory_digest": digest(packages), "commands": adapters.commands(t),
             "observed_updates": available,
             "scope": "Update the ENTIRE selected environment using configured repositories and project constraints. "
                      "This is not an exact-version transaction: repository changes can change what is installed. "
-                     "Dependencies, scripts and services may be affected. Back up first.",
+                     "Dependencies, scripts and services may be affected. Back up first."
+                     + (" Cask upgrades may need privileges, quit running applications or run installers;"
+                        " formulae and casks run as separate commands. Cleanup may remove superseded"
+                        " kegs, so an earlier version cannot be relied on for rollback"
+                        " (HOMEBREW_NO_CLEANUP_FORMULAE keeps a formula's old kegs)."
+                        if t["kind"] == "brew" else ""),
             "expires_at": int(time.time()) + 3600}
     with store.transaction():
         row = store.db.execute("INSERT INTO plans(target,at,status,body) VALUES(?,?,?,?)",
@@ -72,8 +175,16 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
     before = adapters.inventory(t, runner)
     if body["inventory_digest"] != digest(before) or int(time.time()) >= body["expires_at"]:
         raise Error("Inventory changed or preview expired; create a new preview")
+    if t.get("path") and t.get("kind") in ("uvtool", "pipx"):
+        # Only the venv-bound kinds claim a whole installation: a conda/uv/npm project may
+        # legitimately share a directory with another target.
+        for other in store.target_rows():
+            if other["name"] != t["name"] and other["removed"] == 0 \
+                    and other.get("kind") in ("uvtool", "pipx") \
+                    and other.get("path") and same_venv(other.get("path"), t["path"]):
+                raise Error("%s already tracks this venv; remove that target first" % other["name"])
     with store.transaction():
-        busy = store.db.execute("SELECT id FROM plans WHERE target=? AND status IN ('running','needs_attention')", (t["name"],)).fetchone()
+        busy = busy_plan(store, t)
         if busy:
             raise Error("Previous update is running or needs attention; inspect history and resolve it first")
         updated = store.db.execute("UPDATE plans SET status='running' WHERE id=? AND status='proposed'", (id_,))
@@ -81,13 +192,20 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
             raise Error("Plan was already claimed")
         store.event(t["name"], "approved_and_started", {"plan": id_, "operator_uid": os.getuid(), "commands": body["commands"]})
     try:
+        last_argv = None
         for argv in body["commands"]:
-            runner(t, argv, timeout=1800)
+            last_argv = argv  # approved command in flight; cleared after the loop
+            try:
+                runner(t, argv, timeout=1800)
+            except Error as exc:
+                raise Error(f"Update step failed: {adapters.step_label(argv)}; {exc}") from exc
             store.event(t["name"], "command_completed", {"plan": id_, "argv": argv})
+        last_argv = None  # later failures belong to verification, not an approved step
         report = check(store, t, runner=runner, request=request)
         changed = digest(before) != digest(report["packages"])
         result = {"plan": id_, "status": "applied", "package_state_changed": changed,
                   "remaining_findings": report["findings"], "advisory_check_ok": report["advisory_check_ok"],
+                  "coverage": report.get("coverage"),
                   "runtime": "Not verified. Check running services and restart/reboot requirements before declaring remediation complete."}
         if t["kind"] == "ubuntu":
             try:
@@ -99,10 +217,21 @@ def apply(store, id_, *, yes=False, runner=adapters.run, request=sources.fetch):
             store.event(t["name"], "applied", result)
         return result
     except BaseException as exc:
+        detail = {"error": "Update interrupted/failed or verification unavailable; inspect the system before retrying"}
+        if isinstance(exc, Error):
+            step = str(exc).split(";")[0]
+            if step.startswith("Update step failed:"):
+                detail["failed_step"] = step.split(":", 1)[1].strip()
+        elif isinstance(exc, UnicodeDecodeError):
+            # A command ran and produced output that is not valid UTF-8; the step is
+            # known even though its output cannot be decoded.
+            detail["failed_step"] = adapters.step_label(last_argv) if last_argv else "unknown step"
         with store.transaction():
             store.db.execute("UPDATE plans SET status='needs_attention',result=? WHERE id=?",
-                             (canonical({"error": "Update interrupted/failed or verification unavailable; inspect the system before retrying"}), id_))
-            store.event(t["name"], "needs_attention", {"plan": id_, "error": type(exc).__name__})
+                             (canonical(detail), id_))
+            store.event(t["name"], "needs_attention",
+                        {"plan": id_, "error": type(exc).__name__, **({"failed_step": detail["failed_step"]}
+                                                                       if "failed_step" in detail else {})})
         raise
 
 
@@ -112,7 +241,15 @@ def resolve(store, id_, note):
         if not row or row["status"] not in ("running", "needs_attention"):
             raise Error("Only interrupted or uncertain updates can be resolved")
         store.db.execute("UPDATE plans SET status='resolved' WHERE id=?", (id_,))
-        store.db.execute("UPDATE plans SET status='stale' WHERE target=? AND status='proposed'", (row["target"],))
+        # A crashed install may have changed a venv another target's plan observed, so the
+        # staling is venv-scoped for the venv-bound kinds (and name-scoped as before for
+        # the rest).
+        try:
+            target = store.target(row["target"])
+        except Error:
+            target = {}
+        store.stale_siblings(row["target"], path=target.get("path"),
+                             venv_match=same_venv if target.get("kind") in ("uvtool", "pipx") else None)
         store.event(row["target"], "operator_resolved", {"plan": id_, "note": note,
                     "warning": "Operator attests no process still runs and recovery is complete; not a verified remediation"})
     return {"plan": id_, "status": "resolved"}

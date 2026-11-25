@@ -103,7 +103,7 @@ class ArchRelevanceTests(unittest.TestCase):
             store = Store(Path(root) / "db")
             self.addCleanup(store.close)
             t = adapters.target("local", "cachyos")
-            store.db.execute("INSERT INTO targets VALUES(?,?)", ("local", canonical(t)))
+            store.add_target(t["kind"], t)
             def runner(t, argv, **kwargs):
                 if argv[0] == "cat": return "ID=cachyos\n"
                 if argv == ["pacman", "-Qm"]: return ""

@@ -9,13 +9,14 @@ import urllib.error
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
-from . import adapters
+from . import adapters, __version__
 from .core import Error, digest, text
 from .versions import compare_versions
 
 USN = "https://usn.ubuntu.com/usn-db/database.json"
 ARCH = "https://security.archlinux.org/issues/all.json"
 OSV = "https://api.osv.dev/v1/query"
+OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 PWN = "https://pwn.watch/incidents.json"
 CVE_NOW = "https://cve.now/api/v1/entries/"
 ZERO_WIRE = "https://radar.cloudflare.com/security/zero-wire/rss"
@@ -36,15 +37,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Error("Advisory endpoint redirected; check source configuration in code")
 
 
+def user_agent():
+    """One source of truth for how netwatch identifies itself to advisory feeds."""
+    return "netwatch/" + __version__
+
+
 def fetch(url, body=None):
     cve_lookup = url.startswith(CVE_NOW) and re.fullmatch(CVE_ID, url[len(CVE_NOW):])
-    if url not in (USN, ARCH, OSV, PWN, ZERO_WIRE) and not cve_lookup:
+    if url not in (USN, ARCH, OSV, OSV_BATCH, PWN, ZERO_WIRE) and not cve_lookup:
         raise Error("Unknown advisory endpoint")
     briefing = cve_lookup or url in (PWN, ZERO_WIRE)
     if briefing and body is not None:
         raise Error("Context sources accept only public GET requests")
     request = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"User-Agent": "netwatch/0.2", "Content-Type": "application/json",
+                                     headers={"User-Agent": user_agent(), "Content-Type": "application/json",
                                               "Accept-Encoding": "identity"})
     limit = 512 * 1024 * 1024 if url == USN else (2 if cve_lookup else 5 if url == ZERO_WIRE else 20) * 1024 * 1024
     timeout = 10 if briefing else 30
@@ -62,6 +68,60 @@ def fetch(url, body=None):
         return raw.decode("utf-8") if url == ZERO_WIRE else json.loads(raw)
     except (OSError, ValueError, urllib.error.URLError) as exc:
         raise Error("Advisory request failed; previous findings retained") from exc
+
+
+def osv_batch(queries, *, request=fetch, chunk=1000):
+    """One batched OSV question for a whole scan: advisory ids per query, in input order.
+
+    `queries` are `querybatch` bodies; a refusal shrinks the chunk and re-asks, so one
+    oversized request cannot fail a scan. Pagination is resolved here: only the queries
+    that carry a token are re-asked, and their ids merge in place.
+    """
+    result, start = [], 0
+    while start < len(queries):
+        batch = queries[start:start + chunk]
+        try:
+            reply = request(OSV_BATCH, {"queries": batch})
+        except Error:
+            # A refusal is a size problem, not a data problem: halve and re-ask this chunk.
+            if chunk <= 1:
+                raise
+            chunk = max(1, chunk // 2)
+            continue
+        result.extend(_osv_batch_page(batch, reply, request))
+        start += len(batch)
+    return result
+
+
+def _osv_batch_page(queries, reply, request):
+    # A malformed reply is not a size refusal: re-asking smaller cannot fix it, so it fails
+    # outright instead of re-sending the batch one query at a time.
+    if (not isinstance(reply, dict) or not isinstance(reply.get("results"), list)
+            or len(reply["results"]) != len(queries)):
+        raise Error("OSV batch response is malformed")
+    ids, follow = [], []
+    for index, (query, row) in enumerate(zip(queries, reply["results"])):
+        if not isinstance(row, dict) or not isinstance(row.get("vulns", []), list):
+            raise Error("OSV batch response is malformed")
+        ids.append([v["id"] for v in row.get("vulns") or []
+                    if isinstance(v, dict) and isinstance(v.get("id"), str)])
+        if row.get("next_page_token"):
+            follow.append((index, query, row["next_page_token"]))
+    while follow:
+        reply = request(OSV_BATCH, {"queries": [{**q, "page_token": t} for _, q, t in follow]})
+        if (not isinstance(reply, dict) or not isinstance(reply.get("results"), list)
+                or len(reply["results"]) != len(follow)):
+            raise Error("OSV batch response is malformed")
+        remaining = []
+        for (index, query, _), row in zip(follow, reply["results"]):
+            if not isinstance(row, dict) or not isinstance(row.get("vulns", []), list):
+                raise Error("OSV batch response is malformed")
+            ids[index].extend(v["id"] for v in row.get("vulns") or []
+                              if isinstance(v, dict) and isinstance(v.get("id"), str))
+            if row.get("next_page_token"):
+                remaining.append((index, query, row["next_page_token"]))
+        follow = remaining
+    return ids
 
 
 def finding(p, advisory, state, fixes, reason, link):
@@ -177,6 +237,344 @@ def osv(p, data):
     return result
 
 
+
+BREW_FIXED = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~,-]{0,127}")
+
+
+def strip_credentials(url):
+    """A repository URL without userinfo or a query string, so no secret reaches the report."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.username is None and not parts.query:
+        return url
+    netloc = parts.hostname or ""
+    if ":" in netloc:  # a bracketed IPv6 host must keep its brackets
+        netloc = f"[{netloc}]"
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", parts.fragment))
+
+
+def advisory_fields(advisory):
+    """Validate the optional fields instead of trusting Homebrew's JSON types.
+
+    A numeric overflow (1e400) decodes to infinity, which the store cannot
+    serialise; an object where a string belongs is equally able to replace a
+    recorded fix with nonsense.
+    """
+    aliases = advisory.get("aliases")
+    if aliases is None:
+        aliases = []
+    elif not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+        raise TypeError("unexpected aliases type")
+    fixed = advisory.get("fixed_versions")
+    if fixed is None:
+        fixed = []
+    elif not isinstance(fixed, list) or any(not isinstance(value, str) or BREW_FIXED.fullmatch(value) is None
+                                            for value in fixed):
+        raise TypeError("unexpected fixed_versions type")
+    severity, summary = advisory.get("severity"), advisory.get("summary")
+    if summary is None:
+        summary = ""
+    elif isinstance(summary, str):
+        # A display string: empty is fine, newlines collapse so it cannot break the
+        # report layout. Only a non-string is malformed.
+        summary = " ".join(summary.split())[:500]
+    else:
+        raise TypeError("unexpected advisory summary type")
+    return {"id": text(advisory["id"], "advisory id"),
+            "severity": "Unknown" if severity is None else text(severity, "advisory severity"),
+            "summary": summary, "aliases": aliases, "fixed": fixed}
+
+
+def brew_scan(t, packages, runner, *, offline=False):
+    """Homebrew's own OSV scan.
+
+    Returns (findings, warnings, coverage). Partial coverage counts as evidence
+    collected: what it could not cover is named in `retained`, which is the set
+    the store keeps as `unknown` instead of clearing. A missing scanner or an
+    offline check collected no evidence at all, so both are incomplete.
+    """
+    pairs = {(p["name"], p["version"]) for p in packages if p["ecosystem"] == "Homebrew"}
+    # Scan rows name the upstream version; installed kegs are indexed by base only. A keg
+    # whose literal version is also another keg's base (`1_2` installed alongside `1_2_1`)
+    # is ambiguous — it could be upstream 1 at revision 2 — so it is excluded from the
+    # index and its findings stay unknown rather than inheriting another version's advisory.
+    def is_ambiguous(name, version):
+        # A bare version (base == itself) is upstream at revision 0: unambiguous.
+        if adapters.brew_base(version) == version:
+            return False
+        # A revised keg (`1_2_1` = upstream 1_2 rev 1) is ambiguous only when another
+        # keg claims its literal as that keg's own upstream version AND that keg is
+        # itself revised (`1_2` = upstream 1 rev 2), so `1_2` is claimed both as an
+        # upstream version and as a revision of `1`.
+        return any(other != version and adapters.brew_base(other) == version
+                   and adapters.brew_base(other) != other
+                   for other in (v for n, v in pairs if n == name))
+    # Kegs are keyed by their tap-qualified identity; scan rows are looked up by the raw
+    # name Homebrew reported (its `full_name`), so a core row for a name our inventory
+    # knows only under a tap is not evidence about that keg.
+    ambiguous = {(p.get("tap") or p["name"], p["version"])
+                 for p in packages if p["ecosystem"] == "Homebrew" and is_ambiguous(p["name"], p["version"])}
+    by_base = {}
+    for p in (p for p in packages if p["ecosystem"] == "Homebrew"):
+        if p.get("unloadable"):
+            # A keg the metadata read does not describe is never assessed; a scan row
+            # must not publish a finding for it.
+            continue
+        key_name = p.get("tap") or p["name"]
+        if (key_name, p["version"]) in ambiguous:
+            continue
+        by_base.setdefault((key_name, adapters.brew_base(p["version"])), []).append(p["version"])
+    formulae = {name for name, _ in pairs}
+    coverage = {"scanner": None, "checked": 0, "complete": False, "deferred": False,
+                "skipped": [], "unscanned": {}, "outdated_without_sbom": [],
+                "scanned": [], "retained": sorted(formulae),
+                "retained_versions": sorted([name, version] for name, version in pairs)}
+    if offline:
+        coverage["deferred"] = True
+        # Retention pairs carry the inventory's tap identity so JSON consumers can join
+        # them with the findings in the same report.
+        coverage["retained_versions"] = sorted([p.get("tap") or p["name"], p["version"]]
+                                               for p in packages if p["ecosystem"] == "Homebrew")
+        return [], ["Coverage: Homebrew's scan needs the target and was skipped in offline mode; prior findings retained"], coverage
+    words = runner(t, adapters.brew_env("brew", "commands")).split()
+    if "vulns" not in words:
+        coverage["scanner"] = False
+        coverage["retained_versions"] = sorted([p.get("tap") or p["name"], p["version"]]
+                                               for p in packages if p["ecosystem"] == "Homebrew")
+        return [], ["Coverage: this Homebrew has no vulnerability scanner; no formula was assessed"], coverage
+    coverage["scanner"] = True
+    raw = runner(t, adapters.brew_env("brew", "vulns", "--json"), ok=(0, 1), timeout=300)
+    try:
+        data = json.loads(raw)
+        if not isinstance(data["findings"], list) or not isinstance(data["skipped_formulae"], list) \
+                or not isinstance(data["unscanned_formulae"], dict) or not isinstance(data["checked"], int) \
+                or not isinstance(data["complete"], bool) \
+                or not isinstance(data.get("outdated_without_sbom", []), list):
+            raise TypeError("unexpected scan field types")
+        if type(data["checked"]) is not int or data["checked"] < 0:
+            raise TypeError("unexpected checked type")
+        coverage.update(checked=data["checked"], complete=data["complete"],
+                        skipped=sorted(text(name, "skipped formula") for name in data["skipped_formulae"]),
+                        unscanned={text(k, "unscanned formula"): text(v, "reason")
+                                   for k, v in data["unscanned_formulae"].items()},
+                        # Homebrew reports these against the current formula version, not the
+                        # installed one, so they cannot clear a finding either.
+                        outdated_without_sbom=sorted(text(n, "outdated formula")
+                                                     for n in data.get("outdated_without_sbom") or []))
+        parsed = []
+        for row in data["findings"]:
+            formula, version = text(row["formula"], "formula name"), text(row["version"], "installed version")
+            vulnerabilities = row["vulnerabilities"]
+            if not isinstance(vulnerabilities, list):
+                raise TypeError("unexpected vulnerabilities type")
+            repository = text(row["repo_url"], "repository URL")
+            parsed.append({"formula": formula, "full_name": formula, "version": version,
+                           "repository": strip_credentials(repository), "tag": text(row["tag"], "upstream tag"),
+                           "vulnerabilities": [advisory_fields(a) for a in vulnerabilities]})
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise Error("Homebrew vulnerability scan output is malformed") from exc
+    # The scanner considers what `brew info --installed` knows, and the inventory this
+    # check already collected holds exactly that: loadable formulae with their
+    # tap-qualified identity. Unloadable kegs (present in the Cellar, formula gone) are
+    # never scanned. The post-scan reconciliation re-reads the metadata and discards the
+    # scan if anything changed.
+    considered = {p["name"] for p in packages
+                  if p["ecosystem"] == "Homebrew" and not p.get("unloadable")} & formulae
+    # Only loadable rows define the tap map: a Cellar-only keg's formula is gone, and a
+    # bare self-map would make the bare-name identity depend on sort order.
+    full_names = {p["tap"]: p["name"] for p in packages
+                  if p["ecosystem"] == "Homebrew" and p.get("tap") and not p.get("unloadable")}
+    coverage["considered"] = sorted(considered)
+    # `brew vulns` reports `full_name`, tap-qualified for third-party taps; map those onto
+    # the inventory's short names before any comparison.
+    full_names_inverse = {}
+    for qualified, short in full_names.items():
+        full_names_inverse.setdefault(short, qualified)
+    identity = lambda name: full_names_inverse.get(name, name)
+    def resolve(name):
+        # A raw scan name is either tap-qualified (mapped to its short name) or a bare
+        # name that no tap-qualified formula claims. A bare name shadowed by a tap
+        # competitor (`foo` when the inventory only knows `acme/tools/foo`) names a
+        # formula that is not installed here.
+        if name in full_names:
+            return full_names[name]
+        return None if name in full_names_inverse else name
+    skipped = {resolved for name in coverage["skipped"] if (resolved := resolve(name)) is not None}
+    unscanned = {resolved: reason for name, reason in coverage["unscanned"].items()
+                 if (resolved := resolve(name)) is not None}
+    stale = {resolved for name in coverage["outdated_without_sbom"]
+             if (resolved := resolve(name)) is not None}
+    # A stale target that names no installed formula consumed one of Homebrew's checked
+    # slots that cannot be credited to any keg here.
+    stale_unresolved = [name for name in coverage["outdated_without_sbom"] if resolve(name) is None]
+    # A formula that is both skipped and stale is a contradictory scan: it cannot be
+    # both refused and assessed against a stale target.
+    contradictory = skipped & stale | unscanned.keys() & stale
+    # `checked` is `queryable.size` in Homebrew's scanner, so it counts queryable formulae —
+    # skipped and refused ones are excluded, stale ones are included.
+    claimed = considered - skipped - unscanned.keys()
+    # Homebrew assessed stale targets against the current formula version, and refused
+    # others outright; findings for either are not evidence about this host. Rows for
+    # those formulas are dropped first: they are outside `checked`, so they must not be
+    # counted against its budget.
+    unreliable = unscanned.keys() | stale | skipped
+    parsed = [row for row in parsed if resolve(row["formula"]) not in unreliable]
+    # A row is evidence only about the formula identity it names: a core row for a name our
+    # inventory knows only under a tap is not evidence about that keg.
+    considered_identities = {identity(n) for n in considered}
+    outside = {row["formula"] for row in parsed if row["formula"] not in considered_identities}
+    # A stale target consumes one of Homebrew's checked slots; if its identity is not an
+    # installed formula, the slot cannot be credited to any keg that was scanned.
+    if any(identity(n) not in considered_identities for n in stale) or stale_unresolved or contradictory:
+        outside.add("\x00stale-outside-inventory")
+    # Homebrew reports an incomplete scan: the gap must be named by an installed
+    # formula, or no keg can be tied to an assessment.
+    if not coverage["complete"] and not ((skipped | unscanned.keys() | stale) & considered):
+        coverage["unaccounted"] = True
+        coverage["unexplained_gap"] = True
+    if len(claimed) != coverage["checked"] or \
+            len({row["formula"] for row in parsed}) > coverage["checked"]:
+        coverage["unaccounted"] = True
+        claimed = set()
+    if outside:
+        # A finding for a formula `brew info --installed` does not know contradicts the
+        # scan's own accounting; none of its evidence can be used.
+        coverage["unaccounted"] = True
+    for row in parsed:
+        resolved = resolve(row["full_name"])
+        if resolved is not None:
+            row["formula"] = resolved
+    # Homebrew scans one keg per formula (`formula.any_installed_prefix`) and reports the
+    # upstream version as-is; installed kegs are indexed by base so a revision suffix
+    # (`9.0.2_1`) still matches its upstream version (`9.0.2`). Other kegs stay unknown.
+    # Duplicates are counted on the raw reported name: the scan identifies formulas by
+    # their full name, whatever the inventory's short name is.
+    seen_formulas = [row["full_name"] for row in parsed]
+    duplicated = {name for name in seen_formulas if seen_formulas.count(name) > 1}
+    if duplicated:
+        # Homebrew scans one keg per formula (`any_installed_prefix`); two rows for one
+        # formula contradict the scanner's own model.
+        coverage["unaccounted"] = True
+    matched_versions, matched_names = set(), set()
+    unmatched = set()
+    for row in parsed:
+        # The index is keyed by the tap-qualified identity and base-only: one scan row for
+        # upstream 9.0.2 reaches the revised keg 9.0.2_1. Kegs whose upstream identity is
+        # uncertain (`is_ambiguous`) are absent.
+        installed = by_base.get((row["full_name"], row["version"]))
+        if installed:
+            if row["vulnerabilities"]:
+                matched_names.add(row["formula"])
+                matched_versions.update((row["formula"], version) for version in installed)
+            else:
+                # A matched row without vulnerabilities is malformed evidence: it
+                # describes nothing, so the kegs stay unknown rather than covered.
+                unmatched.add(row["formula"])
+        else:
+            unmatched.add(row["formula"])
+    # A formula with one matching and one mismatched row is not covered either way: its
+    # name and every keg version drop out, so all its prior findings stay unknown.
+    matched_names -= unmatched
+    matched_versions = {(name, version) for name, version in matched_versions
+                        if name not in unmatched}
+    matched_names = {identity(name) for name in matched_names}
+    matched_versions = {(identity(name), version) for name, version in matched_versions}
+    # A clean formula has no row at all; absence of a finding is evidence of assessment.
+    # A stale target was assessed against the wrong version, so it is never covered.
+    if coverage.get("unaccounted"):
+        # The accounting does not balance, so no formula can be claimed as covered.
+        matched_names, matched_versions, clean = set(), set(), set()
+    else:
+        clean = claimed - unmatched - stale - matched_names
+    # A matched row covers only the kegs sharing its base. A clean assessment describes the
+    # keg Homebrew built (`any_installed_prefix`), which is identifiable only when one keg
+    # of the formula is installed.
+    multi_keg = {name for name, count in
+                 ((name, sum(1 for n, _ in pairs if n == name)) for name in formulae) if count > 1}
+    # Coverage names carry the tap-qualified identity; `retained` stays in the inventory's
+    # short names, which is what the report and the store match on.
+    covered_identities = matched_names | {identity(name) for name in clean if name not in multi_keg}
+    covered_versions = matched_versions | {(identity(name), version) for name, version in pairs
+                                           if name in clean and name not in multi_keg}
+    coverage["scanned"] = sorted(covered_identities)
+    covered_short_names = {full_names.get(i, i) for i in covered_identities}
+    coverage["retained"] = sorted(formulae - covered_short_names)
+    # Retention is keyed by the tap-qualified identity, so a formula replaced by a
+    # different tap's formula of the same short name and version cannot inherit the
+    # removed formula's advisory.
+    covered_versions = {(identity(name), version) for name, version in covered_versions
+                        if (identity(name), version) not in ambiguous}
+    unloadable = {(p["name"], p["version"]) for p in packages
+                  if p["ecosystem"] == "Homebrew" and p.get("unloadable")}
+    # An unloadable keg's retention pair is its bare short name: the tap-qualified
+    # identity its earlier finding recorded no longer exists.
+    coverage["retained_versions"] = sorted(
+        [name, version, "unloadable"] if (name, version) in unloadable
+         else [identity(name), version]
+         for name, version in pairs if (name, version) in unloadable
+         or (identity(name), version) not in covered_versions)
+    # A retained formula is not covered, whatever Homebrew reported; nor is a retained keg
+    # of a partially covered formula.
+    coverage["reported_complete"] = coverage["complete"]
+    coverage["complete"] = coverage["complete"] and not coverage.get("unaccounted") \
+        and not coverage["retained_versions"] and not coverage["retained"]
+    warnings, result = [], []
+    # Scanned names are tap-qualified identities; an unloadable keg's retained pair uses
+    # the formula's short name, so compare against both forms.
+    scanned_identities = {identity(n) for n in coverage["scanned"]} \
+        | {full_names.get(n, n) for n in coverage["scanned"]}
+    partially = sorted({pair[0] for pair in coverage["retained_versions"]} & scanned_identities)
+    if partially:
+        warnings.append(f"Coverage: {', '.join(partially)}: other installed kegs were not assessed by "
+                        "Homebrew; their earlier findings are retained")
+    if unmatched:
+        empty = {row["formula"] for row in parsed if not row["vulnerabilities"]}
+        ambiguous_names = {full_names.get(n, n) for n, _ in ambiguous}
+        changed, empty = unmatched - empty - ambiguous_names, unmatched & empty
+        unresolved = unmatched & ambiguous_names
+        if unresolved:
+            warnings.append(f"Coverage: {', '.join(sorted(unresolved))}: an installed keg's upstream version "
+                            "cannot be determined from Homebrew's naming; earlier findings are retained")
+        if changed:
+            warnings.append(f"Coverage: {', '.join(sorted(changed))} changed version between collection and "
+                            "Homebrew's scan; their earlier findings are retained and their scan results "
+                            "are not used — re-run the check")
+        if empty:
+            warnings.append(f"Coverage: {', '.join(sorted(empty))}: Homebrew's scan returned a row without "
+                            "advisory evidence; their earlier findings are retained and their scan results "
+                            "are not used")
+
+    for row in parsed:
+        if row["formula"] in unmatched or coverage.get("unaccounted"):
+            continue
+        for advisory in row["vulnerabilities"]:
+            for installed in by_base[(row["full_name"], row["version"])]:
+                item = finding({"ecosystem": "Homebrew", "name": row["formula"], "version": installed},
+                               advisory["id"], "affected", advisory["fixed"],
+                               "Homebrew OSV scan matched the upstream repository and tag; coverage limited to scanned formulae",
+                               "https://osv.dev/vulnerability/" + advisory["id"])
+                item["key"] = digest(["Homebrew", row["full_name"], installed, advisory["id"]])
+                item["upstream_version"] = row["version"]
+                item.update(repository=row["repository"], tag=row["tag"], severity=advisory["severity"],
+                            summary=advisory["summary"], references=advisory["aliases"],
+                            tap=row["full_name"])
+                result.append(item)
+    if coverage.get("unexplained_gap"):
+        warnings.append("Coverage: Homebrew reported an incomplete scan without a gap among the installed "
+                        "formulae; no formula is claimed as covered and earlier findings are retained")
+    if coverage["retained"]:
+        warnings.append(f"Coverage: {len(coverage['retained'])} installed formulae were not scanned by Homebrew; "
+                        "their earlier findings are retained and absence of findings is absence of evidence")
+    if coverage.get("unaccounted"):
+        warnings.append("Coverage: Homebrew's scan count does not match the installed set; no formula is "
+                        "claimed as covered and earlier findings are retained")
+    if coverage["outdated_without_sbom"]:
+        warnings.append(f"Coverage: {len(coverage['outdated_without_sbom'])} formulae were scanned against the current "
+                        "formula version, not the installed one; their results are not used")
+    return result, sorted(set(warnings)), coverage
+
+
 def advisory_references(findings, *, cves_only=False):
     """Notice-level links are context, not per-package applicability claims."""
     values = set()
@@ -235,6 +633,10 @@ def pwn_context(packages, findings, data):
                "nodejs": "node", "bind9": "bind"}
     names = {}
     for p in packages:
+        # Cask names collide with unrelated projects: a cask "gemini" on this
+        # host is MacPaw Gemini, not Google's gemini-cli.
+        if p["ecosystem"] == "Homebrew-cask":
+            continue
         normalize = lambda n: re.sub(r"[-_.]+", "-", n.lower()) if p["ecosystem"] == "PyPI" else n.lower()
         for name in {p["name"], p.get("source", p["name"])}:
             tag = normalize(name)
@@ -396,6 +798,14 @@ def assess(t, packages, store, *, offline=False, refresh=False, refreshed=None, 
             findings = arch(packages, data, kind, compare=lambda pairs: adapters.arch_compare(t, pairs, runner), stats=stats)
             evidence[-1]["matching"] = stats
             warnings.append("Coverage: Arch tracker may lag releases; remaining CachyOS and foreign-package matches require investigation")
+        elif kind == "brew":
+            findings, brew_warnings, coverage = brew_scan(t, packages, runner, offline=offline)
+            warnings.extend(brew_warnings)
+            evidence.append({"source": "Homebrew OSV scan", "coverage": coverage})
+            # No scanner, an offline scan, or a scan whose accounting does not balance
+            # collected no usable evidence.
+            if coverage["scanner"] is not True or coverage["deferred"] or coverage.get("unaccounted"):
+                complete = False
         else:
             unknown = sum(p["ecosystem"] == "Conda" for p in packages)
             if unknown:
