@@ -27,11 +27,12 @@ Four things are outside this release:
 
 ## Before the first run
 
-netwatch itself needs Python 3.12 or newer and Git. A `brew` target needs
+netwatch itself needs Python 3.12 or newer and Git. [Install and try](USAGE.md#install-and-try)
+in the usage guide has the two commands. A `brew` target needs
 Homebrew with a `vulns` command, which netwatch tests by reading `brew commands`
 and looking for `vulns` in the output. It never reads a version number. A
 Homebrew without that command produces an incomplete advisory check, not a clean
-one. Section 4 covers the result.
+one. [Reading a Homebrew report](#reading-a-homebrew-report) covers the result.
 
 Homebrew lives at `/opt/homebrew` on Apple silicon and at `/usr/local` on Intel.
 A non-interactive command has no login shell, so neither prefix is on its
