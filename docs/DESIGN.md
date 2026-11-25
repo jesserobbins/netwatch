@@ -49,3 +49,5 @@ netwatch runs package tools locally or over SSH and stores observations in SQLit
 ## Development checks
 
 Use injected command runners, synthetic responses and temporary databases for tests. Test each adapter's collection, update discovery and apply paths. Live operations require explicit target authorization.
+
+The Homebrew coverage contract is stated once, in `docs/MACOS.md`. `docs/USAGE.md` carries a summary and a link. A change to Homebrew behavior updates the guide first, and then whichever summary now contradicts the new code.

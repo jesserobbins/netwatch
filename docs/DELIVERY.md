@@ -81,6 +81,15 @@ Tracks implementation and verification for Ubuntu, Arch/CachyOS, conda/mamba, uv
 - [x] Documented in `docs/USAGE.md` (lanes, tickets, registration, tool-venv lifecycle with a state-and-recovery table, the exact install command and the apply conditions), `docs/DESIGN.md` (seven modules and the behavior to preserve) and `README.md`.
 - [x] Verification: 419 deterministic tests, worklog checks, packaging check and demo. Live on the development machine in throwaway tool homes: uv-tool ruff 0.8.0 → 0.17.6 and pipx upgrades, each read back from the venv's own interpreter; a probe replaced after preview refused the approval; malformed-probe, recovery and unresolved_path transitions reproduced through the CLI. OS package-manager updates were not run. The work was put through repeated independent audit passes, which found and drove fixes for a shadowing bug, unredacted index credentials, a verified copy that never ran, and launcher verification by label.
 
+## Host guides and the host-first manual
+
+- [x] Add `docs/MACOS.md`: what netwatch covers on a Mac, host setup, a first run over the tool-venv roots, the Homebrew coverage contract per formula, the three apply commands, a symptom table and the macOS limits. Casks, MacPorts, the App Store and Xcode content are named as uncovered.
+- [x] Reorder `docs/USAGE.md` host first: hosts, then the kind table, then projects and tool venvs, then discovery, then a reference part. Every published anchor keeps its name; the Homebrew paragraph and its two keg-cleanup bullets move to the guide, which owns them.
+- [x] Split the README usage section into a Mac walkthrough, a Linux host walkthrough, and project examples that work on any host.
+- [x] State Homebrew's scanner requirement as a capability test (`brew commands` lists `vulns`) in place of the version claim, and keep every claim in the guide tied to the function that enforces it.
+- [x] Name the guide in `netwatch`'s overview, in `docs/DESIGN.md` as the owner of the Homebrew contract, and in `AGENTS.md`'s reading list.
+- [x] Verify: every relative link and anchor resolves, every fenced bash block parses, the public paths carry no local or private path, and 449 tests pass.
+
 ## Before using live updates
 
 Test package-manager commands, credentials, project layouts and recovery on disposable targets before enabling updates on working systems. Tool-venv upgrades have been exercised end to end in throwaway tool homes; OS package-manager updates have not been run live and remain unverified. Conda-native vulnerability matching and authoritative CachyOS matching remain unimplemented; inventory and update discovery are supported.
