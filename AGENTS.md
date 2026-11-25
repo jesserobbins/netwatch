@@ -4,7 +4,7 @@ netwatch is a small Python/SQLite CLI for maintained environments, cached adviso
 
 ## Using netwatch
 
-Read [docs/USAGE.md](docs/USAGE.md) for installation, environment registration, scanning and repo tickets, checks, status/history queries, update approval and recovery. It is the operating manual for users and agents. [README.md](README.md) gives the quick start; [docs/DESIGN.md](docs/DESIGN.md) describes the modules and the behavior to preserve.
+Read [docs/USAGE.md](docs/USAGE.md) for installation, environment registration, scanning and repo tickets, checks, status/history queries, update approval and recovery. It is the operating manual for users and agents. [docs/MACOS.md](docs/MACOS.md) is the same contract for a Mac: Homebrew coverage, host setup, updating and troubleshooting. [README.md](README.md) gives the quick start; [docs/DESIGN.md](docs/DESIGN.md) describes the modules and the behavior to preserve.
 
 `scan ROOT --list` is the safe way to look at an unfamiliar root: it reads directory structure only and never opens the database. A real `scan ROOT` runs git inside each classified checkout and writes tickets only into repos the configured account owns. `report PATH` writes one ticket anywhere on request. Registration is a separate, explicit `scan ROOT --register …` step.
 
@@ -13,7 +13,7 @@ Start with `netwatch list` and `netwatch status` to inspect saved state without 
 ## Work
 
 1. Inspect `git status -sb`, current branch, staged paths and recent commits. Work on `main`; preserve unrelated edits and `.pi/` state.
-2. Read `docs/DELIVERY.md`, `docs/DESIGN.md`, `docs/USAGE.md` and relevant code/tests. Keep CLI changes reflected in the usage manual.
+2. Read `docs/DELIVERY.md`, `docs/DESIGN.md`, `docs/USAGE.md`, `docs/MACOS.md` and relevant code/tests. Keep CLI changes reflected in the usage manual, and Homebrew changes reflected in the macOS guide.
 3. Make the smallest complete change. Use plain adapter functions, SQLite and the standard library; Rich handles terminal presentation. Pin dependencies in `requirements.lock`.
 4. Test collection, matching, query and update success/failure paths with injected runners and temporary databases. Never change development-host packages, services, credentials or remote systems to prove an updater works. Live operations require explicit target authorization.
 

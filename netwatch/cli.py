@@ -58,6 +58,7 @@ More
   netwatch demo                              simulated run; no network, no changes
   netwatch COMMAND --help                    arguments for one command
   docs/USAGE.md                              the operating manual, in the source repository
+  docs/MACOS.md                              the macOS guide, in the source repository
 """
 
 SECTIONS = ("Usage", "The loop", "Find and register", "Observe",
