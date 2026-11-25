@@ -48,10 +48,12 @@ netwatch check laptop
 Homebrew formulae get advisories from Homebrew's own scan. Casks are collected and updated, and Homebrew never scans them for vulnerabilities. To find the tool venvs a Mac already has:
 
 ```bash
-netwatch scan ~/.local/share/uv/tools --list
+netwatch scan ~/.local/share/uv/tools --list   # what is there: touches nothing
+netwatch scan ~/.local/share/uv/tools          # store the run
 netwatch scan ~/.local/share/uv/tools --register 1 3
-netwatch add ruff-tool uvtool --path ~/.local/share/uv/tools/ruff
 ```
+
+Registration needs a stored run, so the plain scan comes before it. To register one tool by hand instead, use `netwatch add ruff-tool uvtool --path ~/.local/share/uv/tools/ruff`.
 
 Homebrew needs a `vulns` command, netwatch never runs it as root, and a remote Mac needs Remote Login enabled. See the [macOS guide](docs/MACOS.md) for host setup, Homebrew coverage, updating and troubleshooting.
 

@@ -117,7 +117,9 @@ the advisory check as incomplete.
 
 Casks are inventoried and updated, and they are never scanned: Homebrew does not
 scan them, and netwatch does not derive matches for them. A cask has no advisory,
-whatever its version.
+whatever its version. Casks also stay out of pwn.watch matching, because a cask
+name can collide with an unrelated project. The cask `gemini` is MacPaw Gemini,
+not the command-line tool of the same name, so a cask produces no incident lead.
 
 `check --offline` skips Homebrew's scan, because the scan needs the target. The
 advisory check is incomplete and earlier findings are retained. Unlike the other
